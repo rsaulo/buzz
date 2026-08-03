@@ -79,13 +79,14 @@ export function ComposerUploadProgressPill({
             <div className="relative flex h-full items-center gap-2 pl-3 pr-1">
               <span className="min-w-0 flex-1 truncate text-sm font-semibold text-foreground">
                 Uploading
-              </span>
-              <span className="w-9 shrink-0 text-right text-sm font-semibold text-muted-foreground">
-                {percentage}%
+                <span className="text-muted-foreground">
+                  {" · "}
+                  {percentage}%
+                </span>
               </span>
               <button
                 className={cn(
-                  "shrink-0 rounded-full px-1 py-1 text-sm font-semibold text-foreground",
+                  "shrink-0 rounded-full bg-transparent px-2 py-1 text-sm font-semibold text-foreground",
                   "transition-colors hover:bg-foreground/10 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
                 )}
                 data-testid="composer-upload-cancel"
