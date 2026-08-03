@@ -92,6 +92,8 @@ export type MessageComposerProps = {
     id: string;
   } | null;
   showTopBorder?: boolean;
+  /** Render the app-wide upload queue above this composer dock. */
+  showBackgroundUploadProgress?: boolean;
   toolbarExtraActions?: ReactNode;
   typingParentEventId?: string | null;
   typingRootEventId?: string | null;

@@ -603,6 +603,7 @@ export function NewMessageScreen() {
         onPreparingMentionSendChange={setIsPreparingMentionSend}
         onSend={sendFirstMessage}
         placeholder={composerPlaceholder}
+        showBackgroundUploadProgress
       />
       <div aria-hidden="true" className="min-h-8 bg-background px-5 pb-1.5" />
     </div>

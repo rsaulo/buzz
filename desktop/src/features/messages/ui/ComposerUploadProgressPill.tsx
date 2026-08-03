@@ -1,40 +1,21 @@
 import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 
-import type {
-  MediaUploadController,
-  UploadingAttachmentPreview,
-} from "@/features/messages/lib/useMediaUpload";
 import { cn } from "@/shared/lib/cn";
 
-function aggregateUploadProgress(
-  previews: UploadingAttachmentPreview[],
-): number {
-  if (previews.length === 0) return 0;
-  return Math.min(
-    ...previews.map((preview) =>
-      Math.min(100, Math.max(0, Math.round(preview.progress ?? 0))),
-    ),
-  );
-}
-
 export function ComposerUploadProgressPill({
-  media,
+  isUploading,
+  onCancel,
+  percentage,
 }: {
-  media: Pick<
-    MediaUploadController,
-    "cancelUpload" | "isUploading" | "uploadingPreviews"
-  >;
+  isUploading: boolean;
+  onCancel: () => void;
+  percentage: number;
 }) {
   const reducedMotion = useReducedMotion();
-  const previews = media.uploadingPreviews;
-  const percentage = aggregateUploadProgress(previews);
-  const handleCancel = () => {
-    for (const preview of previews) media.cancelUpload(preview.id);
-  };
 
   return (
     <AnimatePresence initial={false}>
-      {media.isUploading ? (
+      {isUploading ? (
         <motion.div
           animate="visible"
           className="relative z-0 flex justify-center pb-2"
@@ -90,7 +71,7 @@ export function ComposerUploadProgressPill({
                   "transition-colors hover:bg-foreground/10 focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring",
                 )}
                 data-testid="composer-upload-cancel"
-                onClick={handleCancel}
+                onClick={onCancel}
                 type="button"
               >
                 Cancel

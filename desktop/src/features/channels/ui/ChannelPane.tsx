@@ -174,7 +174,7 @@ export const ChannelPane = React.memo(function ChannelPane({
     activeChannel,
     currentPubkey,
   );
-  const mainComposerMedia = useMediaUpload();
+  const mainComposerMedia = useMediaUpload({ deferUploadsUntilSend: true });
   const isNonMemberView =
     activeChannel !== null &&
     !activeChannel.isMember &&
@@ -792,6 +792,7 @@ export const ChannelPane = React.memo(function ChannelPane({
                               : "Select a channel"
                   }
                   showTopBorder={false}
+                  showBackgroundUploadProgress
                 />
                 {/* The activity accessory is anchored in the dock's reserved
                     bottom rail, so fading it cannot change the observed

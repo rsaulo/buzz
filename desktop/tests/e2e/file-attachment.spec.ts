@@ -1,4 +1,5 @@
 import { expect, test } from "@playwright/test";
+import type { Page } from "@playwright/test";
 
 import { installMockBridge } from "../helpers/bridge";
 import { expectCornerRadiusPx, expectSmoothCorners } from "../helpers/css";
@@ -11,6 +12,7 @@ import { expectCornerRadiusPx, expectSmoothCorners } from "../helpers/css";
 
 test.beforeEach(async ({ page }) => {
   await installMockBridge(page, {
+    deferredComposerUploads: true,
     uploadDescriptors: [
       {
         url: `https://mock.relay/media/${"a".repeat(64)}.pdf`,
@@ -24,13 +26,25 @@ test.beforeEach(async ({ page }) => {
   });
 });
 
+async function chooseQuarterlyReport(page: Page) {
+  const [chooser] = await Promise.all([
+    page.waitForEvent("filechooser"),
+    page.getByRole("button", { name: "Attach image" }).click(),
+  ]);
+  await chooser.setFiles({
+    buffer: Buffer.from("quarterly report"),
+    mimeType: "application/pdf",
+    name: "quarterly-report.pdf",
+  });
+}
+
 test("upload a file and see a FileCard in the timeline", async ({ page }) => {
   await page.goto("/");
   await page.getByTestId("channel-general").click();
   await expect(page.getByTestId("chat-title")).toHaveText("general");
 
-  // Paperclip → mocked pick_and_upload_media returns the PDF descriptor.
-  await page.getByRole("button", { name: "Attach image" }).click();
+  // The paperclip queues the local file without starting its upload.
+  await chooseQuarterlyReport(page);
 
   // The composer shows a chip with the original filename.
   await expect(page.getByTestId("message-composer")).toContainText(
@@ -61,6 +75,64 @@ test("upload a file and see a FileCard in the timeline", async ({ page }) => {
       ),
     )
     .toContain("download_file");
+});
+
+test("sends immediately and keeps upload progress across channels", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    const e2e = (
+      window as Window & {
+        __BUZZ_E2E__?: { mock?: { uploadDelayMs?: number } };
+      }
+    ).__BUZZ_E2E__;
+    if (e2e?.mock) e2e.mock.uploadDelayMs = 1_000;
+  });
+  await page.getByTestId("channel-general").click();
+  await chooseQuarterlyReport(page);
+
+  await expect(page.getByTestId("composer-upload-progress")).toHaveCount(0);
+  await page.getByTestId("send-message").click();
+
+  await expect(page.getByTestId("message-composer")).not.toContainText(
+    "quarterly-report.pdf",
+  );
+  await expect(page.getByTestId("composer-upload-progress")).toBeVisible();
+
+  await page.getByTestId("channel-random").click();
+  await expect(page.getByTestId("chat-title")).toHaveText("random");
+  await expect(page.getByTestId("composer-upload-progress")).toBeVisible();
+  await expect(page.getByTestId("composer-upload-progress")).toHaveCount(0, {
+    timeout: 5_000,
+  });
+
+  await page.getByTestId("channel-general").click();
+  await expect(page.getByTestId("file-card").last()).toContainText(
+    "quarterly-report.pdf",
+  );
+});
+
+test("canceling a background upload prevents the message from publishing", async ({
+  page,
+}) => {
+  await page.goto("/");
+  await page.evaluate(() => {
+    const e2e = (
+      window as Window & {
+        __BUZZ_E2E__?: { mock?: { uploadDelayMs?: number } };
+      }
+    ).__BUZZ_E2E__;
+    if (e2e?.mock) e2e.mock.uploadDelayMs = 1_000;
+  });
+  await page.getByTestId("channel-general").click();
+  await chooseQuarterlyReport(page);
+  await page.getByTestId("send-message").click();
+
+  await page.getByTestId("composer-upload-cancel").click();
+  await expect(page.getByTestId("composer-upload-progress")).toHaveCount(0);
+  await page.waitForTimeout(1_100);
+  await expect(page.getByTestId("file-card")).toHaveCount(0);
 });
 
 test("dropping a file on the channel column attaches it to the composer", async ({
