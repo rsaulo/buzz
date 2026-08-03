@@ -10,20 +10,20 @@ import { resolveSentDraftKey } from "@/features/messages/ui/draftSubmitKey";
 import { useEmojiAutocomplete } from "@/features/messages/lib/useEmojiAutocomplete";
 import type { EmojiSuggestion } from "@/features/messages/lib/useEmojiAutocomplete";
 import { useCustomEmoji } from "@/features/custom-emoji/hooks";
+import { buildCustomEmojiTags } from "@/shared/lib/customEmojiTags";
 import {
+  buildOutgoingMessage,
   findSpoileredImetaMediaUrls,
   type ImetaMedia,
+  mergeOutgoingTags,
   restoreImetaMediaDisplayLabels,
   stripImetaMediaLines,
 } from "@/features/messages/lib/imetaMediaMarkdown";
 
 import { useAttachmentEditing } from "@/features/messages/lib/useAttachmentEditing";
 import { useMediaUpload } from "@/features/messages/lib/useMediaUpload";
-import {
-  cancelBackgroundMediaUploads,
-  useBackgroundMediaUpload,
-} from "@/features/messages/lib/backgroundMediaUploadStore";
 import { useMentions } from "@/features/messages/lib/useMentions";
+import { diffAddedMentionPubkeys } from "@/features/messages/lib/threading";
 import { getPersistentAgentAudienceScope } from "@/features/messages/lib/persistentAgentAudience";
 import { useIdentityQuery } from "@/shared/api/hooks";
 import {
@@ -50,13 +50,11 @@ import {
   type MentionSuggestion,
 } from "./MentionAutocomplete";
 import { ComposerDockToolbar } from "./ComposerDockToolbar";
-import { ComposerUploadProgressPill } from "./ComposerUploadProgressPill";
 import { NonMemberMentionDialog } from "./NonMemberMentionDialog";
 import { useMentionSendFlow } from "./useMentionSendFlow";
 import { usePersistentAgentMentionHydration } from "./usePersistentAgentMentionHydration";
 import { useComposerContentState } from "./useComposerContentState";
 import { useDraftPersistLifecycle } from "./useDraftPersistSnapshot";
-import { submitMessageEdit } from "./submitMessageEdit";
 
 import type { MessageComposerProps } from "./MessageComposer.types";
 
@@ -85,7 +83,6 @@ function MessageComposerImpl({
   profiles,
   replyTarget = null,
   mediaController,
-  showBackgroundUploadProgress = false,
   showTopBorder = false,
   toolbarExtraActions,
   typingParentEventId = null,
@@ -145,12 +142,11 @@ function MessageComposerImpl({
     typingRootEventId,
   );
 
-  // New files stay local so the composer can render previews immediately;
-  // submitting hands them to the app-wide background upload queue.
-  const internalMedia = useMediaUpload({ deferUploadsUntilSend: true });
+  // We pass a custom setter that both updates React state AND inserts
+  // markdown into the Tiptap editor when media upload completes.
+  const internalMedia = useMediaUpload();
   const media = mediaController ?? internalMedia;
   const ownsDropZone = mediaController === undefined;
-  const backgroundUpload = useBackgroundMediaUpload();
 
   // Draft-persist lifecycle: restore/clear content + imeta + spoilered urls on
   // key change, and persist the outgoing draft in the cleanup. The StrictMode
@@ -312,8 +308,6 @@ function MessageComposerImpl({
     setContent: setComposerContent,
     setIsEmojiPickerOpen,
     setPendingImeta: media.setPendingImeta,
-    clearQueuedAttachments: media.clearQueuedAttachments,
-    restoreQueuedAttachments: media.restoreQueuedAttachments,
     setSpoileredAttachmentUrls,
     onSuccessfulExplicitAgentAudience:
       persistentAudience.enabled && audienceContext && ownerPubkey
@@ -518,52 +512,77 @@ function MessageComposerImpl({
     // Edit mode
     if (editTargetRef.current && onEditSaveRef.current) {
       if (isSendingRef.current || isUploadingRef.current) return;
+      const currentPendingImeta = media.pendingImetaRef.current;
       // No empty-edit guard here: clearing an edit to empty (no text, no
       // attachments) flows through to onEditSave as empty content, which
       // deletes the message instead of publishing it (see handleEditSave).
-      await submitMessageEdit({
-        content: trimmed,
-        customEmoji,
-        originalContent: editTargetRef.current.body,
-        ownerPubkey: ownerPubkeyRef.current,
-        pendingImeta: media.pendingImetaRef.current,
-        queuedAttachments: media.queuedAttachmentsRef.current,
+
+      // Build the edit's body + imeta tag set. Coerce `mediaTags ?? []`
+      // because edit semantics use `[]` as the explicit "wipe all
+      // attachments" signal — the receiver overlay drops imeta when the
+      // edit carries an empty (but defined) set.
+      const { content: finalContent, mediaTags } = buildOutgoingMessage(
+        trimmed,
+        currentPendingImeta,
         spoileredAttachmentUrls,
-        extractMentionPubkeys: extractMentionPubkeysRef.current,
-        save: onEditSaveRef.current,
-        clearComposer: () => {
-          setComposerContent("");
-          richText.clearContent();
-          media.setPendingImeta([]);
-          media.clearQueuedAttachments();
-          setSpoileredAttachmentUrls(new Set());
-          mentions.clearMentions();
-          channelLinks.clearChannels();
-          emojiAutocomplete.clearEmojis();
-          setIsEmojiPickerOpen(false);
-        },
-        restoreComposer: (draft) => {
-          setComposerContent(draft.content);
-          richText.setContent(draft.content);
-          media.setPendingImeta(draft.pendingImeta);
-          media.restoreQueuedAttachments(draft.queuedAttachments);
-          setSpoileredAttachmentUrls(draft.spoileredAttachmentUrls);
-        },
-        setUploadError: (message) =>
-          media.setUploadState({ status: "error", message }),
-      });
+      );
+
+      // NIP-30: attach `["emoji", shortcode, url]` tags for custom emoji in the
+      // edited body, exactly like the send path. Without this an edited message
+      // ships with no emoji tags, so the receiver can't resolve a `:shortcode:`
+      // and renders the literal text. `?? []` preserves edit semantics (a
+      // defined-but-empty media set means "wipe attachments").
+      const outgoingTags =
+        mergeOutgoingTags(
+          mediaTags,
+          buildCustomEmojiTags(finalContent, customEmoji),
+        ) ?? [];
+
+      // Notify only mentions this edit *newly adds* (see
+      // diffAddedMentionPubkeys): a typo-fix edit that leaves the mention set
+      // unchanged emits no `p` tags and re-wakes nobody. Computed before the
+      // composer state is cleared below.
+      const addedMentionPubkeys = diffAddedMentionPubkeys(
+        extractMentionPubkeysRef.current(editTargetRef.current.body),
+        extractMentionPubkeysRef.current(finalContent),
+        ownerPubkeyRef.current ?? "",
+      );
+
+      const savedContent = trimmed;
+      const savedImeta = [...currentPendingImeta];
+      const savedSpoileredAttachmentUrls = new Set(spoileredAttachmentUrls);
+      setComposerContent("");
+      richText.clearContent();
+      media.setPendingImeta([]);
+      setSpoileredAttachmentUrls(new Set());
+      mentions.clearMentions();
+      channelLinks.clearChannels();
+      emojiAutocomplete.clearEmojis();
+      setIsEmojiPickerOpen(false);
+
+      try {
+        await onEditSaveRef.current(
+          finalContent,
+          outgoingTags,
+          addedMentionPubkeys,
+        );
+      } catch {
+        setComposerContent(savedContent);
+        richText.setContent(savedContent);
+        media.setPendingImeta(savedImeta);
+        setSpoileredAttachmentUrls(savedSpoileredAttachmentUrls);
+      }
       return;
     }
 
     // Normal send
     const currentPendingImeta = media.pendingImetaRef.current;
-    const currentQueuedAttachments = media.queuedAttachmentsRef.current;
-    const hasMedia =
-      currentPendingImeta.length > 0 || currentQueuedAttachments.length > 0;
+    const hasMedia = currentPendingImeta.length > 0;
     if (
       (!trimmed && !hasMedia) ||
       disabledRef.current ||
       isSendingRef.current ||
+      isUploadingRef.current ||
       mentionSendFlow.isPreparingMentionSend
     ) {
       return;
@@ -584,7 +603,6 @@ function MessageComposerImpl({
         capturedChannelId: channelId,
         capturedThreadContext,
         pendingImeta: currentPendingImeta,
-        queuedAttachments: currentQueuedAttachments,
         sentDraftKey: resolveSentDraftKey(
           effectiveDraftKeyRef.current,
           drafts.loadDraft,
@@ -604,12 +622,8 @@ function MessageComposerImpl({
     customEmoji,
     drafts.loadDraft,
     emojiAutocomplete.clearEmojis,
-    media.clearQueuedAttachments,
     media.pendingImetaRef,
-    media.queuedAttachmentsRef,
-    media.restoreQueuedAttachments,
     media.setPendingImeta,
-    media.setUploadState,
     mentionSendFlow.isPreparingMentionSend,
     mentionSendFlow.sendMessageWithMentionFlow,
     mentions.clearMentions,
@@ -811,23 +825,21 @@ function MessageComposerImpl({
   const sendDisabled = React.useMemo(
     () =>
       disabled ||
-      (editTarget !== null && media.isUploading) ||
+      media.isUploading ||
       mentionSendFlow.isPreparingMentionSend ||
-      (isContentEmpty &&
-        media.pendingImeta.length === 0 &&
-        media.queuedAttachments.length === 0),
+      (isContentEmpty && media.pendingImeta.length === 0),
     [
       disabled,
-      editTarget,
       media.isUploading,
       mentionSendFlow.isPreparingMentionSend,
       isContentEmpty,
       media.pendingImeta.length,
-      media.queuedAttachments.length,
     ],
   );
 
-  const handleCaptureSelection = React.useCallback(() => {}, []);
+  const handleCaptureSelection = React.useCallback(() => {
+    // No-op for Tiptap — selection is managed by ProseMirror.
+  }, []);
 
   const handlePaperclipClick = React.useCallback(() => {
     void media.handlePaperclip();
@@ -885,13 +897,6 @@ function MessageComposerImpl({
             onCancelEdit={onCancelEdit}
             onCancelReply={onCancelReply}
           />
-          {showBackgroundUploadProgress ? (
-            <ComposerUploadProgressPill
-              isUploading={backgroundUpload.isUploading}
-              onCancel={cancelBackgroundMediaUploads}
-              percentage={backgroundUpload.percentage}
-            />
-          ) : null}
           <form
             className={cn(
               "relative z-10 isolate rounded-2xl border border-border/50 bg-background/80 px-3 pb-2 pt-3 shadow-none supports-[backdrop-filter]:bg-background/70 dark:bg-background/70 dark:supports-[backdrop-filter]:bg-background/55 sm:px-4",
@@ -951,16 +956,12 @@ function MessageComposerImpl({
               </div>
             ) : null}
 
-            {(media.pendingImeta.length > 0 ||
-              media.queuedAttachments.length > 0 ||
-              media.isUploading) && (
+            {(media.pendingImeta.length > 0 || media.isUploading) && (
               <div className="mb-2 flex items-center gap-2">
                 <ComposerAttachments
                   attachments={media.pendingImeta}
                   isUploading={media.isUploading}
                   onCancelUpload={media.cancelUpload}
-                  onRemoveQueued={media.removeQueuedAttachment}
-                  queuedPreviews={media.queuedPreviews}
                   uploadingCount={media.uploadingCount}
                   uploadingPreviews={media.uploadingPreviews}
                   onEditSave={handleAttachmentEditSave}

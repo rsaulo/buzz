@@ -61,10 +61,6 @@ type ComposerAttachmentsProps = {
   attachments: ImetaMedia[];
   isUploading?: boolean;
   onCancelUpload?: (previewId: number) => void;
-  /** Remove a local attachment that has not started uploading yet. */
-  onRemoveQueued?: (previewId: number) => void;
-  /** Local previews that are queued for upload when the message is sent. */
-  queuedPreviews?: UploadingAttachmentPreview[];
   uploadingCount?: number;
   uploadingPreviews?: UploadingAttachmentPreview[];
   /** Upload annotated bytes as a replacement for the attachment at `url`. */
@@ -515,8 +511,6 @@ export const ComposerAttachments = React.memo(function ComposerAttachments({
   uploadingCount = 0,
   uploadingPreviews = [],
   onCancelUpload,
-  onRemoveQueued,
-  queuedPreviews = [],
   onEditSave,
   onRemove,
   onRevert,
@@ -524,8 +518,7 @@ export const ComposerAttachments = React.memo(function ComposerAttachments({
   onToggleSpoiler,
   spoileredUrls,
 }: ComposerAttachmentsProps) {
-  if (attachments.length === 0 && queuedPreviews.length === 0 && !isUploading)
-    return null;
+  if (attachments.length === 0 && !isUploading) return null;
 
   const uploadPlaceholders: UploadingAttachmentPreview[] =
     uploadingPreviews.length > 0
@@ -614,65 +607,6 @@ export const ComposerAttachments = React.memo(function ComposerAttachments({
                 onToggleSpoiler={onToggleSpoiler}
                 originalUrl={originalUrl}
               />
-            );
-          })}
-          {queuedPreviews.map((preview) => {
-            const isMedia =
-              preview.type?.startsWith("image/") ||
-              preview.type?.startsWith("video/");
-            return (
-              <motion.div
-                animate={{ opacity: 1, scale: 1 }}
-                className="group relative"
-                exit={{ opacity: 0, scale: 0.8 }}
-                initial={{ opacity: 0, scale: 0.8 }}
-                key={`queued-attachment-${preview.id}`}
-                layout
-                transition={{ type: "spring", stiffness: 500, damping: 30 }}
-              >
-                {isMedia ? (
-                  <div
-                    className="relative h-[55px] max-w-[55px]"
-                    style={composerMediaStyle()}
-                  >
-                    <div className="h-full w-full overflow-hidden rounded-2xl border border-border/70 bg-muted">
-                      {preview.posterUrl ? (
-                        <img
-                          alt={preview.filename ?? "Queued attachment"}
-                          className="h-full w-full object-cover"
-                          src={preview.posterUrl}
-                        />
-                      ) : (
-                        <div className="flex h-full w-full items-center justify-center text-muted-foreground">
-                          <Play className="size-5" />
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                ) : (
-                  <div className="flex h-5 max-w-40 items-center gap-1 rounded border border-border/70 bg-muted px-1.5">
-                    <FileText className="h-4 w-4 shrink-0 text-muted-foreground" />
-                    <span className="truncate text-2xs text-muted-foreground">
-                      {preview.filename ?? "Attachment"}
-                    </span>
-                  </div>
-                )}
-                {onRemoveQueued ? (
-                  <Tooltip disableHoverableContent>
-                    <TooltipTrigger asChild>
-                      <button
-                        aria-label="Remove attachment"
-                        className="absolute -right-1 -top-1 z-10 flex h-4 w-4 items-center justify-center rounded-full bg-foreground text-background"
-                        onClick={() => onRemoveQueued(preview.id)}
-                        type="button"
-                      >
-                        <X className="h-2.5 w-2.5" />
-                      </button>
-                    </TooltipTrigger>
-                    <TooltipContent>Remove attachment</TooltipContent>
-                  </Tooltip>
-                ) : null}
-              </motion.div>
             );
           })}
           {isUploading &&

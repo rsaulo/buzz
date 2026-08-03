@@ -355,8 +355,6 @@ type E2eConfig = {
     // (e.g. a generic PDF) without a real upload pipeline. See
     // tests/helpers/bridge.ts:MockBridgeOptions.uploadDescriptors.
     uploadDelayMs?: number;
-    /** Exercise the production composer path that queues files until send. */
-    deferredComposerUploads?: boolean;
     /** Delay (ms) applied to `encode_agent_snapshot_for_send` so E2E tests can
      *  observe the "preparing" phase before the upload begins. 0/undefined = instant. */
     encodeDelayMs?: number;

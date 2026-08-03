@@ -13,10 +13,6 @@ import {
 import { resolvePersonaRuntime } from "@/features/agents/lib/resolvePersonaRuntime";
 import { useAddChannelMembersMutation } from "@/features/channels/hooks";
 import { filterEffectiveExplicitAgentPubkeys } from "@/features/messages/lib/effectiveExplicitAgentPubkeys";
-import {
-  enqueueBackgroundMediaUpload,
-  type QueuedMediaAttachment,
-} from "@/features/messages/lib/backgroundMediaUploadStore";
 import type { UseChannelLinksResult } from "@/features/messages/lib/useChannelLinks";
 import type { UseEmojiAutocompleteResult } from "@/features/messages/lib/useEmojiAutocomplete";
 import {
@@ -40,7 +36,7 @@ type PendingNonMemberMentionSend = {
     parentEventId: string | null;
     threadHeadId: string | null;
   } | null;
-  trimmed: string;
+  finalContent: string;
   mentionPubkeys: string[];
   nonMemberPubkeys: string[];
   outgoingTags?: string[][];
@@ -48,7 +44,6 @@ type PendingNonMemberMentionSend = {
   readyAgentPubkeys?: string[];
   savedContent: string;
   savedImeta: ImetaMedia[];
-  queuedAttachments: QueuedMediaAttachment[];
   savedSpoileredAttachmentUrls: Set<string>;
   sentDraftKey: string | null | undefined;
   audienceGeneration: number;
@@ -65,7 +60,6 @@ type SendMessageWithMentionFlowInput = {
     threadHeadId: string | null;
   } | null;
   pendingImeta: ImetaMedia[];
-  queuedAttachments?: QueuedMediaAttachment[];
   sentDraftKey: string | null | undefined;
   spoileredAttachmentUrls?: ReadonlySet<string>;
   trimmed: string;
@@ -104,8 +98,6 @@ type UseMentionSendFlowOptions = {
   setContent: (content: string) => void;
   setIsEmojiPickerOpen: React.Dispatch<React.SetStateAction<boolean>>;
   setPendingImeta: (pendingImeta: ImetaMedia[]) => void;
-  clearQueuedAttachments: () => void;
-  restoreQueuedAttachments: (attachments: QueuedMediaAttachment[]) => void;
   setSpoileredAttachmentUrls?: React.Dispatch<
     React.SetStateAction<Set<string>>
   >;
@@ -169,8 +161,6 @@ export function useMentionSendFlow({
   setContent,
   setIsEmojiPickerOpen,
   setPendingImeta,
-  clearQueuedAttachments,
-  restoreQueuedAttachments,
   setSpoileredAttachmentUrls,
   onSuccessfulExplicitAgentAudience,
   resolvePostSendContent,
@@ -408,7 +398,6 @@ export function useMentionSendFlow({
         mentions.cancelMentionAutocomplete();
       } else richText.clearContent();
       setPendingImeta([]);
-      clearQueuedAttachments();
       setSpoileredAttachmentUrls?.(new Set());
       if (!postSendContent) mentions.clearMentions();
       channelLinks.clearChannels();
@@ -426,7 +415,6 @@ export function useMentionSendFlow({
       setContent,
       setIsEmojiPickerOpen,
       setPendingImeta,
-      clearQueuedAttachments,
       setSpoileredAttachmentUrls,
     ],
   );
@@ -526,37 +514,11 @@ export function useMentionSendFlow({
           );
         }
 
-        const send = onSendRef.current;
-        const restoreComposerAfterFailure = () => {
-          if (
-            !isMountedRef.current ||
-            draft.capturedChannelId !== channelIdRef.current
-          ) {
-            return;
-          }
-          setContent(draft.savedContent);
-          contentRef.current = draft.savedContent;
-          richText.setContent(draft.savedContent);
-          setPendingImeta(draft.savedImeta);
-          restoreQueuedAttachments(draft.queuedAttachments);
-          setSpoileredAttachmentUrls?.(
-            new Set(draft.savedSpoileredAttachmentUrls),
-          );
-        };
-        const finishSend = async (uploaded: ImetaMedia[]) => {
-          const { content: finalContent, mediaTags } = buildOutgoingMessage(
-            draft.trimmed,
-            [...draft.savedImeta, ...uploaded],
-            draft.savedSpoileredAttachmentUrls,
-          );
-          const finalOutgoingTags = mergeOutgoingTags(
-            mediaTags,
-            outgoingTags ?? [],
-          );
-          await send(
-            finalContent,
+        try {
+          await onSendRef.current(
+            draft.finalContent,
             mentionPubkeys,
-            finalOutgoingTags,
+            outgoingTags,
             sendChannelId,
             draft.capturedThreadContext,
           );
@@ -580,30 +542,17 @@ export function useMentionSendFlow({
               [...draft.savedSpoileredAttachmentUrls],
             );
           }
-        };
-
-        if (draft.queuedAttachments.length > 0) {
-          enqueueBackgroundMediaUpload({
-            attachments: draft.queuedAttachments,
-            onComplete: async (uploaded) => {
-              try {
-                await finishSend(uploaded);
-              } catch {
-                restoreComposerAfterFailure();
-              }
-            },
-            onError: (error) => {
-              restoreComposerAfterFailure();
-              toast.error(
-                `Upload failed: ${getErrorMessage(error, "Unknown error")}`,
-              );
-            },
-          });
-        } else {
-          try {
-            await finishSend([]);
-          } catch {
-            restoreComposerAfterFailure();
+        } catch {
+          // Only restore the composer content if the user is still on the
+          // channel that originated the send.
+          if (draft.capturedChannelId === channelIdRef.current) {
+            setContent(draft.savedContent);
+            contentRef.current = draft.savedContent;
+            richText.setContent(draft.savedContent);
+            setPendingImeta(draft.savedImeta);
+            setSpoileredAttachmentUrls?.(
+              new Set(draft.savedSpoileredAttachmentUrls),
+            );
           }
         }
       } finally {
@@ -627,7 +576,6 @@ export function useMentionSendFlow({
       richText.setContent,
       setContent,
       setPendingImeta,
-      restoreQueuedAttachments,
       setSpoileredAttachmentUrls,
     ],
   );
@@ -694,7 +642,6 @@ export function useMentionSendFlow({
       capturedChannelId,
       capturedThreadContext = null,
       pendingImeta,
-      queuedAttachments = [],
       sentDraftKey,
       spoileredAttachmentUrls = new Set(),
       trimmed,
@@ -756,7 +703,15 @@ export function useMentionSendFlow({
             createdPersonaAgentPubkeySet.has(pubkey),
         );
         const pubkeys = explicitMentionPubkeys;
-        const outgoingTags = buildCustomEmojiTags(trimmed, customEmoji);
+        const { content: finalContent, mediaTags } = buildOutgoingMessage(
+          trimmed,
+          pendingImeta,
+          spoileredAttachmentUrls,
+        );
+        const outgoingTags = mergeOutgoingTags(
+          mediaTags,
+          buildCustomEmojiTags(finalContent, customEmoji),
+        );
         const nonMemberPubkeys = getNonMemberMentionPubkeys(pubkeys);
         let promptNonMemberPubkeys = nonMemberPubkeys.filter(
           (pubkey) =>
@@ -779,7 +734,7 @@ export function useMentionSendFlow({
         const pendingDraft: PendingNonMemberMentionSend = {
           capturedChannelId: effectiveChannelId,
           capturedThreadContext,
-          trimmed,
+          finalContent,
           mentionPubkeys: pubkeys,
           nonMemberPubkeys: promptNonMemberPubkeys,
           outgoingTags,
@@ -790,7 +745,6 @@ export function useMentionSendFlow({
               : createdPersonaAgentPubkeys,
           savedContent: trimmed,
           savedImeta: [...pendingImeta],
-          queuedAttachments: [...queuedAttachments],
           savedSpoileredAttachmentUrls: new Set(spoileredAttachmentUrls),
           sentDraftKey,
           audienceGeneration,
