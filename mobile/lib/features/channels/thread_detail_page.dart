@@ -58,6 +58,7 @@ class ThreadDetailPage extends HookConsumerWidget {
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
+    final sendMessage = ref.read(sendMessageProvider);
     // Relay thread queries are keyed by the outermost root, even when this
     // page displays a nested branch. Query that root, then select this head's
     // direct children from the returned subtree below.
@@ -401,16 +402,14 @@ class ThreadDetailPage extends HookConsumerWidget {
                     content,
                     mentionPubkeys, {
                     mediaTags = const <List<String>>[],
-                  }) => ref
-                      .read(sendMessageProvider)
-                      .call(
-                        channelId: channelId,
-                        content: content,
-                        mentionPubkeys: mentionPubkeys,
-                        parentEventId: threadHead.id,
-                        rootEventId: effectiveRootId,
-                        mediaTags: mediaTags,
-                      ),
+                  }) => sendMessage.call(
+                    channelId: channelId,
+                    content: content,
+                    mentionPubkeys: mentionPubkeys,
+                    parentEventId: threadHead.id,
+                    rootEventId: effectiveRootId,
+                    mediaTags: mediaTags,
+                  ),
             ),
         ],
       ),

@@ -55,6 +55,7 @@ class _InboxRow extends HookConsumerWidget {
   final VoidCallback onMarkUnread;
 
   const _InboxRow({
+    super.key,
     required this.item,
     required this.channel,
     required this.currentPubkey,
@@ -114,6 +115,9 @@ class _InboxRow extends HookConsumerWidget {
         : mutedColor;
 
     final reducedMotion = MediaQuery.of(context).disableAnimations;
+    final swipeDirection = Directionality.of(context) == TextDirection.ltr
+        ? 1.0
+        : -1.0;
     void closeActions() => revealAmount.value = 0;
     void toggleReadState() {
       closeActions();
@@ -152,7 +156,10 @@ class _InboxRow extends HookConsumerWidget {
                   ),
                 ),
               AnimatedSlide(
-                offset: Offset(-revealAmount.value / constraints.maxWidth, 0),
+                offset: Offset(
+                  -swipeDirection * revealAmount.value / constraints.maxWidth,
+                  0,
+                ),
                 duration: reducedMotion || isDragging.value
                     ? Duration.zero
                     : const Duration(milliseconds: 160),
@@ -166,9 +173,10 @@ class _InboxRow extends HookConsumerWidget {
                   onHorizontalDragUpdate: (details) {
                     isDragging.value = true;
                     final previous = revealAmount.value;
-                    final next = (previous - details.delta.dx)
-                        .clamp(0, actionExtent)
-                        .toDouble();
+                    final next =
+                        (previous - (details.delta.dx * swipeDirection))
+                            .clamp(0, actionExtent)
+                            .toDouble();
                     if (!labelHapticFired.value &&
                         previous < _inboxSwipeLabelRevealWidth &&
                         next >= _inboxSwipeLabelRevealWidth) {
@@ -181,13 +189,13 @@ class _InboxRow extends HookConsumerWidget {
                     isDragging.value = false;
                     final velocity = details.primaryVelocity ?? 0;
                     final shouldCommit =
-                        velocity < -900 ||
+                        (velocity * swipeDirection) < -900 ||
                         revealAmount.value >= actionExtent * commitThreshold;
                     if (shouldCommit) {
                       toggleReadState();
                     } else {
                       revealAmount.value =
-                          velocity < -200 ||
+                          (velocity * swipeDirection) < -200 ||
                               revealAmount.value >= restingRevealWidth / 2
                           ? restingRevealWidth
                           : 0;

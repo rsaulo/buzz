@@ -495,6 +495,7 @@ class ComposeBar extends HookConsumerWidget {
         final queueGeneration = uploadGeneration.value;
         final cancellation = UploadCancellationToken();
         activeUploadCancellation.value = cancellation;
+        final delivery = onSend;
         unawaited(() async {
           try {
             final uploaded = <BlobDescriptor>[];
@@ -523,7 +524,7 @@ class ComposeBar extends HookConsumerWidget {
               customEmoji: customEmoji,
             );
             if (queueGeneration != uploadGeneration.value) return;
-            await onSend(
+            await delivery(
               payload.content,
               mentionPubkeys,
               mediaTags: [...payload.mediaTags, ...referenceMentionTags],

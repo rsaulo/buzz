@@ -1,5 +1,5 @@
 import 'package:buzz/features/home/home_page.dart';
-import 'package:buzz/features/activity/inbox_unread_provider.dart';
+import 'package:buzz/shared/read_state/inbox_unread_provider.dart';
 import 'package:buzz/features/channels/channels_page.dart';
 import 'package:buzz/shared/theme/theme.dart';
 import 'package:flutter/material.dart';

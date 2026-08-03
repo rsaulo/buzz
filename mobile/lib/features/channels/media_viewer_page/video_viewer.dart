@@ -1,11 +1,13 @@
 part of '../media_viewer_page.dart';
 
-// StatefulWidget retained: owns a VideoPlayerController with async init and
-// disposal — kept imperative deliberately (allowed exception).
-class MediaVideoViewerPage extends StatefulWidget {
+class MediaVideoViewerPage extends HookConsumerWidget {
   final String videoUrl;
   final String? posterUrl;
   final VoidCallback? onReply;
+
+  static const _dismissThreshold = 100.0;
+  static const _dismissVelocity = 700.0;
+  static const _backgroundFadeDivisor = 300.0;
 
   const MediaVideoViewerPage({
     super.key,
@@ -15,250 +17,239 @@ class MediaVideoViewerPage extends StatefulWidget {
   });
 
   @override
-  State<MediaVideoViewerPage> createState() => _MediaVideoViewerPageState();
-}
-
-class _MediaVideoViewerPageState extends State<MediaVideoViewerPage>
-    with SingleTickerProviderStateMixin {
-  static const _dismissThreshold = 100.0;
-  static const _dismissVelocity = 700.0;
-  static const _backgroundFadeDivisor = 300.0;
-
-  VideoPlayerController? _controller;
-  File? _videoFile;
-  late final Future<void> _initializeFuture;
-  late final AnimationController _snapBackController;
-  String? _error;
-  double _dragOffset = 0;
-  bool _isDragging = false;
-
-  @override
-  void initState() {
-    super.initState();
-    _snapBackController = AnimationController(
-      vsync: this,
+  Widget build(BuildContext context, WidgetRef ref) {
+    final controller = useState<VideoPlayerController?>(null);
+    final videoFile = useRef<File?>(null);
+    final downloadSubscription = useRef<StreamSubscription<List<int>>?>(null);
+    final downloadSink = useRef<IOSink?>(null);
+    final initializeFuture = useState<Future<void>?>(null);
+    final error = useState<String?>(null);
+    final dragOffset = useState(0.0);
+    final isDragging = useState(false);
+    final snapBackController = useAnimationController(
       duration: const Duration(milliseconds: 200),
     );
-    _initializeFuture = _initializeVideo();
-  }
 
-  /// Download through Buzz's authenticated media client before handing the
-  /// local file to AVPlayer. AVPlayer does not consistently preserve custom
-  /// authorization headers for its follow-up range requests, which makes
-  /// protected relay video fail after the first request.
-  Future<void> _initializeVideo() async {
-    final container = ProviderScope.containerOf(context, listen: false);
-    final auth = container.read(mediaGetAuthServiceProvider);
-    final uri = Uri.parse(widget.videoUrl);
-
-    // ExoPlayer supports the request headers on every range request, so keep
-    // Android on its streaming path. iOS uses the authenticated local copy
-    // below because AVPlayer can drop those headers after the first request.
-    if (Platform.isAndroid) {
-      VideoPlayerController? streamingController;
+    Future<void> deleteVideoFile() async {
+      final file = videoFile.value;
+      videoFile.value = null;
+      if (file == null) return;
       try {
-        streamingController = VideoPlayerController.networkUrl(
-          uri,
-          httpHeaders: auth.headersFor(widget.videoUrl),
-        );
-        await streamingController.initialize();
-        await streamingController.play();
-        if (!mounted) {
-          await streamingController.dispose();
-          return;
+        if (await file.exists()) await file.delete();
+      } on FileSystemException {
+        // Temporary storage cleanup should not make closing the viewer fail.
+      }
+    }
+
+    useEffect(() {
+      var disposed = false;
+      Future<void> initializeVideo() async {
+        final auth = ref.read(mediaGetAuthServiceProvider);
+        final uri = Uri.parse(videoUrl);
+
+        // ExoPlayer supports the request headers on every range request, so
+        // keep Android on its streaming path. iOS uses the authenticated local
+        // copy below because AVPlayer can drop those headers after the first
+        // request.
+        if (Platform.isAndroid) {
+          VideoPlayerController? streamingController;
+          try {
+            streamingController = VideoPlayerController.networkUrl(
+              uri,
+              httpHeaders: auth.headersFor(videoUrl),
+            );
+            await streamingController.initialize();
+            await streamingController.play();
+            if (disposed) {
+              await streamingController.dispose();
+              return;
+            }
+            controller.value = streamingController;
+            return;
+          } catch (_) {
+            if (streamingController != null) {
+              await streamingController.dispose();
+            }
+            // Fall through to the authenticated local-file path only when the
+            // streaming controller cannot initialize.
+          }
         }
-        _controller = streamingController;
-        setState(() {});
-        return;
-      } catch (_) {
-        if (streamingController != null) {
-          await streamingController.dispose();
+
+        try {
+          final client = ref.read(mediaHttpClientProvider);
+          final request = http.Request('GET', uri)
+            ..headers.addAll(auth.headersFor(videoUrl));
+          final response = await client.send(request);
+          if (response.statusCode < 200 || response.statusCode >= 300) {
+            await response.stream.drain<void>();
+            throw HttpException(
+              'Video download failed (${response.statusCode})',
+              uri: uri,
+            );
+          }
+
+          final directory = await getTemporaryDirectory();
+          final file = File(
+            '${directory.path}${Platform.pathSeparator}'
+            'buzz-video-${DateTime.now().microsecondsSinceEpoch}'
+            '${_videoFileExtension(uri)}',
+          );
+          videoFile.value = file;
+          final sink = file.openWrite();
+          downloadSink.value = sink;
+          final completed = Completer<void>();
+          downloadSubscription.value = response.stream.listen(
+            sink.add,
+            onError: (Object error, StackTrace stackTrace) async {
+              await sink.close();
+              if (!completed.isCompleted) {
+                completed.completeError(error, stackTrace);
+              }
+            },
+            onDone: () async {
+              await sink.close();
+              if (!completed.isCompleted) completed.complete();
+            },
+            cancelOnError: true,
+          );
+          await completed.future;
+          downloadSubscription.value = null;
+          downloadSink.value = null;
+          if (disposed) {
+            await deleteVideoFile();
+            return;
+          }
+
+          final localController = VideoPlayerController.file(file);
+          await localController.initialize();
+          await localController.play();
+          if (disposed) {
+            await localController.dispose();
+            await deleteVideoFile();
+            return;
+          }
+          controller.value = localController;
+        } catch (loadError) {
+          if (!disposed) error.value = loadError.toString();
         }
-        // Fall through to the authenticated local-file path only when the
-        // streaming controller cannot initialize.
-      }
-    }
-
-    try {
-      final client = container.read(mediaHttpClientProvider);
-      final request = http.Request('GET', uri)
-        ..headers.addAll(auth.headersFor(widget.videoUrl));
-      final response = await client.send(request);
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        await response.stream.drain<void>();
-        throw HttpException(
-          'Video download failed (${response.statusCode})',
-          uri: uri,
-        );
       }
 
-      final directory = await getTemporaryDirectory();
-      final file = File(
-        '${directory.path}${Platform.pathSeparator}'
-        'buzz-video-${DateTime.now().microsecondsSinceEpoch}'
-        '${_videoFileExtension(uri)}',
-      );
-      _videoFile = file;
-      await response.stream.pipe(file.openWrite());
-      if (!mounted) {
-        await _deleteVideoFile();
+      initializeFuture.value = initializeVideo();
+      return () {
+        disposed = true;
+        unawaited(downloadSubscription.value?.cancel() ?? Future.value());
+        unawaited(downloadSink.value?.close() ?? Future.value());
+        final activeController = controller.value;
+        if (activeController != null) unawaited(activeController.dispose());
+        unawaited(deleteVideoFile());
+      };
+    }, [videoUrl]);
+
+    void animateSnapBack() {
+      isDragging.value = false;
+      if (MediaQuery.disableAnimationsOf(context)) {
+        dragOffset.value = 0;
         return;
       }
-
-      final controller = VideoPlayerController.file(file);
-      _controller = controller;
-      await controller.initialize();
-      await controller.play();
-      if (mounted) setState(() {});
-    } catch (error) {
-      if (mounted) {
-        setState(() {
-          _error = error.toString();
-        });
-      }
-    }
-  }
-
-  @override
-  void dispose() {
-    _snapBackController.dispose();
-    final controller = _controller;
-    if (controller != null) unawaited(controller.dispose());
-    unawaited(_deleteVideoFile());
-    super.dispose();
-  }
-
-  void _onVerticalDragStart(DragStartDetails details) {
-    _snapBackController.stop();
-    setState(() => _isDragging = true);
-  }
-
-  void _onVerticalDragUpdate(DragUpdateDetails details) {
-    if (!_isDragging) return;
-    setState(() {
-      _dragOffset = (_dragOffset + details.delta.dy).clamp(
-        0.0,
-        MediaQuery.sizeOf(context).height,
-      );
-    });
-  }
-
-  void _onVerticalDragEnd(DragEndDetails details) {
-    _isDragging = false;
-    final velocity = details.primaryVelocity ?? 0;
-    if (_dragOffset > _dismissThreshold || velocity > _dismissVelocity) {
-      _controller?.pause();
-      Navigator.of(context).maybePop();
-      return;
-    }
-    _animateSnapBack();
-  }
-
-  void _animateSnapBack() {
-    _isDragging = false;
-    if (MediaQuery.disableAnimationsOf(context)) {
-      setState(() => _dragOffset = 0);
-      return;
-    }
-
-    final tween = Tween<double>(begin: _dragOffset, end: 0);
-    void listener() {
-      if (mounted) {
-        setState(() => _dragOffset = tween.evaluate(_snapBackController));
-      }
-    }
-
-    _snapBackController
-      ..stop()
-      ..reset()
-      ..addListener(listener);
-    _snapBackController
-        .animateWith(
-          SpringSimulation(
-            SpringDescription.withDurationAndBounce(
-              duration: const Duration(milliseconds: 260),
-              bounce: 0.14,
+      final tween = Tween<double>(begin: dragOffset.value, end: 0);
+      void listener() => dragOffset.value = tween.evaluate(snapBackController);
+      snapBackController
+        ..stop()
+        ..reset()
+        ..addListener(listener);
+      snapBackController
+          .animateWith(
+            SpringSimulation(
+              SpringDescription.withDurationAndBounce(
+                duration: const Duration(milliseconds: 260),
+                bounce: 0.14,
+              ),
+              0,
+              1,
+              0,
+              snapToEnd: true,
             ),
-            0,
-            1,
-            0,
-            snapToEnd: true,
-          ),
-        )
-        .whenCompleteOrCancel(() {
-          _snapBackController.removeListener(listener);
-        });
-  }
-
-  Future<void> _deleteVideoFile() async {
-    final file = _videoFile;
-    _videoFile = null;
-    if (file == null) return;
-    try {
-      if (await file.exists()) await file.delete();
-    } on FileSystemException {
-      // Temporary storage cleanup should not make closing the viewer fail.
+          )
+          .whenCompleteOrCancel(
+            () => snapBackController.removeListener(listener),
+          );
     }
-  }
 
-  Future<void> _replyInThread() async {
-    final callback = widget.onReply;
-    if (callback == null) return;
-    final route = ModalRoute.of(context);
-    _controller?.pause();
-    await Navigator.of(context).maybePop();
-    await route?.completed;
-    callback();
-  }
+    Future<void> replyInThread() async {
+      final callback = onReply;
+      if (callback == null) return;
+      final route = ModalRoute.of(context);
+      controller.value?.pause();
+      await Navigator.of(context).maybePop();
+      await route?.completed;
+      callback();
+    }
 
-  @override
-  Widget build(BuildContext context) {
     final viewportHeight = MediaQuery.sizeOf(context).height;
-    final dragProgress = (_dragOffset / viewportHeight).clamp(0.0, 1.0);
+    final dragProgress = (dragOffset.value / viewportHeight).clamp(0.0, 1.0);
     final videoScale = 1 - (dragProgress * 0.1);
-    final chromeOpacity = (1 - (_dragOffset / 160)).clamp(0.0, 1.0);
+    final chromeOpacity = (1 - (dragOffset.value / 160)).clamp(0.0, 1.0);
     return Scaffold(
       key: const ValueKey('message-media-video-viewer'),
       backgroundColor: Colors.black.withValues(
-        alpha: (1 - (_dragOffset / _backgroundFadeDivisor)).clamp(0.3, 1.0),
+        alpha: (1 - (dragOffset.value / _backgroundFadeDivisor)).clamp(
+          0.3,
+          1.0,
+        ),
       ),
       body: Stack(
         children: [
           Positioned.fill(
             child: Transform.translate(
-              offset: Offset(0, _dragOffset),
+              offset: Offset(0, dragOffset.value),
               child: Transform.scale(
                 scale: videoScale,
                 child: GestureDetector(
                   key: const ValueKey('message-media-video-viewer-gesture'),
                   behavior: HitTestBehavior.opaque,
-                  onVerticalDragStart: _onVerticalDragStart,
-                  onVerticalDragUpdate: _onVerticalDragUpdate,
-                  onVerticalDragEnd: _onVerticalDragEnd,
-                  onVerticalDragCancel: _animateSnapBack,
+                  onVerticalDragStart: (_) {
+                    snapBackController.stop();
+                    isDragging.value = true;
+                  },
+                  onVerticalDragUpdate: (details) {
+                    if (!isDragging.value) return;
+                    dragOffset.value = (dragOffset.value + details.delta.dy)
+                        .clamp(0.0, viewportHeight)
+                        .toDouble();
+                  },
+                  onVerticalDragEnd: (details) {
+                    isDragging.value = false;
+                    final velocity = details.primaryVelocity ?? 0;
+                    if (dragOffset.value > _dismissThreshold ||
+                        velocity > _dismissVelocity) {
+                      controller.value?.pause();
+                      Navigator.of(context).maybePop();
+                      return;
+                    }
+                    animateSnapBack();
+                  },
+                  onVerticalDragCancel: animateSnapBack,
                   child: SafeArea(
                     child: Center(
                       child: FutureBuilder<void>(
-                        future: _initializeFuture,
+                        future: initializeFuture.value,
                         builder: (context, snapshot) {
-                          if (_error != null || snapshot.hasError) {
+                          if (error.value != null || snapshot.hasError) {
                             return const _MediaLoadFailure(
                               message: 'Failed to load video',
                               icon: LucideIcons.videoOff,
                             );
                           }
 
-                          final controller = _controller;
-                          if (controller == null ||
-                              !controller.value.isInitialized) {
-                            return _VideoLoadingPoster(
-                              posterUrl: widget.posterUrl,
-                            );
+                          final videoController = controller.value;
+                          if (videoController == null ||
+                              !videoController.value.isInitialized) {
+                            return _VideoLoadingPoster(posterUrl: posterUrl);
                           }
 
                           return AspectRatio(
-                            aspectRatio: controller.value.aspectRatio,
-                            child: VideoPlayer(controller),
+                            aspectRatio: videoController.value.aspectRatio,
+                            child: VideoPlayer(videoController),
                           );
                         },
                       ),
@@ -291,8 +282,8 @@ class _MediaVideoViewerPageState extends State<MediaVideoViewerPage>
               opacity: chromeOpacity,
               child: SafeArea(
                 child: _VideoViewerBottomControls(
-                  controller: _controller,
-                  onReply: () => unawaited(_replyInThread()),
+                  controller: controller.value,
+                  onReply: () => unawaited(replyInThread()),
                 ),
               ),
             ),

@@ -277,6 +277,7 @@ class ActivityPage extends HookConsumerWidget {
               children: [
                 if (index == newBoundaryIndex) const _NewBoundaryDivider(),
                 _InboxRow(
+                  key: ValueKey(item.id),
                   item: item,
                   channel: channel,
                   currentPubkey: myPk,
