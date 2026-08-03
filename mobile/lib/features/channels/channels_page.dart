@@ -39,10 +39,10 @@ import 'channel_sections/channel_sections_provider.dart';
 import 'channel_sections/channel_sections_storage.dart';
 import 'channel_stars/channel_stars_provider.dart';
 import 'channels_provider.dart';
-import 'read_state/deferred_read_state_update.dart';
-import 'read_state/read_state_format.dart';
-import 'read_state/read_state_provider.dart';
-import 'read_state/read_state_time.dart';
+import '../../shared/read_state/deferred_read_state_update.dart';
+import '../../shared/read_state/read_state_format.dart';
+import '../../shared/read_state/read_state_provider.dart';
+import '../../shared/read_state/read_state_time.dart';
 import 'unread_badge/observed_unread_event.dart';
 
 part 'channels_page/body.dart';

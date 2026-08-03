@@ -47,11 +47,40 @@ class _MediaVideoViewerPageState extends State<MediaVideoViewerPage>
   /// authorization headers for its follow-up range requests, which makes
   /// protected relay video fail after the first request.
   Future<void> _initializeVideo() async {
+    final container = ProviderScope.containerOf(context, listen: false);
+    final auth = container.read(mediaGetAuthServiceProvider);
+    final uri = Uri.parse(widget.videoUrl);
+
+    // ExoPlayer supports the request headers on every range request, so keep
+    // Android on its streaming path. iOS uses the authenticated local copy
+    // below because AVPlayer can drop those headers after the first request.
+    if (Platform.isAndroid) {
+      VideoPlayerController? streamingController;
+      try {
+        streamingController = VideoPlayerController.networkUrl(
+          uri,
+          httpHeaders: auth.headersFor(widget.videoUrl),
+        );
+        await streamingController.initialize();
+        await streamingController.play();
+        if (!mounted) {
+          await streamingController.dispose();
+          return;
+        }
+        _controller = streamingController;
+        setState(() {});
+        return;
+      } catch (_) {
+        if (streamingController != null) {
+          await streamingController.dispose();
+        }
+        // Fall through to the authenticated local-file path only when the
+        // streaming controller cannot initialize.
+      }
+    }
+
     try {
-      final container = ProviderScope.containerOf(context, listen: false);
       final client = container.read(mediaHttpClientProvider);
-      final auth = container.read(mediaGetAuthServiceProvider);
-      final uri = Uri.parse(widget.videoUrl);
       final request = http.Request('GET', uri)
         ..headers.addAll(auth.headersFor(widget.videoUrl));
       final response = await client.send(request);
@@ -79,6 +108,7 @@ class _MediaVideoViewerPageState extends State<MediaVideoViewerPage>
       final controller = VideoPlayerController.file(file);
       _controller = controller;
       await controller.initialize();
+      await controller.play();
       if (mounted) setState(() {});
     } catch (error) {
       if (mounted) {
@@ -171,6 +201,16 @@ class _MediaVideoViewerPageState extends State<MediaVideoViewerPage>
     }
   }
 
+  Future<void> _replyInThread() async {
+    final callback = widget.onReply;
+    if (callback == null) return;
+    final route = ModalRoute.of(context);
+    _controller?.pause();
+    await Navigator.of(context).maybePop();
+    await route?.completed;
+    callback();
+  }
+
   @override
   Widget build(BuildContext context) {
     final viewportHeight = MediaQuery.sizeOf(context).height;
@@ -252,7 +292,7 @@ class _MediaVideoViewerPageState extends State<MediaVideoViewerPage>
               child: SafeArea(
                 child: _VideoViewerBottomControls(
                   controller: _controller,
-                  onReply: widget.onReply,
+                  onReply: () => unawaited(_replyInThread()),
                 ),
               ),
             ),

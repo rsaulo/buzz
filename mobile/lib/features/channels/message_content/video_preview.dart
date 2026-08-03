@@ -30,12 +30,7 @@ final videoPreviewFrameLoaderProvider = Provider<VideoPreviewFrameLoader>((
   ref,
 ) {
   final auth = ref.watch(mediaGetAuthServiceProvider);
-  final client = ref.watch(mediaHttpClientProvider);
-  return (url) => _loadVideoPreviewFrame(
-    url,
-    headers: auth.headersFor(url),
-    client: client,
-  );
+  return (url) => _loadVideoPreviewFrame(url, headers: auth.headersFor(url));
 });
 
 class _MessageVideoPreview extends HookConsumerWidget {
@@ -170,27 +165,15 @@ class _MessageVideoPreview extends HookConsumerWidget {
 Future<LoadedVideoPreviewFrame?> _loadVideoPreviewFrame(
   String url, {
   required Map<String, String> headers,
-  required http.Client client,
 }) async {
   final uri = Uri.tryParse(url);
   if (uri == null || !uri.hasScheme) return null;
 
   VideoPlayerController? controller;
-  File? downloadedFile;
-
   Future<void> disposeResources() async {
     final currentController = controller;
     controller = null;
     if (currentController != null) await currentController.dispose();
-    final currentFile = downloadedFile;
-    downloadedFile = null;
-    if (currentFile != null) {
-      try {
-        if (await currentFile.exists()) await currentFile.delete();
-      } on FileSystemException {
-        // Temporary preview cleanup should never break the message timeline.
-      }
-    }
   }
 
   Future<bool> initialize(VideoPlayerController candidate) async {
@@ -221,32 +204,11 @@ Future<LoadedVideoPreviewFrame?> _loadVideoPreviewFrame(
     await disposeResources();
     return null;
   } catch (_) {
-    // Some protected media servers or AVPlayer range requests do not retain
-    // custom headers. Fall back to the same authenticated local-file path as
-    // the full-screen viewer so posterless historical events still get a frame.
+    // A timeline preview must stay bounded: falling back to a local file here
+    // would fully download every posterless video encountered while scrolling.
+    // The full-screen viewer can use its authenticated fallback after a tap.
     await disposeResources();
-    try {
-      final request = http.Request('GET', uri)..headers.addAll(headers);
-      final response = await client.send(request);
-      if (response.statusCode < 200 || response.statusCode >= 300) {
-        await response.stream.drain<void>();
-        return null;
-      }
-      final directory = await getTemporaryDirectory();
-      downloadedFile = File(
-        '${directory.path}${Platform.pathSeparator}'
-        'buzz-video-preview-${DateTime.now().microsecondsSinceEpoch}'
-        '${_previewVideoFileExtension(uri)}',
-      );
-      await response.stream.pipe(downloadedFile!.openWrite());
-      if (!await initialize(VideoPlayerController.file(downloadedFile!))) {
-        await disposeResources();
-        return null;
-      }
-    } catch (_) {
-      await disposeResources();
-      return null;
-    }
+    return null;
   }
 
   final initializedController = controller;
@@ -263,14 +225,4 @@ Future<LoadedVideoPreviewFrame?> _loadVideoPreviewFrame(
       await disposeResources();
     },
   );
-}
-
-String _previewVideoFileExtension(Uri uri) {
-  final path = uri.path;
-  final extensionStart = path.lastIndexOf('.');
-  if (extensionStart < 0 || extensionStart == path.length - 1) return '.mp4';
-  final extension = path.substring(extensionStart);
-  return RegExp(r'^\.[A-Za-z0-9]{1,10}$').hasMatch(extension)
-      ? extension
-      : '.mp4';
 }

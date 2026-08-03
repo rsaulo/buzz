@@ -1,6 +1,6 @@
 import 'package:hooks_riverpod/hooks_riverpod.dart';
 
-import '../channels/read_state/read_state_provider.dart';
+import '../../shared/read_state/read_state_provider.dart';
 import 'activity_provider.dart';
 import 'inbox_local_state_provider.dart';
 import 'inbox_read_state.dart';

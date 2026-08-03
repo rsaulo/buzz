@@ -289,18 +289,22 @@ Future<BlobDescriptor> _uploadPendingAttachment(
   MediaUploadService service,
   _PendingAttachment attachment, {
   ValueChanged<double>? onProgress,
+  UploadCancellationToken? cancellationToken,
 }) => switch (attachment.kind) {
   _PendingAttachmentKind.image => service.uploadImage(
     attachment.file,
     onProgress: onProgress,
+    cancellationToken: cancellationToken,
   ),
   _PendingAttachmentKind.video => service.uploadVideo(
     attachment.file,
     onProgress: onProgress,
+    cancellationToken: cancellationToken,
   ),
   _PendingAttachmentKind.file => service.uploadFile(
     attachment.file,
     onProgress: onProgress,
+    cancellationToken: cancellationToken,
   ),
 };
 

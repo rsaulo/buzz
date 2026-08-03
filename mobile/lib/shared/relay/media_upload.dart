@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 import 'dart:math' as math;
@@ -83,6 +84,23 @@ class MediaPolicyUploadException implements Exception {
 
   @override
   String toString() => _mediaPolicyUploadMessage;
+}
+
+/// Cancels a single user-initiated media upload without closing the shared
+/// HTTP client used by later uploads.
+class UploadCancellationToken {
+  final Completer<void> _cancelled = Completer<void>();
+
+  bool get isCancelled => _cancelled.isCompleted;
+  Future<void> get whenCancelled => _cancelled.future;
+
+  void cancel() {
+    if (!_cancelled.isCompleted) _cancelled.complete();
+  }
+}
+
+class UploadCancelledException implements Exception {
+  const UploadCancelledException();
 }
 
 @immutable
@@ -257,12 +275,15 @@ class MediaUploadService {
   Future<BlobDescriptor> uploadImage(
     XFile image, {
     ValueChanged<double>? onProgress,
+    UploadCancellationToken? cancellationToken,
   }) async {
     final preparedImage = await _prepareUploadImage(image);
+    _throwIfCancelled(cancellationToken);
     return _uploadPreparedBytes(
       preparedImage.bytes,
       mimeType: preparedImage.mimeType,
       onProgress: onProgress,
+      cancellationToken: cancellationToken,
     );
   }
 
@@ -293,7 +314,9 @@ class MediaUploadService {
   Future<BlobDescriptor> uploadVideo(
     XFile pickedVideo, {
     ValueChanged<double>? onProgress,
+    UploadCancellationToken? cancellationToken,
   }) async {
+    _throwIfCancelled(cancellationToken);
     final length = await pickedVideo.length();
     if (length > _maxVideoSizeBytes) {
       throw Exception(
@@ -314,12 +337,14 @@ class MediaUploadService {
         );
       }
       final bytes = await transcodedFile.readAsBytes();
+      _throwIfCancelled(cancellationToken);
       final video = await uploadBytes(
         bytes,
         mimeType: 'video/mp4',
         onProgress: onProgress == null
             ? null
             : (progress) => onProgress(progress * 0.9),
+        cancellationToken: cancellationToken,
       );
 
       // Extract from the canonical output first so the poster matches the
@@ -351,6 +376,7 @@ class MediaUploadService {
       // Posters are best-effort: a video that passed the media policy should
       // still send if the separate preview upload fails.
       try {
+        _throwIfCancelled(cancellationToken);
         final poster = await uploadImage(
           XFile.fromData(
             posterBytes,
@@ -360,6 +386,7 @@ class MediaUploadService {
           onProgress: onProgress == null
               ? null
               : (progress) => onProgress(0.9 + (progress * 0.1)),
+          cancellationToken: cancellationToken,
         );
         return video.withImage(poster.url);
       } catch (error) {
@@ -397,7 +424,9 @@ class MediaUploadService {
   Future<BlobDescriptor> uploadFile(
     XFile pickedFile, {
     ValueChanged<double>? onProgress,
+    UploadCancellationToken? cancellationToken,
   }) async {
+    _throwIfCancelled(cancellationToken);
     final length = await pickedFile.length();
     if (length == 0) {
       throw Exception('File is empty.');
@@ -408,11 +437,13 @@ class MediaUploadService {
       );
     }
     final bytes = await pickedFile.readAsBytes();
+    _throwIfCancelled(cancellationToken);
     final descriptor = await _uploadPreparedBytes(
       bytes,
       mimeType: 'application/octet-stream',
       allowGenericFile: true,
       onProgress: onProgress,
+      cancellationToken: cancellationToken,
     );
     return descriptor.withFilename(_safeAttachmentFilename(pickedFile.name));
   }
@@ -427,7 +458,9 @@ class MediaUploadService {
     Uint8List bytes, {
     required String mimeType,
     ValueChanged<double>? onProgress,
+    UploadCancellationToken? cancellationToken,
   }) async {
+    _throwIfCancelled(cancellationToken);
     if (mimeType == 'image/gif' ||
         (mimeType == 'image/png' && _isAnimatedPng(bytes)) ||
         (mimeType == 'image/webp' && _isAnimatedWebp(bytes))) {
@@ -441,6 +474,7 @@ class MediaUploadService {
       bytes,
       mimeType: mimeType,
       onProgress: onProgress,
+      cancellationToken: cancellationToken,
     );
   }
 
@@ -449,7 +483,9 @@ class MediaUploadService {
     required String mimeType,
     bool allowGenericFile = false,
     ValueChanged<double>? onProgress,
+    UploadCancellationToken? cancellationToken,
   }) async {
+    _throwIfCancelled(cancellationToken);
     if (!allowGenericFile &&
         !_allowedImageMimeTypes.contains(mimeType) &&
         !_allowedVideoMimeTypes.contains(mimeType)) {
@@ -463,6 +499,7 @@ class MediaUploadService {
       sha256: sha256,
       path: _mediaUploadPath,
       onProgress: onProgress,
+      cancellationToken: cancellationToken,
     );
     if (response.statusCode == HttpStatus.notFound ||
         response.statusCode == HttpStatus.methodNotAllowed) {
@@ -472,6 +509,7 @@ class MediaUploadService {
         sha256: sha256,
         path: _legacyMediaUploadPath,
         onProgress: onProgress,
+        cancellationToken: cancellationToken,
       );
     }
     if (response.statusCode < 200 || response.statusCode >= 300) {
@@ -496,10 +534,13 @@ class MediaUploadService {
     required String sha256,
     required String path,
     ValueChanged<double>? onProgress,
+    UploadCancellationToken? cancellationToken,
   }) async {
-    final request = http.StreamedRequest(
+    _throwIfCancelled(cancellationToken);
+    final request = http.AbortableStreamedRequest(
       'PUT',
       Uri.parse(_baseUrl).resolve(path),
+      abortTrigger: cancellationToken?.whenCancelled,
     );
     request.contentLength = bytes.length;
     request.headers.addAll(
@@ -510,7 +551,14 @@ class MediaUploadService {
         .whenComplete(request.sink.close);
     final response = await _http.send(request);
     await writeRequest;
+    _throwIfCancelled(cancellationToken);
     return http.Response.fromStream(response);
+  }
+
+  void _throwIfCancelled(UploadCancellationToken? cancellationToken) {
+    if (cancellationToken?.isCancelled ?? false) {
+      throw const UploadCancelledException();
+    }
   }
 
   Map<String, String> _buildUploadHeaders({

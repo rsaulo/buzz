@@ -2153,10 +2153,13 @@ void main() {
       await _openSystemPhotoPicker(tester);
       await tester.pumpAndSettle();
       await _expandComposer(tester);
+      await tester.enterText(find.byType(TextField), 'Keep this draft');
       await tester.tap(find.byIcon(LucideIcons.arrowUp));
       await tester.pumpAndSettle();
 
       expect(find.textContaining('upload failed'), findsOneWidget);
+      expect(find.text('Keep this draft'), findsOneWidget);
+      expect(find.byTooltip('Remove attachment'), findsOneWidget);
     });
 
     for (final statusCode in [
