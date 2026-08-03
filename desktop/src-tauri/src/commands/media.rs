@@ -573,6 +573,7 @@ async fn process_picked_path(
     path: std::path::PathBuf,
     state: &AppState,
     images_only: bool,
+    progress: Option<(tauri::AppHandle, String)>,
 ) -> Result<BlobDescriptor, String> {
     // Pin the inode by opening the fd BEFORE spawn_blocking. This prevents a
     // local attacker from swapping the file between dialog return and read.
@@ -639,8 +640,7 @@ async fn process_picked_path(
 
     // Upload video first, then poster (best-effort). If poster upload fails,
     // the video descriptor is returned without an image field.
-    let mut descriptor = do_upload(body, &mime, state, None).await?;
-
+    let mut descriptor = do_upload(body, &mime, state, progress).await?;
     if let Some(poster) = poster_bytes {
         match do_upload(poster, "image/jpeg", state, None).await {
             Ok(poster_desc) => descriptor.image = Some(poster_desc.url),
@@ -675,6 +675,7 @@ async fn process_picked_path(
 #[tauri::command]
 pub async fn pick_and_upload_media(
     app: tauri::AppHandle,
+    progress_id: Option<String>,
     state: State<'_, AppState>,
 ) -> Result<Vec<BlobDescriptor>, String> {
     use tauri_plugin_dialog::DialogExt;
@@ -694,7 +695,8 @@ pub async fn pick_and_upload_media(
     let mut descriptors = Vec::with_capacity(file_paths.len());
     for file_path in file_paths {
         let path = file_path.as_path().ok_or("invalid path")?.to_path_buf();
-        let descriptor = process_picked_path(path, &state, false).await?;
+        let progress = progress_id.clone().map(|id| (app.clone(), id));
+        let descriptor = process_picked_path(path, &state, false, progress).await?;
         descriptors.push(descriptor);
     }
 
@@ -735,7 +737,7 @@ pub async fn pick_and_upload_image(
     };
 
     let path = file_path.as_path().ok_or("invalid path")?.to_path_buf();
-    let descriptor = process_picked_path(path, &state, true).await?;
+    let descriptor = process_picked_path(path, &state, true, None).await?;
     Ok(Some(descriptor))
 }
 

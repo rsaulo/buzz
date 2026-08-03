@@ -14,9 +14,15 @@ Widget _testable(
   Widget child, {
   List<Override> overrides = const [],
   bool disableAnimations = false,
+  VideoPreviewFrameLoader? videoPreviewFrameLoader,
 }) {
   return ProviderScope(
-    overrides: overrides,
+    overrides: [
+      videoPreviewFrameLoaderProvider.overrideWithValue(
+        videoPreviewFrameLoader ?? (_) async => null,
+      ),
+      ...overrides,
+    ],
     child: MaterialApp(
       theme: AppTheme.light(),
       home: Builder(
@@ -1075,6 +1081,52 @@ Photos
         expect(find.byIcon(LucideIcons.play), findsOneWidget);
       });
 
+      testWidgets('derives a first frame for a posterless video event', (
+        tester,
+      ) async {
+        const videoUrl = 'https://example.com/media/legacy-video.mp4';
+        var disposed = false;
+
+        await tester.pumpWidget(
+          _testable(
+            const MessageContent(
+              content: '![video]($videoUrl)',
+              tags: [
+                ['imeta', 'url $videoUrl', 'm video/mp4', 'dim 1080x1920'],
+              ],
+            ),
+            videoPreviewFrameLoader: (url) async {
+              expect(url, videoUrl);
+              return LoadedVideoPreviewFrame(
+                aspectRatio: 9 / 16,
+                child: const ColoredBox(
+                  key: ValueKey('derived-video-frame'),
+                  color: Colors.blue,
+                ),
+                dispose: () async => disposed = true,
+              );
+            },
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(
+          find.byKey(
+            const ValueKey('message-media-video-first-frame:$videoUrl'),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.byKey(const ValueKey('derived-video-frame')),
+          findsOneWidget,
+        );
+        expect(find.text('Video attachment'), findsNothing);
+
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump();
+        expect(disposed, isTrue);
+      });
+
       testWidgets(
         'tapping video preview opens overlay viewer with close button',
         (tester) async {
@@ -1134,6 +1186,46 @@ Photos
         },
       );
 
+      testWidgets('swiping down on the video dismisses its viewer', (
+        tester,
+      ) async {
+        await tester.pumpWidget(
+          _testable(
+            const MessageContent(
+              content: '![video](https://example.com/media/clip.mp4)',
+              tags: [
+                [
+                  'imeta',
+                  'url https://example.com/media/clip.mp4',
+                  'm video/mp4',
+                ],
+              ],
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.tap(
+          find.byKey(
+            const ValueKey(
+              'message-media-video-preview:https://example.com/media/clip.mp4',
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        await tester.drag(
+          find.byKey(const ValueKey('message-media-video-viewer-gesture')),
+          const Offset(0, 140),
+        );
+        await tester.pumpAndSettle();
+
+        expect(
+          find.byKey(const ValueKey('message-media-video-viewer')),
+          findsNothing,
+        );
+      });
+
       testWidgets('treats only mp4 fallback URLs as videos', (tester) async {
         await tester.pumpWidget(
           _testable(
@@ -1170,6 +1262,43 @@ Photos
             ),
           ),
           findsOneWidget,
+        );
+      });
+
+      testWidgets('renders an explicitly tagged non-mp4 video preview', (
+        tester,
+      ) async {
+        await tester.pumpWidget(
+          _testable(
+            const MessageContent(
+              content: '![video](https://example.com/media/clip.mov)',
+              tags: [
+                [
+                  'imeta',
+                  'url https://example.com/media/clip.mov',
+                  'm video/quicktime',
+                ],
+              ],
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(
+          find.byKey(
+            const ValueKey(
+              'message-media-video-preview:https://example.com/media/clip.mov',
+            ),
+          ),
+          findsOneWidget,
+        );
+        expect(
+          find.byKey(
+            const ValueKey(
+              'message-media-image-preview:https://example.com/media/clip.mov',
+            ),
+          ),
+          findsNothing,
         );
       });
     });

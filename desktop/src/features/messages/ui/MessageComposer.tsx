@@ -50,6 +50,7 @@ import {
   type MentionSuggestion,
 } from "./MentionAutocomplete";
 import { ComposerDockToolbar } from "./ComposerDockToolbar";
+import { ComposerUploadProgressPill } from "./ComposerUploadProgressPill";
 import { NonMemberMentionDialog } from "./NonMemberMentionDialog";
 import { useMentionSendFlow } from "./useMentionSendFlow";
 import { usePersistentAgentMentionHydration } from "./usePersistentAgentMentionHydration";
@@ -837,9 +838,7 @@ function MessageComposerImpl({
     ],
   );
 
-  const handleCaptureSelection = React.useCallback(() => {
-    // No-op for Tiptap — selection is managed by ProseMirror.
-  }, []);
+  const handleCaptureSelection = React.useCallback(() => {}, []);
 
   const handlePaperclipClick = React.useCallback(() => {
     void media.handlePaperclip();
@@ -897,6 +896,7 @@ function MessageComposerImpl({
             onCancelEdit={onCancelEdit}
             onCancelReply={onCancelReply}
           />
+          <ComposerUploadProgressPill media={media} />
           <form
             className={cn(
               "relative z-10 isolate rounded-2xl border border-border/50 bg-background/80 px-3 pb-2 pt-3 shadow-none supports-[backdrop-filter]:bg-background/70 dark:bg-background/70 dark:supports-[backdrop-filter]:bg-background/55 sm:px-4",

@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:collection';
+import 'dart:io';
 import 'dart:math' as math;
 
 import 'package:camera/camera.dart' as camera;
@@ -42,14 +43,13 @@ part 'compose_bar/markdown_editing_controller.dart';
 part 'compose_bar/suggestions.dart';
 part 'compose_bar/formatting_toolbar.dart';
 part 'compose_bar/attachments.dart';
+part 'compose_bar/upload_progress_pill.dart';
 part 'compose_bar/photo_gallery_picker.dart';
 part 'compose_bar/ios_photo_picker.dart';
 part 'compose_bar/ios_attachment_popover.dart';
 part 'compose_bar/camera_preview.dart';
 part 'compose_bar/send_button.dart';
 part 'compose_bar/layout.dart';
-
-const _maxConcurrentImageUploads = 3;
 
 /// Rich compose bar with @mention autocomplete and a markdown formatting
 /// toolbar. Used in both channel and thread views — the caller provides an
@@ -70,7 +70,6 @@ class ComposeBar extends HookConsumerWidget {
   /// Optional thread IDs for thread-scoped typing indicators.
   final String? threadHeadId;
   final String? rootId;
-
   const ComposeBar({
     super.key,
     required this.channelId,
@@ -80,12 +79,10 @@ class ComposeBar extends HookConsumerWidget {
     this.rootId,
     required this.onSend,
   });
-
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final controller = useMemoized(_MarkdownEditingController.new);
     useEffect(() => controller.dispose, [controller]);
-
     // Restore and persist unsent text as a local draft so the Activity
     // inbox Drafts filter reflects real composer state.
     //
@@ -138,12 +135,13 @@ class ComposeBar extends HookConsumerWidget {
     );
     final isSending = useState(false);
     final showFormatting = useState(false);
-    final attachments = useState<List<BlobDescriptor>>([]);
+    final attachments = useState<List<_PendingAttachment>>([]);
     final uploadError = useState<String?>(null);
     final uploadingCount = useState(0);
+    final uploadProgress = useState(0.0);
+    final uploadGeneration = useRef(0);
     final clipboardHasImage = useState(false);
     final hasAttachments = attachments.value.isNotEmpty;
-    final hasPendingUploads = uploadingCount.value > 0;
     final customEmoji = ref.watch(customEmojiListProvider);
     final reducedMotion = MediaQuery.disableAnimationsOf(context);
     final composerExpansionController = useAnimationController(
@@ -154,11 +152,9 @@ class ComposeBar extends HookConsumerWidget {
     final composerExpansionProgress = composerExpansionValue
         .clamp(0.0, 1.0)
         .toDouble();
-
     final resolvedHint =
         hintText ??
         (channelName.isNotEmpty ? 'Message #$channelName' : 'Message\u2026');
-
     useEffect(() {
       final target = isComposerExpanded.value ? 1.0 : 0.0;
       if (reducedMotion) {
@@ -179,7 +175,6 @@ class ComposeBar extends HookConsumerWidget {
       }
       return null;
     }, [isComposerExpanded.value, reducedMotion]);
-
     useEffect(() {
       if (defaultTargetPlatform != TargetPlatform.iOS) return null;
 
@@ -419,16 +414,14 @@ class ComposeBar extends HookConsumerWidget {
       focusNode.requestFocus();
     }
 
-    void removeAttachment(String url) {
-      attachments.value = _withoutAttachment(attachments.value, url);
+    void removeAttachment(int id) {
+      attachments.value = _withoutAttachment(attachments.value, id);
     }
 
     // Send the message.
     Future<void> send() async {
       final text = controller.text.trim();
-      if ((text.isEmpty && !hasAttachments) ||
-          isSending.value ||
-          hasPendingUploads) {
+      if ((text.isEmpty && !hasAttachments) || isSending.value) {
         return;
       }
 
@@ -502,11 +495,7 @@ class ComposeBar extends HookConsumerWidget {
         }
       }
 
-      final payload = _ComposeDraftPayload.fromDraft(
-        text: text,
-        attachments: attachments.value,
-        customEmoji: customEmoji,
-      );
+      final queuedAttachments = attachments.value;
 
       isSending.value = true;
       try {
@@ -524,47 +513,88 @@ class ComposeBar extends HookConsumerWidget {
               .read(channelActionsProvider)
               .addMembers(channelId: channelId, pubkeys: inviteHumanPubkeys);
         }
-        await onSend(
-          payload.content,
-          mentionPubkeys,
-          mediaTags: [...payload.mediaTags, ...referenceMentionTags],
-        );
-        if (context.mounted) {
-          clearComposer();
+        if (queuedAttachments.isEmpty) {
+          final payload = _ComposeDraftPayload.fromDraft(
+            text: text,
+            attachments: const [],
+            customEmoji: customEmoji,
+          );
+          await onSend(
+            payload.content,
+            mentionPubkeys,
+            mediaTags: [...payload.mediaTags, ...referenceMentionTags],
+          );
+          if (context.mounted) clearComposer();
+          return;
         }
+
+        clearComposer();
+        uploadingCount.value += 1;
+        uploadProgress.value = 0;
+        isSending.value = false;
+        final queueGeneration = uploadGeneration.value;
+        unawaited(() async {
+          try {
+            final uploaded = <BlobDescriptor>[];
+            for (var index = 0; index < queuedAttachments.length; index++) {
+              final attachment = queuedAttachments[index];
+              final descriptor = await _uploadPendingAttachment(
+                ref.read(mediaUploadServiceProvider),
+                attachment,
+                onProgress: (progress) {
+                  if (context.mounted) {
+                    uploadProgress.value =
+                        (index + progress) / queuedAttachments.length;
+                  }
+                },
+              );
+              if (queueGeneration != uploadGeneration.value) return;
+              uploaded.add(descriptor);
+              if (context.mounted) {
+                uploadProgress.value = (index + 1) / queuedAttachments.length;
+              }
+            }
+            final payload = _ComposeDraftPayload.fromDraft(
+              text: text,
+              attachments: uploaded,
+              customEmoji: customEmoji,
+            );
+            if (queueGeneration != uploadGeneration.value) return;
+            await onSend(
+              payload.content,
+              mentionPubkeys,
+              mediaTags: [...payload.mediaTags, ...referenceMentionTags],
+            );
+          } catch (error) {
+            if (context.mounted) uploadError.value = _formatUploadError(error);
+          } finally {
+            if (context.mounted && queueGeneration == uploadGeneration.value) {
+              uploadingCount.value = math.max(0, uploadingCount.value - 1);
+            }
+          }
+        }());
       } finally {
-        if (context.mounted) isSending.value = false;
+        if (context.mounted && isSending.value) isSending.value = false;
       }
     }
 
-    Future<void> pickAndUpload(Future<BlobDescriptor?> Function() pick) async {
+    void queueAttachment(XFile file, _PendingAttachmentKind kind) {
       uploadError.value = null;
-      uploadingCount.value += 1;
-      try {
-        final uploaded = await pick();
-        if (uploaded != null && context.mounted) {
-          attachments.value = [...attachments.value, uploaded];
-        }
-      } catch (error) {
-        if (context.mounted) {
-          uploadError.value = _formatUploadError(error);
-        }
-      } finally {
-        if (context.mounted) {
-          uploadingCount.value -= 1;
-        }
-      }
+      attachments.value = [
+        ...attachments.value,
+        _PendingAttachment(file: file, kind: kind),
+      ];
     }
 
-    Future<void> pickThenUpload({
+    Future<void> pickThenQueue({
       required Future<XFile?> Function() pick,
-      required Future<BlobDescriptor> Function(XFile file) upload,
+      required _PendingAttachmentKind kind,
     }) async {
       uploadError.value = null;
       try {
         final picked = await pick();
         if (picked == null || !context.mounted) return;
-        await pickAndUpload(() => upload(picked));
+        queueAttachment(picked, kind);
       } catch (error) {
         if (context.mounted) {
           uploadError.value = _formatUploadError(error);
@@ -572,62 +602,14 @@ class ComposeBar extends HookConsumerWidget {
       }
     }
 
-    Future<void> uploadImages(List<XFile> images) async {
+    void queueImages(List<XFile> images) {
       if (images.isEmpty) return;
       uploadError.value = null;
-      uploadingCount.value += images.length;
-      try {
-        Future<({BlobDescriptor? uploaded, Object? error})> uploadImage(
-          XFile image,
-        ) async {
-          try {
-            final uploaded = await ref
-                .read(mediaUploadServiceProvider)
-                .uploadImage(image);
-            return (uploaded: uploaded, error: null);
-          } catch (error) {
-            return (uploaded: null, error: error);
-          }
-        }
-
-        final results = <({BlobDescriptor? uploaded, Object? error})>[];
-        for (
-          var start = 0;
-          start < images.length;
-          start += _maxConcurrentImageUploads
-        ) {
-          final end = math.min(
-            start + _maxConcurrentImageUploads,
-            images.length,
-          );
-          results.addAll(
-            await Future.wait([
-              for (final image in images.sublist(start, end))
-                uploadImage(image),
-            ]),
-          );
-        }
-        if (!context.mounted) return;
-
-        final uploaded = [for (final result in results) ?result.uploaded];
-        if (uploaded.isNotEmpty) {
-          attachments.value = [...attachments.value, ...uploaded];
-        }
-        final firstError = results
-            .map((result) => result.error)
-            .whereType<Object>()
-            .firstOrNull;
-        if (firstError != null) {
-          uploadError.value = _formatUploadError(firstError);
-        }
-      } finally {
-        if (context.mounted) {
-          uploadingCount.value = math.max(
-            0,
-            uploadingCount.value - images.length,
-          );
-        }
-      }
+      attachments.value = [
+        ...attachments.value,
+        for (final image in images)
+          _PendingAttachment(file: image, kind: _PendingAttachmentKind.image),
+      ];
     }
 
     Widget buildContextMenu(
@@ -636,9 +618,20 @@ class ComposeBar extends HookConsumerWidget {
     ) {
       void pasteImage() {
         ContextMenuController.removeAny();
-        pickAndUpload(
-          ref.read(mediaUploadServiceProvider).readAndUploadClipboardImage,
-        );
+        unawaited(() async {
+          try {
+            final image = await ref
+                .read(mediaUploadServiceProvider)
+                .readClipboardImage();
+            if (image != null && context.mounted) {
+              queueAttachment(image, _PendingAttachmentKind.image);
+            } else if (context.mounted) {
+              uploadError.value = 'Unable to read pasted image';
+            }
+          } catch (error) {
+            if (context.mounted) uploadError.value = _formatUploadError(error);
+          }
+        }());
       }
 
       if (defaultTargetPlatform == TargetPlatform.iOS &&
@@ -677,10 +670,9 @@ class ComposeBar extends HookConsumerWidget {
         return;
       }
 
-      pickAndUpload(
-        () => ref
-            .read(mediaUploadServiceProvider)
-            .uploadImage(XFile.fromData(bytes)),
+      queueAttachment(
+        XFile.fromData(bytes, name: 'Pasted image'),
+        _PendingAttachmentKind.image,
       );
     }
 
@@ -754,28 +746,27 @@ class ComposeBar extends HookConsumerWidget {
         iosAttachmentPopover
             .present(
               sourceContext: triggerContext,
-              onCapture: (image) => pickAndUpload(
-                () => ref.read(mediaUploadServiceProvider).uploadImage(image),
-              ),
-              onChoosePhotos: uploadImages,
+              onCapture: (image) async =>
+                  queueAttachment(image, _PendingAttachmentKind.image),
+              onChoosePhotos: (photos) async => queueImages(photos),
               onAllPhotos: () => chooseAttachment(() async {
                 final photos = await ref
                     .read(mediaUploadServiceProvider)
                     .pickGalleryImages();
-                await uploadImages(photos);
+                queueImages(photos);
               }, errorMessage: 'Unable to open your photo library.'),
               onVideo: () => chooseAttachment(() {
                 final service = ref.read(mediaUploadServiceProvider);
-                return pickThenUpload(
+                return pickThenQueue(
                   pick: service.pickGalleryVideo,
-                  upload: service.uploadVideo,
+                  kind: _PendingAttachmentKind.video,
                 );
               }),
               onFiles: () => chooseAttachment(() {
                 final service = ref.read(mediaUploadServiceProvider);
-                return pickThenUpload(
+                return pickThenQueue(
                   pick: service.pickAttachmentFile,
-                  upload: service.uploadFile,
+                  kind: _PendingAttachmentKind.file,
                 );
               }),
             )
@@ -859,28 +850,26 @@ class ComposeBar extends HookConsumerWidget {
         },
         onVideo: () => chooseAttachment(() {
           final service = ref.read(mediaUploadServiceProvider);
-          return pickThenUpload(
+          return pickThenQueue(
             pick: service.pickGalleryVideo,
-            upload: service.uploadVideo,
+            kind: _PendingAttachmentKind.video,
           );
         }),
         onFiles: () => chooseAttachment(() {
           final service = ref.read(mediaUploadServiceProvider);
-          return pickThenUpload(
+          return pickThenQueue(
             pick: service.pickAttachmentFile,
-            upload: service.uploadFile,
+            kind: _PendingAttachmentKind.file,
           );
         }),
         onCapture: (image) async {
           attachmentSurface.value = _AttachmentSurface.closed;
-          await pickAndUpload(
-            () => ref.read(mediaUploadServiceProvider).uploadImage(image),
-          );
+          queueAttachment(image, _PendingAttachmentKind.image);
         },
         onPickAllPhotos: ref.read(mediaUploadServiceProvider).pickGalleryImages,
         onChoosePhotos: (photos) async {
           attachmentSurface.value = _AttachmentSurface.closed;
-          await uploadImages(photos);
+          queueImages(photos);
         },
       );
     }
@@ -893,99 +882,113 @@ class ComposeBar extends HookConsumerWidget {
         right: Grid.twelve,
         bottom: MediaQuery.viewPaddingOf(context).bottom + Grid.xxs,
       ),
-      child: OverlayPortal.overlayChildLayoutBuilder(
-        controller: suggestionOverlayController,
-        overlayChildBuilder: (context, layoutInfo) {
-          final composerOrigin = MatrixUtils.transformPoint(
-            layoutInfo.childPaintTransform,
-            Offset.zero,
-          );
-          return ValueListenableBuilder<_AttachmentSurface>(
-            valueListenable: attachmentSurface,
-            builder: (context, surface, _) {
-              final surfaceDuration = reducedMotion
-                  ? Duration.zero
-                  : Duration(
-                      milliseconds:
-                          surface == _AttachmentSurface.camera ||
-                              surface == _AttachmentSurface.photos
-                          ? 320
-                          : 250,
-                    );
-              final expandedSurfaceCoversComposer =
-                  surface == _AttachmentSurface.camera ||
-                  surface == _AttachmentSurface.photos;
-              final overlayAnchorY =
-                  composerOrigin.dy +
-                  (expandedSurfaceCoversComposer
-                      ? layoutInfo.childSize.height + Grid.twelve
-                      : 0);
-              return AnimatedPositioned(
-                duration: surfaceDuration,
-                curve:
-                    surface == _AttachmentSurface.camera ||
-                        surface == _AttachmentSurface.photos
-                    ? const Cubic(0.34, 1.25, 0.64, 1)
-                    : const Cubic(0.22, 1, 0.36, 1),
-                left: composerOrigin.dx,
-                bottom: layoutInfo.overlaySize.height - overlayAnchorY,
-                width: layoutInfo.childSize.width,
-                child: ClipRect(
-                  child: Padding(
-                    padding: const EdgeInsets.only(bottom: Grid.xxs),
-                    child: surface == _AttachmentSurface.closed
-                        ? _SuggestionPanelMotion(
-                            duration: surfaceDuration,
-                            alignment: Alignment.bottomLeft,
-                            child: buildOverlayPanel(surface),
-                          )
-                        : buildOverlayPanel(surface),
-                  ),
-                ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _UploadProgressMotion(
+            visible: uploadingCount.value > 0,
+            progress: uploadProgress.value,
+            reducedMotion: reducedMotion,
+            onCancel: () {
+              uploadGeneration.value += 1;
+              uploadingCount.value = 0;
+              uploadProgress.value = 0;
+            },
+          ),
+          OverlayPortal.overlayChildLayoutBuilder(
+            controller: suggestionOverlayController,
+            overlayChildBuilder: (context, layoutInfo) {
+              final composerOrigin = MatrixUtils.transformPoint(
+                layoutInfo.childPaintTransform,
+                Offset.zero,
+              );
+              return ValueListenableBuilder<_AttachmentSurface>(
+                valueListenable: attachmentSurface,
+                builder: (context, surface, _) {
+                  final surfaceDuration = reducedMotion
+                      ? Duration.zero
+                      : Duration(
+                          milliseconds:
+                              surface == _AttachmentSurface.camera ||
+                                  surface == _AttachmentSurface.photos
+                              ? 320
+                              : 250,
+                        );
+                  final expandedSurfaceCoversComposer =
+                      surface == _AttachmentSurface.camera ||
+                      surface == _AttachmentSurface.photos;
+                  final overlayAnchorY =
+                      composerOrigin.dy +
+                      (expandedSurfaceCoversComposer
+                          ? layoutInfo.childSize.height + Grid.twelve
+                          : 0);
+                  return AnimatedPositioned(
+                    duration: surfaceDuration,
+                    curve:
+                        surface == _AttachmentSurface.camera ||
+                            surface == _AttachmentSurface.photos
+                        ? const Cubic(0.34, 1.25, 0.64, 1)
+                        : const Cubic(0.22, 1, 0.36, 1),
+                    left: composerOrigin.dx,
+                    bottom: layoutInfo.overlaySize.height - overlayAnchorY,
+                    width: layoutInfo.childSize.width,
+                    child: ClipRect(
+                      child: Padding(
+                        padding: const EdgeInsets.only(bottom: Grid.xxs),
+                        child: surface == _AttachmentSurface.closed
+                            ? _SuggestionPanelMotion(
+                                duration: surfaceDuration,
+                                alignment: Alignment.bottomLeft,
+                                child: buildOverlayPanel(surface),
+                              )
+                            : buildOverlayPanel(surface),
+                      ),
+                    ),
+                  );
+                },
               );
             },
-          );
-        },
-        child: _ComposeBarLayout(
-          attachments: attachments.value,
-          uploadingCount: uploadingCount.value,
-          onRemoveAttachment: removeAttachment,
-          uploadError: uploadError.value,
-          isExpanded: isComposerExpanded.value,
-          controller: controller,
-          focusNode: focusNode,
-          contextMenuBuilder: buildContextMenu,
-          onContentInserted: uploadPastedImage,
-          onSend: () => unawaited(send()),
-          resolvedHint: resolvedHint,
-          attachmentSurface: attachmentSurface.value,
-          onAttachmentTap: handleAttachmentTap,
-          onExpand: expandComposer,
-          expansionValue: composerExpansionValue,
-          expansionProgress: composerExpansionProgress,
-          formattingOpen: showFormatting.value,
-          onCloseFormatting: () => showFormatting.value = false,
-          motionDuration: motionDuration,
-          onFormat: applyFormat,
-          onMention: () {
-            attachmentSurface.value = _AttachmentSurface.closed;
-            triggerMention();
-          },
-          onChannel: () {
-            attachmentSurface.value = _AttachmentSurface.closed;
-            triggerChannel();
-          },
-          onEmoji: () {
-            attachmentSurface.value = _AttachmentSurface.closed;
-            showEmojiPicker(context: context, onSelect: insertEmoji);
-          },
-          onOpenFormatting: () {
-            attachmentSurface.value = _AttachmentSurface.closed;
-            showFormatting.value = true;
-          },
-          hasPendingUploads: hasPendingUploads,
-          isSending: isSending.value,
-        ),
+            child: _ComposeBarLayout(
+              attachments: attachments.value,
+              onRemoveAttachment: removeAttachment,
+              uploadError: uploadError.value,
+              isExpanded: isComposerExpanded.value,
+              controller: controller,
+              focusNode: focusNode,
+              contextMenuBuilder: buildContextMenu,
+              onContentInserted: uploadPastedImage,
+              onSend: () => unawaited(send()),
+              resolvedHint: resolvedHint,
+              attachmentSurface: attachmentSurface.value,
+              onAttachmentTap: handleAttachmentTap,
+              onExpand: expandComposer,
+              expansionValue: composerExpansionValue,
+              expansionProgress: composerExpansionProgress,
+              formattingOpen: showFormatting.value,
+              onCloseFormatting: () => showFormatting.value = false,
+              motionDuration: motionDuration,
+              onFormat: applyFormat,
+              onMention: () {
+                attachmentSurface.value = _AttachmentSurface.closed;
+                triggerMention();
+              },
+              onChannel: () {
+                attachmentSurface.value = _AttachmentSurface.closed;
+                triggerChannel();
+              },
+              onEmoji: () {
+                attachmentSurface.value = _AttachmentSurface.closed;
+                showEmojiPicker(context: context, onSelect: insertEmoji);
+              },
+              onOpenFormatting: () {
+                attachmentSurface.value = _AttachmentSurface.closed;
+                showFormatting.value = true;
+              },
+              hasPendingUploads: false,
+              isSending: isSending.value,
+            ),
+          ),
+        ],
       ),
     );
   }

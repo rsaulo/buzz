@@ -4,7 +4,6 @@ class _CustomChannelSection extends StatelessWidget {
   final ChannelSection section;
   final List<Channel> channels;
   final Set<String> unreadChannelIds;
-  final Map<String, int> unreadChannelCounts;
   final Set<String> mutedChannelIds;
   final String? currentPubkey;
   final bool expanded;
@@ -23,7 +22,6 @@ class _CustomChannelSection extends StatelessWidget {
     required this.section,
     required this.channels,
     required this.unreadChannelIds,
-    required this.unreadChannelCounts,
     required this.mutedChannelIds,
     required this.currentPubkey,
     required this.expanded,
@@ -64,7 +62,6 @@ class _CustomChannelSection extends StatelessWidget {
               for (final channel in channels)
                 _ChannelTile(
                   channel: channel,
-                  unreadCount: unreadChannelCounts[channel.id],
                   isUnread: unreadChannelIds.contains(channel.id),
                   isMuted: mutedChannelIds.contains(channel.id),
                   currentPubkey: currentPubkey,
@@ -286,7 +283,6 @@ class _ChannelSection extends StatelessWidget {
   final List<Channel> channels;
   final bool showTopDivider;
   final Set<String> unreadChannelIds;
-  final Map<String, int> unreadChannelCounts;
   final Set<String> mutedChannelIds;
   final String? currentPubkey;
   final String emptyLabel;
@@ -300,7 +296,6 @@ class _ChannelSection extends StatelessWidget {
     required this.channels,
     required this.showTopDivider,
     required this.unreadChannelIds,
-    required this.unreadChannelCounts,
     required this.mutedChannelIds,
     required this.currentPubkey,
     required this.emptyLabel,
@@ -343,7 +338,6 @@ class _ChannelSection extends StatelessWidget {
                 for (final channel in channels)
                   _ChannelTile(
                     channel: channel,
-                    unreadCount: unreadChannelCounts[channel.id],
                     isUnread: unreadChannelIds.contains(channel.id),
                     isMuted: mutedChannelIds.contains(channel.id),
                     currentPubkey: currentPubkey,

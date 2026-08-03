@@ -1069,70 +1069,75 @@ void main() {
       expect(tester.takeException(), isNull);
     });
 
-    testWidgets('can jump back to latest after a non-drag user scroll', (
-      tester,
-    ) async {
-      final initialMessages = [
-        for (var i = 0; i < 40; i++)
-          _textMsg(
-            id: 'msg$i',
-            pubkey: 'alice',
-            content: 'Message $i',
-            createdAt: 1000 + i,
+    testWidgets(
+      'shows Latest only after a new message arrives while scrolled',
+      (tester) async {
+        final initialMessages = [
+          for (var i = 0; i < 40; i++)
+            _textMsg(
+              id: 'msg$i',
+              pubkey: 'alice',
+              content: 'Message $i',
+              createdAt: 1000 + i,
+            ),
+        ];
+        final messagesNotifier = _FakeMessagesNotifier(initialMessages);
+
+        await tester.pumpWidget(
+          _buildTestable(
+            messages: const [],
+            messagesNotifier: messagesNotifier,
+            users: const {
+              'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
+            },
           ),
-      ];
-      final messagesNotifier = _FakeMessagesNotifier(initialMessages);
+        );
+        await tester.pumpAndSettle();
 
-      await tester.pumpWidget(
-        _buildTestable(
-          messages: const [],
-          messagesNotifier: messagesNotifier,
-          users: const {
-            'alice': UserProfile(pubkey: 'alice', displayName: 'Alice'),
-          },
-        ),
-      );
-      await tester.pumpAndSettle();
+        final messageList = find.byKey(const ValueKey('channel-message-list'));
+        final messageListElement = tester.element(messageList);
+        UserScrollNotification(
+          metrics: FixedScrollMetrics(
+            minScrollExtent: 0,
+            maxScrollExtent: 100,
+            pixels: 0,
+            viewportDimension: 100,
+            axisDirection: AxisDirection.down,
+            devicePixelRatio: 1,
+          ),
+          context: messageListElement,
+          direction: ScrollDirection.reverse,
+        ).dispatch(messageListElement);
+        final listView = tester.widget<ScrollablePositionedList>(messageList);
+        listView.itemScrollController!.jumpTo(index: 39);
+        await tester.pumpAndSettle();
+        expect(
+          find.byKey(const ValueKey('channel-jump-to-latest')),
+          findsNothing,
+        );
 
-      final messageList = find.byKey(const ValueKey('channel-message-list'));
-      final messageListElement = tester.element(messageList);
-      UserScrollNotification(
-        metrics: FixedScrollMetrics(
-          minScrollExtent: 0,
-          maxScrollExtent: 100,
-          pixels: 0,
-          viewportDimension: 100,
-          axisDirection: AxisDirection.down,
-          devicePixelRatio: 1,
-        ),
-        context: messageListElement,
-        direction: ScrollDirection.reverse,
-      ).dispatch(messageListElement);
-      final listView = tester.widget<ScrollablePositionedList>(messageList);
-      listView.itemScrollController!.jumpTo(index: 39);
-      await tester.pumpAndSettle();
-      expect(
-        find.byKey(const ValueKey('channel-jump-to-latest')),
-        findsOneWidget,
-      );
+        messagesNotifier.setMessages([
+          ...initialMessages,
+          _textMsg(
+            id: 'newest',
+            pubkey: 'alice',
+            content: 'Newest live update',
+            createdAt: 2000,
+          ),
+        ]);
+        await tester.pump();
 
-      messagesNotifier.setMessages([
-        ...initialMessages,
-        _textMsg(
-          id: 'newest',
-          pubkey: 'alice',
-          content: 'Newest live update',
-          createdAt: 2000,
-        ),
-      ]);
-      await tester.pump();
+        expect(findRichText('Newest live update'), findsNothing);
+        expect(
+          find.byKey(const ValueKey('channel-jump-to-latest')),
+          findsOneWidget,
+        );
+        await tester.tap(find.byKey(const ValueKey('channel-jump-to-latest')));
+        await tester.pumpAndSettle();
 
-      expect(findRichText('Newest live update'), findsNothing);
-      await tester.tap(find.byKey(const ValueKey('channel-jump-to-latest')));
-      await tester.pumpAndSettle();
-
-      expect(findRichText('Newest live update'), findsOneWidget);
-    });
+        expect(findRichText('Newest live update'), findsOneWidget);
+      },
+    );
 
     testWidgets(
       'keeps follow mode off while a tall newest message stays visible',
@@ -1182,7 +1187,7 @@ void main() {
         expect(findRichText('Newest message line 0'), findsOneWidget);
         expect(
           find.byKey(const ValueKey('channel-jump-to-latest')),
-          findsOneWidget,
+          findsNothing,
         );
 
         messagesNotifier.setMessages([
@@ -1234,7 +1239,7 @@ void main() {
       expect(findRichText('Message 39'), findsNothing);
       expect(
         find.byKey(const ValueKey('channel-jump-to-latest')),
-        findsOneWidget,
+        findsNothing,
       );
 
       messagesNotifier.setMessages([
@@ -1250,6 +1255,10 @@ void main() {
 
       expect(findRichText('Message 5'), findsOneWidget);
       expect(findRichText('Newest live update'), findsNothing);
+      expect(
+        find.byKey(const ValueKey('channel-jump-to-latest')),
+        findsOneWidget,
+      );
     });
 
     testWidgets(

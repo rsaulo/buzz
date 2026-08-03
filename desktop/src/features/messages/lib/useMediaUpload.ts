@@ -374,7 +374,7 @@ export function useMediaUpload() {
     const previewId = reserveUploadingPreview();
     setUploadingCount((c) => c + 1);
     try {
-      const descriptors = await pickAndUploadMedia();
+      const descriptors = await pickAndUploadMedia(uploadProgressId(previewId));
       if (isUploadCanceled(previewId)) return;
       finishUpload(previewId);
       for (const descriptor of descriptors) {

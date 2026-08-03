@@ -1102,7 +1102,7 @@ void main() {
       ]);
     });
 
-    testWidgets('bounds concurrent system-selected photo uploads', (
+    testWidgets('defers system-selected photo uploads until send', (
       tester,
     ) async {
       final releaseFirstBatch = Completer<void>();
@@ -1154,19 +1154,8 @@ void main() {
       );
 
       await _openSystemPhotoPicker(tester);
-      for (var frame = 0; frame < 20 && requestsStarted < 3; frame += 1) {
-        await tester.pump(const Duration(milliseconds: 20));
-      }
-
-      expect(requestsStarted, 3);
-      expect(peakActiveRequests, 3);
-
-      releaseFirstBatch.complete();
-      await tester.pumpAndSettle();
-
-      expect(requestsStarted, 5);
-      expect(peakActiveRequests, 3);
-      expect(find.byTooltip('Remove attachment'), findsNWidgets(5));
+      expect(requestsStarted, 0);
+      expect(peakActiveRequests, 0);
     });
 
     testWidgets('numbers recent photo selection and returns to the menu', (
@@ -1444,62 +1433,130 @@ void main() {
       );
     });
 
-    testWidgets('keeps upload progress visible after the picker closes', (
-      tester,
-    ) async {
-      final uploadResponse = Completer<http.Response>();
-      final uploadService = MediaUploadService(
-        baseUrl: 'https://relay.example',
-        nsec: nostr.Keys.generate().nsec,
-        httpClient: http_testing.MockClient((request) => uploadResponse.future),
-        pickGalleryVideo: () async => null,
-        pickGalleryImage: () async => null,
-        pickGalleryImages: () async => [
-          XFile.fromData(_pngBytes, name: 'tiny.png'),
-        ],
-      );
+    testWidgets(
+      'shows post-send upload progress above the composer and cancels',
+      (tester) async {
+        final uploadResponse = Completer<http.Response>();
+        var sent = false;
+        final uploadService = MediaUploadService(
+          baseUrl: 'https://relay.example',
+          nsec: nostr.Keys.generate().nsec,
+          httpClient: http_testing.MockClient(
+            (request) => uploadResponse.future,
+          ),
+          pickGalleryVideo: () async => null,
+          pickGalleryImage: () async => null,
+          pickGalleryImages: () async => [
+            XFile.fromData(_pngBytes, name: 'tiny.png'),
+          ],
+        );
 
-      await tester.pumpWidget(
-        _buildComposeBar(
-          uploadService: uploadService,
-          onSend:
-              (
-                content,
-                mentionPubkeys, {
-                mediaTags = const <List<String>>[],
-              }) async {},
-        ),
-      );
+        await tester.pumpWidget(
+          _buildComposeBar(
+            uploadService: uploadService,
+            onSend:
+                (
+                  content,
+                  mentionPubkeys, {
+                  mediaTags = const <List<String>>[],
+                }) async {
+                  sent = true;
+                },
+          ),
+        );
 
-      await _openSystemPhotoPicker(tester);
-      await tester.pump();
+        await _openSystemPhotoPicker(tester);
+        await tester.pump();
 
-      expect(
-        find.byKey(const ValueKey('compose-upload-progress')),
-        findsOneWidget,
-      );
-      expect(find.bySemanticsLabel('Uploading attachment…'), findsOneWidget);
+        expect(
+          find.byKey(const ValueKey('compose-upload-progress')),
+          findsNothing,
+        );
 
-      uploadResponse.complete(
-        http.Response(
-          jsonEncode({
-            'url': 'https://relay.example/media/test.png',
-            'sha256':
-                '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
-            'size': 16,
-            'type': 'image/png',
-            'uploaded': 1,
-          }),
-          200,
-        ),
-      );
-      await tester.pumpAndSettle();
+        await _expandComposer(tester);
+        await tester.tap(find.byIcon(LucideIcons.arrowUp));
+        await tester.pump();
 
-      expect(
-        find.byKey(const ValueKey('compose-upload-progress')),
-        findsNothing,
-      );
-    });
+        expect(
+          find.byKey(const ValueKey('compose-upload-progress')),
+          findsOneWidget,
+        );
+        expect(find.text('Uploading'), findsOneWidget);
+        expect(find.text('100%'), findsOneWidget);
+        expect(
+          find.byKey(const ValueKey('compose-upload-cancel')),
+          findsOneWidget,
+        );
+        expect(
+          tester
+              .widget<AnimatedFractionallySizedBox>(
+                find.byKey(const ValueKey('compose-upload-progress-fill')),
+              )
+              .widthFactor,
+          1,
+        );
+        final progressFill = tester.widget<ColoredBox>(
+          find.descendant(
+            of: find.byKey(const ValueKey('compose-upload-progress-fill')),
+            matching: find.byType(ColoredBox),
+          ),
+        );
+        expect(progressFill.color.a, closeTo(0.12, 0.001));
+        expect(
+          tester
+              .widget<AnimatedFractionallySizedBox>(
+                find.byKey(const ValueKey('compose-upload-progress-fill')),
+              )
+              .heightFactor,
+          1,
+        );
+        expect(
+          tester
+              .widget<Padding>(
+                find.byKey(const ValueKey('compose-upload-cancel-padding')),
+              )
+              .padding,
+          const EdgeInsets.symmetric(
+            horizontal: Grid.half,
+            vertical: Grid.quarter,
+          ),
+        );
+
+        await tester.pump(const Duration(milliseconds: 220));
+        await tester.tap(find.byKey(const ValueKey('compose-upload-cancel')));
+        await tester.pump();
+        expect(
+          find.byKey(const ValueKey('compose-upload-progress')),
+          findsOneWidget,
+        );
+        await tester.pumpAndSettle();
+        expect(
+          find.byKey(const ValueKey('compose-upload-progress')),
+          findsNothing,
+        );
+
+        uploadResponse.complete(
+          http.Response(
+            jsonEncode({
+              'url': 'https://relay.example/media/test.png',
+              'sha256':
+                  '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+              'size': 16,
+              'type': 'image/png',
+              'uploaded': 1,
+            }),
+            200,
+          ),
+        );
+        await tester.pumpAndSettle();
+
+        expect(
+          find.byKey(const ValueKey('compose-upload-progress')),
+          findsNothing,
+        );
+        expect(sent, isFalse);
+      },
+    );
 
     testWidgets('renders markdown formatting without visible delimiters', (
       tester,
@@ -1672,21 +1729,14 @@ void main() {
       await tester.pumpAndSettle();
 
       expect(galleryPickerCalled, isFalse);
-      expect(uploadedBytes, _pngBytes);
-      expect(uploadedMimeType, 'image/png');
-      expect(
-        find.byKey(
-          const ValueKey(
-            'compose-attachment:https://relay.example/media/pasted.png',
-          ),
-        ),
-        findsOneWidget,
-      );
+      expect(uploadedBytes, isNull);
       expect(find.byTooltip('Remove attachment'), findsOneWidget);
 
       await tester.tap(find.byIcon(LucideIcons.arrowUp));
       await tester.pumpAndSettle();
 
+      expect(uploadedBytes, _pngBytes);
+      expect(uploadedMimeType, 'image/png');
       expect(sentContent, '\n![image](https://relay.example/media/pasted.png)');
       expect(sentMediaTags, hasLength(1));
       expect(
@@ -1755,14 +1805,7 @@ void main() {
         pasteImage.onPressed();
         await tester.pumpAndSettle();
 
-        expect(
-          find.byKey(
-            const ValueKey(
-              'compose-attachment:https://relay.example/media/ios-native-paste.png',
-            ),
-          ),
-          findsOneWidget,
-        );
+        expect(find.byTooltip('Remove attachment'), findsOneWidget);
       } finally {
         debugDefaultTargetPlatformOverride = previousPlatform;
       }
@@ -1884,14 +1927,7 @@ void main() {
         pasteImage.onPressed!();
         await tester.pumpAndSettle();
 
-        expect(
-          find.byKey(
-            const ValueKey(
-              'compose-attachment:https://relay.example/media/ios-paste.png',
-            ),
-          ),
-          findsOneWidget,
-        );
+        expect(find.byTooltip('Remove attachment'), findsOneWidget);
       } finally {
         debugDefaultTargetPlatformOverride = previousPlatform;
       }
@@ -2060,18 +2096,20 @@ void main() {
       await _openSystemPhotoPicker(tester);
       await tester.pumpAndSettle();
 
-      final attachmentFinder = find.byKey(
-        const ValueKey(
-          'compose-attachment:https://relay.example/media/test.png',
-        ),
-      );
       final removeButtonFinder = find.byTooltip('Remove attachment');
 
-      expect(attachmentFinder, findsOneWidget);
       expect(removeButtonFinder, findsOneWidget);
 
-      final attachmentTopRight = tester.getTopRight(attachmentFinder);
-      final attachmentTopLeft = tester.getTopLeft(attachmentFinder);
+      final attachmentTopRight = tester.getTopRight(
+        find
+            .ancestor(of: removeButtonFinder, matching: find.byType(Container))
+            .first,
+      );
+      final attachmentTopLeft = tester.getTopLeft(
+        find
+            .ancestor(of: removeButtonFinder, matching: find.byType(Container))
+            .first,
+      );
       final removeButtonCenter = tester.getCenter(removeButtonFinder);
 
       expect(
@@ -2114,6 +2152,9 @@ void main() {
 
       await _openSystemPhotoPicker(tester);
       await tester.pumpAndSettle();
+      await _expandComposer(tester);
+      await tester.tap(find.byIcon(LucideIcons.arrowUp));
+      await tester.pumpAndSettle();
 
       expect(find.textContaining('upload failed'), findsOneWidget);
     });
@@ -2153,6 +2194,9 @@ void main() {
         );
 
         await _openSystemPhotoPicker(tester);
+        await tester.pumpAndSettle();
+        await _expandComposer(tester);
+        await tester.tap(find.byIcon(LucideIcons.arrowUp));
         await tester.pumpAndSettle();
 
         expect(
@@ -2203,14 +2247,7 @@ void main() {
       await _openSystemPhotoPicker(tester);
       await tester.pumpAndSettle();
 
-      expect(
-        find.byKey(
-          const ValueKey(
-            'compose-attachment:https://relay.example/media/animated.gif',
-          ),
-        ),
-        findsOneWidget,
-      );
+      expect(find.byTooltip('Remove attachment'), findsOneWidget);
     });
 
     testWidgets('adds a selected non-member agent as a bot before sending', (
@@ -2498,14 +2535,7 @@ void main() {
       await _openSystemPhotoPicker(tester);
       await tester.pumpAndSettle();
 
-      expect(
-        find.byKey(
-          const ValueKey(
-            'compose-attachment:https://relay.example/media/animated.png',
-          ),
-        ),
-        findsOneWidget,
-      );
+      expect(find.byTooltip('Remove attachment'), findsOneWidget);
     });
 
     // Skip: video upload relies on native platform bridging

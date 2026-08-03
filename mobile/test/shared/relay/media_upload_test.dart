@@ -1340,6 +1340,127 @@ void main() {
       }
     });
 
+    test(
+      'uploads a generated poster and links it from the video imeta',
+      () async {
+        final keychain = nostr.Keys.generate();
+        final requestTypes = <String>[];
+        final client = http_testing.MockClient((request) async {
+          final type = request.headers['Content-Type']!;
+          requestTypes.add(type);
+          final isPoster = type == 'image/jpeg';
+          return http.Response(
+            jsonEncode({
+              'url': isPoster
+                  ? 'https://relay.example/media/poster.jpg'
+                  : 'https://relay.example/media/test.mp4',
+              'sha256':
+                  '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+              'size': 32,
+              'type': type,
+              'uploaded': 1,
+            }),
+            200,
+          );
+        });
+
+        final (xfile, tempFile) = await writeTempVideo(
+          buildFtypHeader('qt  '),
+          'clip.mov',
+        );
+        try {
+          final service = MediaUploadService(
+            baseUrl: 'https://relay.example',
+            nsec: keychain.nsec,
+            httpClient: client,
+            pickGalleryVideo: () async => xfile,
+            pickGalleryImage: () async => null,
+            transcodeVideoToMp4: (path) async {
+              final outDir = await Directory.systemTemp.createTemp(
+                'transcode_',
+              );
+              final outFile = File('${outDir.path}/out.mp4');
+              await outFile.writeAsBytes(buildFtypHeader('isom'));
+              return outFile.path;
+            },
+            generateVideoPoster: (_) async => _jpegBytes,
+            sanitizeImageBytes: (bytes, _) async => bytes,
+            now: () => DateTime.fromMillisecondsSinceEpoch(1_700_000_000_000),
+          );
+
+          final descriptor = await service.pickAndUploadVideo();
+
+          expect(descriptor?.image, 'https://relay.example/media/poster.jpg');
+          expect(
+            descriptor?.toImetaTag(),
+            contains('image https://relay.example/media/poster.jpg'),
+          );
+          expect(requestTypes, ['video/mp4', 'image/jpeg']);
+        } finally {
+          await tempFile.parent.delete(recursive: true);
+        }
+      },
+    );
+
+    test(
+      'falls back to the picked video when the exported poster fails',
+      () async {
+        final sourcePaths = <String>[];
+        final client = http_testing.MockClient((request) async {
+          final type = request.headers['Content-Type']!;
+          return http.Response(
+            jsonEncode({
+              'url': type == 'image/jpeg'
+                  ? 'https://relay.example/media/poster.jpg'
+                  : 'https://relay.example/media/test.mp4',
+              'sha256':
+                  '0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+              'size': request.bodyBytes.length,
+              'type': type,
+              'uploaded': 1,
+            }),
+            200,
+          );
+        });
+
+        final (xfile, tempFile) = await writeTempVideo(
+          buildFtypHeader('qt  '),
+          'clip.mov',
+        );
+        try {
+          final service = MediaUploadService(
+            baseUrl: 'https://relay.example',
+            nsec: nostr.Keys.generate().nsec,
+            httpClient: client,
+            pickGalleryVideo: () async => xfile,
+            pickGalleryImage: () async => null,
+            transcodeVideoToMp4: (path) async {
+              final outDir = await Directory.systemTemp.createTemp(
+                'transcode_',
+              );
+              final outFile = File('${outDir.path}/out.mp4');
+              await outFile.writeAsBytes(buildFtypHeader('isom'));
+              return outFile.path;
+            },
+            generateVideoPoster: (path) async {
+              sourcePaths.add(path);
+              if (sourcePaths.length == 1) throw Exception('frame unavailable');
+              return _jpegBytes;
+            },
+            sanitizeImageBytes: (bytes, _) async => bytes,
+          );
+
+          final descriptor = await service.pickAndUploadVideo();
+
+          expect(sourcePaths, hasLength(2));
+          expect(sourcePaths.last, xfile.path);
+          expect(descriptor?.image, 'https://relay.example/media/poster.jpg');
+        } finally {
+          await tempFile.parent.delete(recursive: true);
+        }
+      },
+    );
+
     test('returns null when video picker is cancelled', () async {
       final service = MediaUploadService(
         baseUrl: 'https://relay.example',

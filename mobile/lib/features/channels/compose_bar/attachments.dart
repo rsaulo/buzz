@@ -272,6 +272,38 @@ class _ComposeDraftPayload {
   }
 }
 
+enum _PendingAttachmentKind { image, video, file }
+
+@immutable
+class _PendingAttachment {
+  static var _nextId = 0;
+
+  final int id;
+  final XFile file;
+  final _PendingAttachmentKind kind;
+
+  _PendingAttachment({required this.file, required this.kind}) : id = _nextId++;
+}
+
+Future<BlobDescriptor> _uploadPendingAttachment(
+  MediaUploadService service,
+  _PendingAttachment attachment, {
+  ValueChanged<double>? onProgress,
+}) => switch (attachment.kind) {
+  _PendingAttachmentKind.image => service.uploadImage(
+    attachment.file,
+    onProgress: onProgress,
+  ),
+  _PendingAttachmentKind.video => service.uploadVideo(
+    attachment.file,
+    onProgress: onProgress,
+  ),
+  _PendingAttachmentKind.file => service.uploadFile(
+    attachment.file,
+    onProgress: onProgress,
+  ),
+};
+
 class _AttachmentTrigger extends StatelessWidget {
   final _AttachmentSurface surface;
   final bool formattingOpen;
@@ -457,26 +489,21 @@ class _AttachmentMenuItem extends StatelessWidget {
   }
 }
 
-List<BlobDescriptor> _withoutAttachment(
-  List<BlobDescriptor> attachments,
-  String url,
+List<_PendingAttachment> _withoutAttachment(
+  List<_PendingAttachment> attachments,
+  int id,
 ) {
   return [
     for (final attachment in attachments)
-      if (attachment.url != url) attachment,
+      if (attachment.id != id) attachment,
   ];
 }
 
 class _AttachmentStrip extends StatelessWidget {
-  final List<BlobDescriptor> attachments;
-  final int uploadingCount;
-  final void Function(String url) onRemove;
+  final List<_PendingAttachment> attachments;
+  final ValueChanged<int> onRemove;
 
-  const _AttachmentStrip({
-    required this.attachments,
-    required this.uploadingCount,
-    required this.onRemove,
-  });
+  const _AttachmentStrip({required this.attachments, required this.onRemove});
 
   @override
   Widget build(BuildContext context) {
@@ -487,70 +514,12 @@ class _AttachmentStrip extends StatelessWidget {
       height: thumbHeight,
       child: ListView.separated(
         scrollDirection: Axis.horizontal,
-        itemCount: attachments.length + (uploadingCount > 0 ? 1 : 0),
+        itemCount: attachments.length,
         separatorBuilder: (_, _) => const SizedBox(width: Grid.half),
         itemBuilder: (context, index) {
-          if (index == attachments.length) {
-            final label = uploadingCount == 1
-                ? 'Uploading attachment…'
-                : 'Uploading $uploadingCount attachments…';
-            return Semantics(
-              excludeSemantics: true,
-              liveRegion: true,
-              label: label,
-              child: Container(
-                key: const ValueKey('compose-upload-progress'),
-                width: thumbWidth,
-                decoration: BoxDecoration(
-                  color: context.colors.surface,
-                  borderRadius: BorderRadius.circular(Radii.md),
-                  border: Border.all(color: context.colors.outlineVariant),
-                ),
-                child: Stack(
-                  alignment: Alignment.center,
-                  children: [
-                    BuzzLoadingIndicator(
-                      size: 34,
-                      color: context.colors.primary,
-                      semanticLabel: label,
-                    ),
-                    if (uploadingCount > 1)
-                      PositionedDirectional(
-                        top: Grid.quarter,
-                        end: Grid.quarter,
-                        child: Container(
-                          key: const ValueKey('compose-upload-count'),
-                          constraints: const BoxConstraints(
-                            minWidth: 22,
-                            minHeight: 22,
-                          ),
-                          alignment: Alignment.center,
-                          decoration: BoxDecoration(
-                            color: context.colors.primary,
-                            shape: BoxShape.circle,
-                          ),
-                          padding: const EdgeInsets.all(3),
-                          child: Text(
-                            '$uploadingCount',
-                            style: context.textTheme.labelSmall?.copyWith(
-                              color: context.colors.onPrimary,
-                              fontWeight: FontWeight.w700,
-                            ),
-                          ),
-                        ),
-                      ),
-                  ],
-                ),
-              ),
-            );
-          }
-
           final attachment = attachments[index];
-          final isVideo = attachment.type.startsWith('video/');
-          final isImage = attachment.type.startsWith('image/');
-          final previewUrl = attachment.thumb ?? attachment.url;
           return Container(
-            key: ValueKey('compose-attachment:${attachment.url}'),
+            key: ValueKey('compose-attachment:${attachment.id}'),
             width: thumbWidth,
             decoration: BoxDecoration(
               borderRadius: BorderRadius.circular(Radii.md),
@@ -561,7 +530,7 @@ class _AttachmentStrip extends StatelessWidget {
               children: [
                 ClipRRect(
                   borderRadius: BorderRadius.circular(Radii.md),
-                  child: isVideo
+                  child: attachment.kind == _PendingAttachmentKind.video
                       ? ColoredBox(
                           color: Colors.black,
                           child: Center(
@@ -572,9 +541,10 @@ class _AttachmentStrip extends StatelessWidget {
                             ),
                           ),
                         )
-                      : isImage
-                      ? MediaImage(
-                          url: previewUrl,
+                      : attachment.kind == _PendingAttachmentKind.image &&
+                            attachment.file.path.isNotEmpty
+                      ? Image.file(
+                          File(attachment.file.path),
                           fit: BoxFit.cover,
                           errorBuilder: (_, _, _) => ColoredBox(
                             color: context.colors.surface,
@@ -597,7 +567,9 @@ class _AttachmentStrip extends StatelessWidget {
                                 ),
                                 const SizedBox(height: Grid.quarter),
                                 Text(
-                                  attachment.filename ?? 'File',
+                                  attachment.file.name.isEmpty
+                                      ? 'File'
+                                      : attachment.file.name,
                                   maxLines: 2,
                                   textAlign: TextAlign.center,
                                   overflow: TextOverflow.ellipsis,
@@ -617,7 +589,7 @@ class _AttachmentStrip extends StatelessWidget {
                     width: 24,
                     height: 24,
                     child: IconButton(
-                      onPressed: () => onRemove(attachment.url),
+                      onPressed: () => onRemove(attachment.id),
                       tooltip: 'Remove attachment',
                       visualDensity: VisualDensity.compact,
                       style: IconButton.styleFrom(
