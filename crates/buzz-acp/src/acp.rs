@@ -20,6 +20,11 @@ use crate::usage::{TurnUsage, UsageTracker};
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 
+/// Bank selectors that must never cross the harness/agent process boundary.
+/// Repository-local Hindsight configuration owns bank selection so one
+/// long-lived harness can safely serve sessions from multiple projects.
+const REMOVED_HINDSIGHT_BANK_ENV: [&str; 2] = ["HINDSIGHT_BANK_ID", "HINDSIGHT_DYNAMIC_BANK_ID"];
+
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
@@ -513,6 +518,27 @@ impl AcpClient {
             cmd.env("CODEX_CONFIG", merged);
         }
 
+        // Command inherits the parent environment by default, and ordinary
+        // `env` entries above only replace individual inherited keys. Remove
+        // Hindsight bank selectors after every merge layer so neither parent
+        // env nor persona env can override repository-local bank selection.
+        let removed_hindsight_bank_env = REMOVED_HINDSIGHT_BANK_ENV
+            .iter()
+            .copied()
+            .filter(|key| {
+                std::env::var_os(key).is_some() || extra_env.iter().any(|(name, _)| name == *key)
+            })
+            .collect::<Vec<_>>();
+        for key in REMOVED_HINDSIGHT_BANK_ENV {
+            cmd.env_remove(key);
+        }
+        if !removed_hindsight_bank_env.is_empty() {
+            tracing::info!(
+                variables = ?removed_hindsight_bank_env,
+                "removed Hindsight bank overrides from agent subprocess environment"
+            );
+        }
+
         // Spawn the agent in its own process group so SIGKILL doesn't propagate
         // to the harness's own process group on Unix.
         // tokio::process::Command::process_group is a stable tokio API (no extra imports needed).
@@ -628,10 +654,12 @@ impl AcpClient {
     /// - `Some(SystemPromptTransport::ClaudeMeta(text))` — `_meta.systemPrompt`
     ///   as `{"append": text}`, keeping claude-agent-acp's native preset intact.
     ///
-    /// `session_title` rides in `_meta.sessionTitle` when `Some`; `_meta` is
-    /// omitted entirely otherwise, since adapters may distinguish an absent
-    /// member from a null one. When both `ClaudeMeta` and `session_title` are
-    /// present the two `_meta` members are merged into a single object.
+    /// `session_title` rides in `_meta.sessionTitle` when `Some`.
+    /// `isolate_claude_user_config` adds
+    /// `_meta.claudeCode.options.settingSources: ["project", "local"]`, which
+    /// claude-agent-acp merges over its user-inclusive default. `_meta` is
+    /// omitted when none of these options apply. Multiple `_meta` members are
+    /// merged into a single object.
     ///
     /// Callers use [`extract_model_config_options`] and [`extract_model_state`]
     /// to pull model info from the raw result.
@@ -641,6 +669,7 @@ impl AcpClient {
         mcp_servers: Vec<McpServer>,
         system_prompt: Option<SystemPromptTransport<'_>>,
         session_title: Option<&str>,
+        isolate_claude_user_config: bool,
     ) -> Result<SessionNewResponse, AcpError> {
         let mut params = serde_json::json!({
             "cwd": cwd,
@@ -659,6 +688,10 @@ impl AcpClient {
         if let Some(title) = session_title {
             // Merge — _meta may already carry systemPrompt from ClaudeMeta above.
             params["_meta"]["sessionTitle"] = serde_json::Value::String(title.to_owned());
+        }
+        if isolate_claude_user_config {
+            params["_meta"]["claudeCode"]["options"]["settingSources"] =
+                serde_json::json!(["project", "local"]);
         }
         let result = self.send_request("session/new", params).await?;
         let session_id = result["sessionId"]
@@ -682,9 +715,16 @@ impl AcpClient {
         mcp_servers: Vec<McpServer>,
         system_prompt: Option<SystemPromptTransport<'_>>,
         session_title: Option<&str>,
+        isolate_claude_user_config: bool,
     ) -> Result<String, AcpError> {
         Ok(self
-            .session_new_full(cwd, mcp_servers, system_prompt, session_title)
+            .session_new_full(
+                cwd,
+                mcp_servers,
+                system_prompt,
+                session_title,
+                isolate_claude_user_config,
+            )
             .await?
             .session_id)
     }
@@ -2957,6 +2997,46 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_applies_claude_user_config_isolation_defaults_only_to_claude() {
+        for var in [
+            "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+        ] {
+            if std::env::var_os(var).is_some() {
+                continue;
+            }
+            assert_eq!(
+                spawn_named_and_read_child_env("claude-agent-acp", var, &[]).await,
+                "1",
+                "Claude spawns must default {var}=1"
+            );
+            assert_eq!(
+                spawn_named_and_read_child_env("other-agent", var, &[]).await,
+                "<unset>",
+                "non-Claude spawns must not receive {var}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_removes_hindsight_bank_overrides_from_extra_env() {
+        for var in REMOVED_HINDSIGHT_BANK_ENV {
+            assert_eq!(
+                spawn_named_and_read_child_env(
+                    "other-agent",
+                    var,
+                    &[(var.into(), "must-not-cross-spawn".into())],
+                )
+                .await,
+                "<unset>",
+                "{var} must be removed after persona env is merged"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn idle_timeout_fires_on_silent_process() {
         let mut client = spawn_script("sleep 10").await;
@@ -3309,6 +3389,7 @@ mod tests {
                 vec![],
                 Some(SystemPromptTransport::Field("Custom system prompt")),
                 None,
+                false,
             )
             .await
             .expect("session_new_full should succeed");
@@ -3394,7 +3475,7 @@ mod tests {
             .expect("initialize should succeed");
 
         let resp = client
-            .session_new_full("/tmp", vec![], None, None)
+            .session_new_full("/tmp", vec![], None, None, false)
             .await
             .expect("session_new_full should succeed");
 
@@ -3422,7 +3503,7 @@ mod tests {
             .expect("initialize should succeed");
 
         let resp = client
-            .session_new_full("/tmp", vec![], None, Some("Fizz · #buzz-dev"))
+            .session_new_full("/tmp", vec![], None, Some("Fizz · #buzz-dev"), false)
             .await
             .expect("session_new_full should succeed");
 
@@ -3450,7 +3531,7 @@ mod tests {
             .expect("initialize should succeed");
 
         let resp = client
-            .session_new_full("/tmp", vec![], None, None)
+            .session_new_full("/tmp", vec![], None, None, false)
             .await
             .expect("session_new_full should succeed");
 
@@ -3486,6 +3567,7 @@ mod tests {
                 vec![],
                 Some(SystemPromptTransport::ClaudeMeta("Be concise")),
                 None,
+                false,
             )
             .await
             .expect("session_new_full should succeed");
@@ -3503,9 +3585,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_new_full_merges_claude_meta_and_session_title_into_single_meta_object() {
-        // Both ClaudeMeta prompt and session_title must coexist under _meta —
-        // the prompt must not clobber sessionTitle or vice versa.
+    async fn session_new_full_merges_all_claude_options_into_single_meta_object() {
+        // ClaudeMeta prompt, session_title, and user-config isolation must
+        // coexist under _meta without clobbering one another.
         let script = r#"
             read -t 2 _init
             echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
@@ -3525,6 +3607,7 @@ mod tests {
                 vec![],
                 Some(SystemPromptTransport::ClaudeMeta("Be concise")),
                 Some("Fizz · #buzz-dev"),
+                true,
             )
             .await
             .expect("session_new_full should succeed");
@@ -3539,6 +3622,11 @@ mod tests {
             received["params"]["_meta"]["sessionTitle"].as_str(),
             Some("Fizz · #buzz-dev"),
             "_meta.sessionTitle must be present alongside systemPrompt"
+        );
+        assert_eq!(
+            received["params"]["_meta"]["claudeCode"]["options"]["settingSources"],
+            serde_json::json!(["project", "local"]),
+            "Claude sessions must exclude user-scoped settings"
         );
     }
 

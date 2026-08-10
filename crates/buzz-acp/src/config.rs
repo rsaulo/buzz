@@ -503,6 +503,16 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_SESSION_TITLE")]
     pub session_title: Option<String>,
 
+    /// Isolate Claude ACP sessions from user-scoped settings, hooks, MCP
+    /// servers, and personal instructions. Project and local settings remain.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_CLAUDE_ISOLATE_USER_CONFIG",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub claude_isolate_user_config: bool,
+
     /// Permission mode for agents that support `session/set_config_option`
     /// with `configId: "mode"` (e.g. `claude-agent-acp`).
     ///
@@ -610,6 +620,9 @@ pub struct Config {
     /// Sanitized session title, sent as `_meta.sessionTitle` on `session/new`.
     /// `None` when unset or when the configured value sanitized to empty.
     pub session_title: Option<String>,
+    /// Whether Claude ACP sessions exclude user-scoped settings, hooks, MCP
+    /// servers, and personal instructions. Enabled by default.
+    pub claude_isolate_user_config: bool,
     /// Permission mode to apply after session creation. `Default` = skip.
     pub permission_mode: PermissionMode,
     /// Inbound author gate mode.
@@ -792,9 +805,17 @@ fn default_agent_args(command: &str) -> Option<Vec<String>> {
 /// startup budget (see block/buzz#3355). Skip that unrelated global startup
 /// by default; an operator or persona can still opt back in by setting the
 /// variable explicitly.
+///
+/// Claude: disable personal CLAUDE.md loading and auto-memory in the managed
+/// child process. Session-level isolation separately removes user-scoped hooks,
+/// MCP servers, and settings while preserving project/local settings.
 pub(crate) fn default_agent_env(command: &str) -> &'static [(&'static str, &'static str)] {
     match normalize_agent_command_identity(command).as_str() {
         "hermes" | "hermes-agent" | "hermes-acp" => &[("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")],
+        "claude-agent-acp" | "claude-code-acp" | "claude-code" | "claudecode" => &[
+            ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1"),
+            ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
+        ],
         _ => &[],
     }
 }
@@ -1172,6 +1193,7 @@ impl Config {
                 .session_title
                 .as_deref()
                 .and_then(sanitize_session_title),
+            claude_isolate_user_config: args.claude_isolate_user_config,
             permission_mode: args.permission_mode,
             respond_to: args.respond_to,
             respond_to_allowlist,
@@ -1205,7 +1227,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} claude_isolate_user_config={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1225,6 +1247,7 @@ impl Config {
             self.typing_enabled,
             self.memory_enabled,
             self.model.as_deref().unwrap_or("(agent default)"),
+            self.claude_isolate_user_config,
             self.permission_mode,
             respond_to_detail,
             allowed_respond_to_detail,
@@ -1543,6 +1566,7 @@ mod tests {
             memory_enabled: true,
             model: None,
             session_title: None,
+            claude_isolate_user_config: true,
             permission_mode: PermissionMode::BypassPermissions,
             respond_to: RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
@@ -1715,7 +1739,7 @@ mod tests {
     }
 
     #[test]
-    fn default_agent_env_recognizes_hermes_identities() {
+    fn default_agent_env_recognizes_runtime_identities() {
         for command in [
             "hermes",
             "hermes-agent",
@@ -1730,10 +1754,27 @@ mod tests {
                 "unexpected env defaults for {command}"
             );
         }
-        for command in ["goose", "codex-acp", "claude-agent-acp", "buzz-agent", ""] {
+        for command in [
+            "claude-agent-acp",
+            "claude-code-acp",
+            "claude-code",
+            "claudecode",
+            "/opt/claude/bin/claude-agent-acp",
+            r"C:\Users\test\bin\Claude_Code_ACP.CMD",
+        ] {
+            assert_eq!(
+                default_agent_env(command),
+                &[
+                    ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1"),
+                    ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
+                ],
+                "unexpected env defaults for {command}"
+            );
+        }
+        for command in ["goose", "codex-acp", "buzz-agent", ""] {
             assert!(
                 default_agent_env(command).is_empty(),
-                "non-Hermes command must have no env defaults: {command}"
+                "unrecognized command must have no env defaults: {command}"
             );
         }
     }
@@ -2281,6 +2322,23 @@ channels = "ALL"
     }
 
     #[test]
+    fn claude_user_config_isolation_defaults_on_and_can_be_disabled() {
+        let key = "0".repeat(64);
+        assert!(
+            CliArgs::parse_from(["buzz-acp", "--private-key", &key]).claude_isolate_user_config
+        );
+        assert!(
+            !CliArgs::parse_from([
+                "buzz-acp",
+                "--private-key",
+                &key,
+                "--claude-isolate-user-config=false",
+            ])
+            .claude_isolate_user_config
+        );
+    }
+
+    #[test]
     fn test_summary_includes_agents_and_heartbeat() {
         let config = test_config(SubscribeMode::Mentions);
         let s = config.summary();
@@ -2292,6 +2350,12 @@ channels = "ALL"
             s.contains("heartbeat=0s"),
             "summary should include heartbeat=0s, got: {s}"
         );
+    }
+
+    #[test]
+    fn summary_includes_claude_user_config_isolation() {
+        let config = test_config(SubscribeMode::Mentions);
+        assert!(config.summary().contains("claude_isolate_user_config=true"));
     }
 
     #[test]

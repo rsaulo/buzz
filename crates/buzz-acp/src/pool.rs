@@ -183,6 +183,10 @@ pub struct OwnedAgent {
 /// rename, so the new name is a reliable capability gate.
 const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
 
+fn should_isolate_claude_user_config(agent_name: &str, configured: bool) -> bool {
+    configured && agent_name == CLAUDE_AGENT_ACP_NAME
+}
+
 fn has_system_prompt_support(
     protocol_version: u32,
     agent_name: &str,
@@ -529,6 +533,9 @@ pub struct PromptContext {
     /// Sanitized title for each new ACP session, sent as `_meta.sessionTitle`
     /// on `session/new`. Never part of the prompt.
     pub session_title: Option<String>,
+    /// Whether claude-agent-acp sessions exclude user-scoped settings, hooks,
+    /// MCP servers, and personal instructions.
+    pub claude_isolate_user_config: bool,
     pub team_instructions: Option<String>,
     pub heartbeat_prompt: Option<String>,
     /// Base prompt content, or `None` if `--no-base-prompt` was passed.
@@ -1137,6 +1144,7 @@ async fn create_session_and_apply_model(
                 combined_system_prompt.as_deref(),
             ),
             session_title.as_deref(),
+            should_isolate_claude_user_config(&agent.agent_name, ctx.claude_isolate_user_config),
         )
         .await?;
 
@@ -4637,6 +4645,20 @@ mod tests {
     }
 
     #[test]
+    fn claude_user_config_isolation_is_scoped_to_claude_sessions() {
+        assert!(should_isolate_claude_user_config(
+            CLAUDE_AGENT_ACP_NAME,
+            true
+        ));
+        assert!(!should_isolate_claude_user_config(
+            CLAUDE_AGENT_ACP_NAME,
+            false
+        ));
+        assert!(!should_isolate_claude_user_config("goose", true));
+        assert!(!should_isolate_claude_user_config("codex-acp", true));
+    }
+
+    #[test]
     fn old_zed_adapter_name_falls_through_to_protocol_version_gate() {
         // The renamed @zed-industries package predates the _meta.systemPrompt support,
         // so it must not be treated as capable and stays on legacy user-message framing.
@@ -7014,6 +7036,7 @@ mod tests {
             dedup_mode: DedupMode::Drop,
             system_prompt: None,
             session_title: None,
+            claude_isolate_user_config: true,
             team_instructions: None,
             heartbeat_prompt: None,
             base_prompt: None,

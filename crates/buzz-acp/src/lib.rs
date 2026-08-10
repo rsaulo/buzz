@@ -1842,6 +1842,7 @@ async fn tokio_main() -> Result<()> {
         dedup_mode: config.dedup_mode,
         system_prompt: config.system_prompt.clone(),
         session_title: config.session_title.clone(),
+        claude_isolate_user_config: config.claude_isolate_user_config,
         team_instructions: config.team_instructions.clone(),
         base_prompt: if config.no_base_prompt {
             None
@@ -4421,7 +4422,9 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
     // so shutdown() runs on all paths (success, error, timeout).
     let protocol_result = tokio::time::timeout(MODELS_TIMEOUT, async {
         let init = client.initialize().await?;
-        let session = client.session_new_full(&cwd, vec![], None, None).await?;
+        let session = client
+            .session_new_full(&cwd, vec![], None, None, false)
+            .await?;
         Ok::<_, acp::AcpError>((init, session))
     })
     .await;
@@ -6224,6 +6227,7 @@ mod build_mcp_servers_tests {
             memory_enabled: false,
             model: None,
             session_title: None,
+            claude_isolate_user_config: true,
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: std::collections::HashSet::new(),
@@ -6446,6 +6450,7 @@ mod error_outcome_emission_tests {
             memory_enabled: false,
             model: None,
             session_title: None,
+            claude_isolate_user_config: true,
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
