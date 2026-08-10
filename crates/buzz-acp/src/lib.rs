@@ -4656,15 +4656,43 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
 }
 
 fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
-    if config.mcp_command.is_empty() {
-        return vec![];
+    let mut servers: Vec<McpServer> = Vec::new();
+    if !config.mcp_command.is_empty() {
+        servers.push(build_buzz_mcp_server(config));
     }
-    vec![McpServer {
-        name: std::path::Path::new(&config.mcp_command)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("mcp")
-            .to_string(),
+    // Extra servers are plain stdio executables with NO Buzz identity in their
+    // environment. The agent's secret key and auth tag belong to `buzz-mcp`
+    // alone; forwarding them to a third-party server would hand out the
+    // agent's Nostr credentials to anything an operator wires up here.
+    for command in config
+        .mcp_extra
+        .iter()
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+    {
+        servers.push(McpServer {
+            name: mcp_server_name(command),
+            command: command.to_string(),
+            args: vec![],
+            env: vec![],
+        });
+    }
+    servers
+}
+
+/// Name an MCP server after its executable, as the protocol expects a stable id.
+fn mcp_server_name(command: &str) -> String {
+    std::path::Path::new(command)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("mcp")
+        .to_string()
+}
+
+/// Buzz's own MCP server, which carries the agent identity it needs to sign.
+fn build_buzz_mcp_server(config: &Config) -> McpServer {
+    McpServer {
+        name: mcp_server_name(&config.mcp_command),
         command: config.mcp_command.clone(),
         args: vec![],
         env: {
@@ -4709,7 +4737,7 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
             }
             env
         },
-    }]
+    }
 }
 
 #[cfg(test)]
@@ -6334,6 +6362,7 @@ mod build_mcp_servers_tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
+            mcp_extra: vec![],
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -6492,6 +6521,58 @@ mod build_mcp_servers_tests {
         );
     }
 
+    /// The case this exists for: Buzz Desktop owns `BUZZ_ACP_MCP_COMMAND` and
+    /// leaves it empty, so an operator's own server must still reach the agent.
+    #[test]
+    fn extra_mcp_servers_are_added_when_buzz_slot_is_empty() {
+        let mut config = test_config();
+        config.mcp_command = "".into();
+        config.mcp_extra = vec!["/opt/tools/hindsight-mcp.js".into()];
+
+        let servers = build_mcp_servers(&config);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "hindsight-mcp");
+        assert_eq!(servers[0].command, "/opt/tools/hindsight-mcp.js");
+    }
+
+    /// Buzz's identity belongs to `buzz-mcp` alone. An extra server is a plain
+    /// executable an operator wired up; handing it the agent's secret key would
+    /// leak the credential to anything listed here.
+    #[test]
+    fn extra_mcp_servers_receive_no_buzz_identity() {
+        let mut config = test_config();
+        config.mcp_extra = vec!["/opt/tools/hindsight-mcp.js".into()];
+
+        let servers = build_mcp_servers(&config);
+        let buzz = servers
+            .iter()
+            .find(|s| s.name == "test-mcp-server")
+            .unwrap();
+        let extra = servers.iter().find(|s| s.name == "hindsight-mcp").unwrap();
+
+        assert!(
+            buzz.env.iter().any(|e| e.name == "BUZZ_PRIVATE_KEY"),
+            "buzz-mcp must keep its identity"
+        );
+        assert!(
+            extra.env.is_empty(),
+            "extra server must get no environment at all, got: {:?}",
+            extra.env.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// `default_value = ""` with a comma delimiter yields `[""]`, not `[]`, so
+    /// the blank entry must not become a server with an empty command.
+    #[test]
+    fn blank_extra_mcp_entries_are_ignored() {
+        let mut config = test_config();
+        config.mcp_command = "".into();
+        config.mcp_extra = vec!["".into(), "   ".into()];
+
+        assert!(build_mcp_servers(&config).is_empty());
+    }
+
     #[test]
     fn absolute_path_mcp_command_uses_file_stem_as_name() {
         let mut config = test_config();
@@ -6561,6 +6642,7 @@ mod error_outcome_emission_tests {
             agent_command: "true".into(),
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
+            mcp_extra: vec![],
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
