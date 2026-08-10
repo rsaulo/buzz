@@ -134,6 +134,21 @@ agent configuration.
 | `--claude-isolate-user-config` / `BUZZ_ACP_CLAUDE_ISOLATE_USER_CONFIG` | `true` | For Claude ACP sessions, sends `settingSources: ["project","local"]`, excluding user-scoped settings, hooks, MCP servers, and personal instructions. Set to `false` to restore the adapter's user-inclusive default. |
 | `BUZZ_LOCAL_AGENT` (child env) | `1` | Marks every spawned ACP runtime as a Buzz-managed agent. Repository hooks and plugins should use this signal to distinguish a Buzz agent session from the human's terminal session in the same repository. The harness only supplies the default when the inherited environment has not already defined it, so an operator can override it. |
 | `HINDSIGHT_BANK_ID`, `HINDSIGHT_DYNAMIC_BANK_ID` (child env) | removed | Both selectors are removed after inherited, runtime-default, and persona env layers are merged. Repository-local Hindsight configuration therefore owns project bank selection and neither parent nor persona env can force one bank across workspaces. |
+| `BUZZ_AGENT_THINKING_EFFORT` | unset | Shared reasoning axis: `none|minimal|low|medium|high|xhigh|max`. Unset/empty preserves the adapter default; an invalid value stops startup. See harness translations below. |
+
+#### External-harness reasoning effort
+
+The fork deliberately reuses `BUZZ_AGENT_THINKING_EFFORT`, the native
+`buzz-agent` variable, instead of adding an ACP-specific alias. If Desktop
+eventually exposes its effort dropdown to BYOH agents, the same value will flow
+through without another bridge.
+
+| Harness | Translation |
+|---------|-------------|
+| `claude-agent-acp` | Sends `_meta.claudeCode.options` on `session/new`. Adaptive models receive `thinking.type=adaptive` plus distinct `effort` values (`high`, `xhigh`, and `max` remain distinct); legacy Claude 3 / Opus 4.5 models receive `thinking.type=enabled` with `budgetTokens`. Unknown models omit both fields. Claude rejects `none` and `minimal`. `_meta` is used instead of `MAX_THINKING_TOKENS` because the token-budget variable collapses `high`, `xhigh`, and `max` to the same 32,768-token budget. |
+| `codex-acp` | Deep-merges `model_reasoning_effort` into existing `CODEX_CONFIG` JSON, preserving persona/operator keys. Codex lacks endpoint values `none` and `max`, so they saturate to `minimal` and `xhigh`, respectively. |
+| `buzz-agent` | Inherits the variable unchanged; its native provider translation remains authoritative. |
+| `opencode` | Not supported in this phase. `OPENCODE_CONFIG` is a path, not inline JSON; when effort is configured, startup fails rather than silently ignoring it or creating/modifying a user config file. Configure `agent.build.variant` in the existing opencode config instead. |
 
 Workspace declaration example:
 
