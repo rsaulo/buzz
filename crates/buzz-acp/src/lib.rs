@@ -2714,8 +2714,9 @@ async fn tokio_main() -> Result<()> {
         match pool_event {
             Some(PoolEvent::Result(result)) => {
                 // Stop typing indicator for the completed channel.
-                if let PromptSource::Channel(ch) = &result.source {
-                    typing_channels.remove(ch);
+                if let PromptSource::Channel(key) = &result.source {
+                    // Typing is a channel-level indicator, not a per-thread one.
+                    typing_channels.remove(&key.channel_id);
                 }
                 if handle_prompt_result(
                     &mut pool,
@@ -3294,8 +3295,11 @@ fn dispatch_pending(
             .last()
             .map(|event| queue::parse_thread_tags(&event.event))
             .unwrap_or_default();
-        let affinity_hit = pool.has_session_for(channel_id);
-        let mut agent = match pool.try_claim(Some(channel_id)) {
+        // Affinity follows the conversation: the batch is thread-homogeneous,
+        // so its session key is the unit that must not be split across agents.
+        let session_key = batch.session_key();
+        let affinity_hit = pool.has_session_for(&session_key);
+        let mut agent = match pool.try_claim(Some(&session_key)) {
             Some(a) => a,
             None => {
                 let pending = queue.pending_channels();
@@ -3560,7 +3564,9 @@ fn handle_prompt_result(
     }
 
     match &result.source {
-        PromptSource::Channel(ch) => queue.mark_complete(*ch),
+        // The queue still enforces one in-flight turn per channel; only the
+        // session is per thread (per-thread dispatch is the next phase).
+        PromptSource::Channel(key) => queue.mark_complete(key.channel_id),
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
     }
 
@@ -3596,7 +3602,7 @@ fn handle_prompt_result(
     let harness_pid = std::process::id();
 
     let channel_id = match &result.source {
-        PromptSource::Channel(ch) => Some(*ch),
+        PromptSource::Channel(key) => Some(key.channel_id),
         PromptSource::Heartbeat => None,
     };
     let turn_id = result.turn_id.clone();
@@ -6593,7 +6599,7 @@ mod error_outcome_emission_tests {
 
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(Uuid::new_v4()),
+            source: PromptSource::Channel(crate::queue::SessionKey::ambient(Uuid::new_v4())),
             turn_id: "test-turn-id".to_string(),
             outcome,
             batch: None,
@@ -6759,7 +6765,7 @@ mod error_outcome_emission_tests {
             let observer = ObserverHandle::in_process();
             let result = PromptResult {
                 agent,
-                source: PromptSource::Channel(Uuid::new_v4()),
+                source: PromptSource::Channel(crate::queue::SessionKey::ambient(Uuid::new_v4())),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: None,
@@ -6809,6 +6815,7 @@ mod error_outcome_emission_tests {
                 .unwrap();
             FlushBatch {
                 channel_id: Uuid::new_v4(),
+                root: None,
                 events: vec![BatchEvent {
                     event,
                     prompt_tag: "test".into(),
@@ -6849,7 +6856,7 @@ mod error_outcome_emission_tests {
             let mut respawn_tasks = tokio::task::JoinSet::new();
             let result = PromptResult {
                 agent,
-                source: PromptSource::Channel(channel_id),
+                source: PromptSource::Channel(crate::queue::SessionKey::ambient(channel_id)),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: Some(batch),
@@ -6915,6 +6922,7 @@ mod error_outcome_emission_tests {
                 .unwrap();
             FlushBatch {
                 channel_id,
+                root: None,
                 events: vec![BatchEvent {
                     event,
                     prompt_tag: "test".into(),
@@ -6954,7 +6962,7 @@ mod error_outcome_emission_tests {
             let mut respawn_tasks = tokio::task::JoinSet::new();
             let result = PromptResult {
                 agent,
-                source: PromptSource::Channel(channel_id),
+                source: PromptSource::Channel(crate::queue::SessionKey::ambient(channel_id)),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: Some(batch),
@@ -7031,6 +7039,7 @@ mod error_outcome_emission_tests {
         let observer = ObserverHandle::in_process();
         let batch = FlushBatch {
             channel_id,
+            root: None,
             events: vec![BatchEvent {
                 event: EventBuilder::new(Kind::Custom(9), "test")
                     .sign_with_keys(&Keys::generate())
@@ -7043,7 +7052,7 @@ mod error_outcome_emission_tests {
         };
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(channel_id),
+            source: PromptSource::Channel(crate::queue::SessionKey::ambient(channel_id)),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
                 recently_active: true,
@@ -7124,6 +7133,7 @@ mod error_outcome_emission_tests {
         let observer = ObserverHandle::in_process();
         let batch = FlushBatch {
             channel_id,
+            root: None,
             events: vec![BatchEvent {
                 event: EventBuilder::new(Kind::Custom(9), "final-attempt")
                     .sign_with_keys(&Keys::generate())
@@ -7136,7 +7146,7 @@ mod error_outcome_emission_tests {
         };
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(channel_id),
+            source: PromptSource::Channel(crate::queue::SessionKey::ambient(channel_id)),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
                 recently_active: true,
@@ -7204,6 +7214,7 @@ mod error_outcome_emission_tests {
         let channel_id = Uuid::new_v4();
         let batch = FlushBatch {
             channel_id,
+            root: None,
             events: vec![BatchEvent {
                 event: original_event.clone(),
                 prompt_tag: "test".into(),
@@ -7252,7 +7263,7 @@ mod error_outcome_emission_tests {
         let grace = std::time::Duration::from_secs(5);
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(channel_id),
+            source: PromptSource::Channel(crate::queue::SessionKey::ambient(channel_id)),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::CancelDrainTimeout(grace),
             batch: Some(batch),
@@ -7381,7 +7392,7 @@ mod error_outcome_emission_tests {
         let grace = std::time::Duration::from_secs(5);
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(Uuid::new_v4()),
+            source: PromptSource::Channel(crate::queue::SessionKey::ambient(Uuid::new_v4())),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::CancelDrainTimeout(grace),
             // Explicit Stop already dropped the batch upstream in
@@ -7525,6 +7536,7 @@ mod error_outcome_emission_tests {
         let channel_id = uuid::Uuid::new_v4();
         let batch = FlushBatch {
             channel_id,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -7567,7 +7579,7 @@ mod error_outcome_emission_tests {
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(channel_id),
+            source: PromptSource::Channel(crate::queue::SessionKey::ambient(channel_id)),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(auth_error),
             batch: Some(batch),
@@ -7610,6 +7622,7 @@ mod error_outcome_emission_tests {
         let channel_id = uuid::Uuid::new_v4();
         let batch = FlushBatch {
             channel_id,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -7652,7 +7665,7 @@ mod error_outcome_emission_tests {
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(channel_id),
+            source: PromptSource::Channel(crate::queue::SessionKey::ambient(channel_id)),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(usage_error),
             batch: Some(batch),

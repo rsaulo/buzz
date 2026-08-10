@@ -72,10 +72,68 @@ pub enum CancelReason {
     Steer,
 }
 
+/// Identity of a single conversation, which is the unit an ACP session maps to.
+///
+/// `root` is the NIP-10 root event ID of a thread. `None` is the channel's
+/// **ambient** conversation: top-level messages that belong to no thread.
+///
+/// Keeping an ambient session is deliberate. Treating every top-level message as
+/// a new thread would mint one session per message in a conversational channel —
+/// the cost of a session with none of the isolation. It also mirrors Slack, where
+/// the channel holds a conversation of its own alongside its threads.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionKey {
+    pub channel_id: Uuid,
+    pub root: Option<String>,
+}
+
+impl SessionKey {
+    /// The channel's ambient conversation (messages outside any thread).
+    pub fn ambient(channel_id: Uuid) -> Self {
+        Self {
+            channel_id,
+            root: None,
+        }
+    }
+
+    /// The conversation of one thread, identified by its root event ID.
+    pub fn thread(channel_id: Uuid, root: impl Into<String>) -> Self {
+        Self {
+            channel_id,
+            root: Some(root.into()),
+        }
+    }
+}
+
+impl std::fmt::Display for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.root {
+            // Truncated to stay readable in logs; 12 hex chars is far past the
+            // collision horizon for threads live at the same instant.
+            Some(root) => write!(f, "{}#{}", self.channel_id, &root[..root.len().min(12)]),
+            None => write!(f, "{}#ambient", self.channel_id),
+        }
+    }
+}
+
+/// The thread a single event belongs to, as a session root.
+///
+/// `None` for top-level messages — they belong to the channel's ambient session.
+pub fn event_thread_root(event: &Event) -> Option<String> {
+    parse_thread_tags(event).root_event_id
+}
+
 /// A batch of events to prompt the agent with.
+///
+/// Every batch is **homogeneous in thread**: all its events share one
+/// [`SessionKey`]. A batch becomes exactly one prompt, and a prompt goes to
+/// exactly one session, so a batch spanning threads would have no session to
+/// route to. [`EventQueue::flush_next`] enforces this.
 #[derive(Debug, Clone)]
 pub struct FlushBatch {
     pub channel_id: Uuid,
+    /// Thread root shared by every event in this batch; `None` for ambient.
+    pub root: Option<String>,
     pub events: Vec<BatchEvent>,
     /// Events from a cancelled batch that triggered this re-prompt.
     /// Empty for normal (non-cancel) batches. When non-empty, `format_prompt()`
@@ -87,6 +145,16 @@ pub struct FlushBatch {
     /// [`Steer`](CancelReason::Steer) framing if a merge somehow lacks a reason
     /// (see [`MergeFraming::for_reason`]).
     pub cancel_reason: Option<CancelReason>,
+}
+
+impl FlushBatch {
+    /// The session this batch must be prompted into.
+    pub fn session_key(&self) -> SessionKey {
+        match &self.root {
+            Some(root) => SessionKey::thread(self.channel_id, root),
+            None => SessionKey::ambient(self.channel_id),
+        }
+    }
 }
 
 /// Per-channel event queue with per-channel in-flight enforcement.
@@ -320,8 +388,14 @@ impl EventQueue {
                         self.in_flight_deadlines
                             .insert(id, now + self.in_flight_deadline);
                         self.in_flight_batch_sizes.insert(id, cancelled.len());
+                        // A cancelled batch was thread-homogeneous when it was
+                        // first flushed, so its head event still names the thread.
+                        let root = cancelled
+                            .first()
+                            .and_then(|be| event_thread_root(&be.event));
                         return Some(FlushBatch {
                             channel_id: id,
+                            root,
                             events: cancelled,
                             cancelled_events: vec![],
                             cancel_reason,
@@ -332,17 +406,30 @@ impl EventQueue {
             }
         };
 
-        // Drain up to MAX_BATCH_EVENTS; leave any remainder in the queue.
+        // Drain up to MAX_BATCH_EVENTS **from the head event's thread only**;
+        // leave any remainder in the queue.
+        //
+        // The head event decides which thread flushes. A batch becomes exactly
+        // one prompt, and a prompt goes to exactly one session, so a batch
+        // spanning threads would have no session to route to. Events from other
+        // threads stay queued and flush on a later cycle — they keep their
+        // original `received_at`, so cross-channel fairness is unaffected.
         let queue = self.queues.entry(channel_id).or_default();
-        let drain_count = MAX_BATCH_EVENTS.min(queue.len());
-        let mut events: Vec<BatchEvent> = queue
-            .drain(..drain_count)
-            .map(|qe| BatchEvent {
-                event: qe.event,
-                prompt_tag: qe.prompt_tag,
-                received_at: qe.received_at,
-            })
-            .collect();
+        let batch_root = queue.front().and_then(|qe| event_thread_root(&qe.event));
+        let mut events: Vec<BatchEvent> = Vec::new();
+        let mut remainder: VecDeque<QueuedEvent> = VecDeque::with_capacity(queue.len());
+        for qe in queue.drain(..) {
+            if events.len() < MAX_BATCH_EVENTS && event_thread_root(&qe.event) == batch_root {
+                events.push(BatchEvent {
+                    event: qe.event,
+                    prompt_tag: qe.prompt_tag,
+                    received_at: qe.received_at,
+                });
+            } else {
+                remainder.push_back(qe);
+            }
+        }
+        *queue = remainder;
         // Relay replay delivers stored events newest-first (`ORDER BY
         // created_at DESC`), but batch consumers — `format_prompt` scope and
         // reply-anchor selection — require the LAST event to be the newest.
@@ -373,6 +460,7 @@ impl EventQueue {
 
         Some(FlushBatch {
             channel_id,
+            root: batch_root,
             events,
             cancelled_events,
             cancel_reason,
@@ -1932,6 +2020,7 @@ mod tests {
 
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "@mention".into(),
@@ -1962,6 +2051,7 @@ mod tests {
         let ch = Uuid::new_v4();
         FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event: make_event("the new message"),
                 prompt_tag: "@mention".into(),
@@ -2093,6 +2183,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![
                 BatchEvent {
                     event: make_event("new one"),
@@ -2150,6 +2241,7 @@ mod tests {
 
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event: steering,
                 prompt_tag: "@mention".into(),
@@ -2242,6 +2334,7 @@ mod tests {
 
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![
                 BatchEvent {
                     event: e1,
@@ -2282,6 +2375,7 @@ mod tests {
 
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -2305,6 +2399,7 @@ mod tests {
         let event = make_event("hi");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -2337,6 +2432,7 @@ mod tests {
         let event = make_event("hi");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -2367,6 +2463,7 @@ mod tests {
         let event = make_event("hi");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -2394,6 +2491,7 @@ mod tests {
 
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -2418,6 +2516,7 @@ mod tests {
 
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -2485,6 +2584,7 @@ mod tests {
         fn prompt_for(channel_id: Uuid, cwd: &str) -> String {
             let batch = FlushBatch {
                 channel_id,
+                root: None,
                 events: vec![BatchEvent {
                     event: make_event("hello"),
                     prompt_tag: "test".into(),
@@ -2518,6 +2618,7 @@ mod tests {
     fn test_format_prompt_legacy_persona_only_omits_workspace() {
         let batch = FlushBatch {
             channel_id: Uuid::new_v4(),
+            root: None,
             events: vec![BatchEvent {
                 event: make_event("hello"),
                 prompt_tag: "test".into(),
@@ -2574,6 +2675,7 @@ mod tests {
 
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -2612,6 +2714,7 @@ mod tests {
         let event = make_event("hello");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -3061,6 +3164,92 @@ mod tests {
             .unwrap()
     }
 
+    // ── thread-homogeneous batches (per-thread sessions, phase 1) ────────────
+
+    /// A 64-hex root event ID, distinct per `seed`.
+    fn root_id(seed: char) -> String {
+        std::iter::repeat_n(seed, 64).collect()
+    }
+
+    /// Build a QueuedEvent that is a reply inside the thread rooted at `root`.
+    fn make_queued_in_thread(channel_id: Uuid, content: &str, root: &str) -> QueuedEvent {
+        QueuedEvent {
+            channel_id,
+            event: make_event_with_tags(
+                content,
+                vec![vec![
+                    "e".into(),
+                    root.to_string(),
+                    String::new(),
+                    "root".into(),
+                ]],
+            ),
+            received_at: Instant::now(),
+            prompt_tag: "test".into(),
+        }
+    }
+
+    /// One channel carrying two threads and a top-level message must flush as
+    /// three batches, each homogeneous in thread — never one mixed batch. A
+    /// batch becomes one prompt into one session, so a mixed batch would have
+    /// no session to route to.
+    #[test]
+    fn test_flush_splits_one_channel_into_one_batch_per_thread() {
+        let ch = Uuid::new_v4();
+        let root_a = root_id('a');
+        let root_b = root_id('b');
+        let mut q = EventQueue::new(DedupMode::Queue);
+
+        // Interleaved on purpose: arrival order must not merge the threads.
+        assert!(q.push(make_queued_in_thread(ch, "a1", &root_a)));
+        assert!(q.push(make_queued_in_thread(ch, "b1", &root_b)));
+        assert!(q.push(make_queued_in_thread(ch, "a2", &root_a)));
+        assert!(q.push(make_queued(ch, "top-level")));
+
+        // Head event is in thread A, so thread A flushes first — and takes both
+        // of its events, skipping over the interleaved thread-B event.
+        let first = q.flush_next().expect("thread A should flush");
+        assert_eq!(first.session_key(), SessionKey::thread(ch, &root_a));
+        assert_eq!(first.events.len(), 2);
+        assert_eq!(first.events[0].event.content, "a1");
+        assert_eq!(first.events[1].event.content, "a2");
+        q.mark_complete(ch);
+
+        let second = q.flush_next().expect("thread B should flush next");
+        assert_eq!(second.session_key(), SessionKey::thread(ch, &root_b));
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].event.content, "b1");
+        q.mark_complete(ch);
+
+        // The top-level message belongs to the channel's ambient session.
+        let third = q.flush_next().expect("ambient message should flush last");
+        assert_eq!(third.session_key(), SessionKey::ambient(ch));
+        assert_eq!(third.events.len(), 1);
+        assert_eq!(third.events[0].event.content, "top-level");
+        q.mark_complete(ch);
+
+        assert!(q.flush_next().is_none(), "queue should be drained");
+    }
+
+    /// The same thread in two different channels is two conversations: the
+    /// channel remains part of the identity.
+    #[test]
+    fn test_session_key_is_scoped_by_channel_as_well_as_thread() {
+        let ch_a = Uuid::new_v4();
+        let ch_b = Uuid::new_v4();
+        let root = root_id('c');
+
+        assert_ne!(
+            SessionKey::thread(ch_a, &root),
+            SessionKey::thread(ch_b, &root)
+        );
+        assert_ne!(SessionKey::thread(ch_a, &root), SessionKey::ambient(ch_a));
+        assert_eq!(
+            SessionKey::thread(ch_a, &root),
+            SessionKey::thread(ch_a, &root)
+        );
+    }
+
     #[test]
     fn test_parse_thread_tags_no_tags() {
         let event = make_event("plain message");
@@ -3129,6 +3318,7 @@ mod tests {
         let event = make_event("hello");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -3160,6 +3350,7 @@ mod tests {
         let event = make_event("hey");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "dm".into(),
@@ -3198,6 +3389,7 @@ mod tests {
         );
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "@mention".into(),
@@ -3226,6 +3418,7 @@ mod tests {
         );
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "@mention".into(),
@@ -3270,6 +3463,7 @@ mod tests {
         let event = make_event("ok do that");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "dm".into(),
@@ -3319,6 +3513,7 @@ mod tests {
         let author_hex = event.pubkey.to_hex();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "@mention".into(),
@@ -3526,6 +3721,7 @@ mod tests {
         );
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "dm".into(),
@@ -3583,6 +3779,7 @@ mod tests {
         let event = make_event("hey there");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "dm".into(),
@@ -3623,6 +3820,7 @@ mod tests {
         let event_id = event.id.to_hex();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -3647,6 +3845,7 @@ mod tests {
         let npub = event.pubkey.to_bech32().unwrap();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -3670,6 +3869,7 @@ mod tests {
         let event = make_event_with_tags("hello", vec![vec!["h".into(), ch.to_string()]]);
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -4036,6 +4236,7 @@ mod tests {
         );
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "@mention".into(),
@@ -4078,6 +4279,7 @@ mod tests {
         let event_id = event.id.to_hex();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "@mention".into(),
@@ -4112,6 +4314,7 @@ mod tests {
         let event_id = event.id.to_hex();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -4141,6 +4344,7 @@ mod tests {
         let event = make_event("hey there");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -4183,6 +4387,7 @@ mod tests {
         let event_id = event.id.to_hex();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "@mention".into(),
@@ -4219,6 +4424,7 @@ mod tests {
         );
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "@mention".into(),
@@ -4254,6 +4460,7 @@ mod tests {
         );
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![
                 BatchEvent {
                     event: plain,
@@ -4291,6 +4498,7 @@ mod tests {
         let plain_id = plain.id.to_hex();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![
                 BatchEvent {
                     event: threaded,
@@ -4324,6 +4532,7 @@ mod tests {
     fn make_single_batch(content: &str) -> FlushBatch {
         FlushBatch {
             channel_id: Uuid::new_v4(),
+            root: None,
             events: vec![BatchEvent {
                 event: make_event(content),
                 prompt_tag: "test".into(),
@@ -4618,6 +4827,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
@@ -4647,6 +4857,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
@@ -4675,6 +4886,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
