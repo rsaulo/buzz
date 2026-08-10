@@ -1873,7 +1873,7 @@ pub async fn run_prompt_task(
                         );
                         SessionWorkspace {
                             cwd: path,
-                            kind: crate::queue::WorkspaceKind::Root,
+                            kind: crate::queue::WorkspaceKind::Pinned,
                         }
                     }
                     SessionCwdDecision::Workspace(path) => {

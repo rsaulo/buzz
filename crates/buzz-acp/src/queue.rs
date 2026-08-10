@@ -1371,7 +1371,8 @@ pub struct FormatPromptArgs<'a> {
     /// Legacy agents receive its `[Workspace]` anchor in the user message;
     /// modern agents receive the same section through `session/new`.
     pub cwd: Option<&'a str>,
-    /// Whether `cwd` is the channel's repository or the harness root/nest.
+    /// Whether `cwd` is the channel's repository, the harness root/nest, or an
+    /// operator-pinned directory whose layout is unknown.
     pub workspace_kind: WorkspaceKind,
     /// System prompt content for legacy agents (protocol_version < 2).
     pub system_prompt: Option<&'a str>,
@@ -1389,11 +1390,13 @@ pub struct FormatPromptArgs<'a> {
 /// Meaning of the working directory rendered in a `[Workspace]` section.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceKind {
-    /// Harness root/nest, including an operator-pinned `AGENT_CWD`.
+    /// Harness root/nest.
     #[default]
     Root,
     /// Repository selected from the channel-to-workspace index.
     Repository,
+    /// Operator-pinned `AGENT_CWD`, whose directory layout is unknown.
+    Pinned,
 }
 
 /// Format the `[Base]` section for the base prompt.
@@ -1428,6 +1431,11 @@ pub(crate) fn workspace_section(cwd: &str, kind: WorkspaceKind) -> Option<String
              repository for this channel and is where you already are. Work with the \
              repository files here; do not search `$HOME` or other directories for \
              another workspace."
+        ),
+        WorkspaceKind::Pinned => format!(
+            "[Workspace]\nYour absolute working directory is `{cwd}`. This is where \
+             you already are; do not search `$HOME` or other directories for a \
+             different working directory."
         ),
     })
 }
@@ -2534,15 +2542,29 @@ mod tests {
     }
 
     #[test]
-    fn test_workspace_section_repository_text_differs_from_root_layout() {
+    fn test_workspace_sections_are_distinct_and_pinned_makes_no_layout_claims() {
         let root = workspace_section("/Users/me/.buzz", WorkspaceKind::Root).unwrap();
         let repository =
             workspace_section("/Users/me/git/channel-repo", WorkspaceKind::Repository).unwrap();
+        let pinned = workspace_section("/Users/me/git/pinned", WorkspaceKind::Pinned).unwrap();
 
         assert!(root.contains("repositories you clone (under `/Users/me/.buzz/REPOS/`)"));
         assert!(repository.contains("This is the repository for this channel"));
         assert!(!repository.contains("REPOS/"));
+        for nest_entry in [
+            "AGENTS.md",
+            "RESEARCH/",
+            "PLANS/",
+            "GUIDES/",
+            "WORK_LOGS/",
+            "OUTBOX/",
+            "REPOS/",
+        ] {
+            assert!(!pinned.contains(nest_entry));
+        }
         assert_ne!(root, repository);
+        assert_ne!(root, pinned);
+        assert_ne!(repository, pinned);
     }
 
     #[test]
