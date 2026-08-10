@@ -25,6 +25,10 @@ const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 /// long-lived harness can safely serve sessions from multiple projects.
 const REMOVED_HINDSIGHT_BANK_ENV: [&str; 2] = ["HINDSIGHT_BANK_ID", "HINDSIGHT_DYNAMIC_BANK_ID"];
 
+/// Marker inherited by every managed ACP runtime so repository-local hooks and
+/// plugins can distinguish Buzz agents from a human terminal session.
+const BUZZ_LOCAL_AGENT_ENV: &str = "BUZZ_LOCAL_AGENT";
+
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
@@ -499,6 +503,9 @@ impl AcpClient {
         // Applied first so both persona `extra_env` (below, via `Command::env`
         // key replacement) and inherited parent env (via the parent-presence
         // check) override them.
+        if std::env::var_os(BUZZ_LOCAL_AGENT_ENV).is_none() {
+            cmd.env(BUZZ_LOCAL_AGENT_ENV, "1");
+        }
         for &(key, value) in crate::config::default_agent_env(command) {
             if std::env::var_os(key).is_none() {
                 cmd.env(key, value);
@@ -2994,6 +3001,31 @@ mod tests {
             spawn_named_and_read_child_env("other-agent", VAR, &[]).await,
             "<unset>",
             "non-Hermes spawns must not receive Hermes defaults"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_marks_every_managed_runtime_as_a_buzz_local_agent() {
+        if std::env::var_os(BUZZ_LOCAL_AGENT_ENV).is_some() {
+            // An inherited operator value wins and makes the default
+            // independently unobservable in this process.
+            return;
+        }
+
+        assert_eq!(
+            spawn_named_and_read_child_env("other-agent", BUZZ_LOCAL_AGENT_ENV, &[]).await,
+            "1"
+        );
+        assert_eq!(
+            spawn_named_and_read_child_env(
+                "other-agent",
+                BUZZ_LOCAL_AGENT_ENV,
+                &[(BUZZ_LOCAL_AGENT_ENV.into(), "0".into())],
+            )
+            .await,
+            "0",
+            "explicit persona env must override the default marker"
         );
     }
 
