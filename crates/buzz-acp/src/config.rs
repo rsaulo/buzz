@@ -463,6 +463,22 @@ pub struct CliArgs {
           value_parser = clap::value_parser!(u32))]
     pub max_turns_per_session: u32,
 
+    /// Idle time after which a conversation's session is closed, in seconds.
+    ///
+    /// Unset keeps the per-harness default measured for each adapter (a session
+    /// costs ~535 MB under claude-agent-acp and ~0.7 MB under opencode, so one
+    /// global number cannot serve both). 0 disables idle eviction.
+    #[arg(long, env = "BUZZ_ACP_SESSION_IDLE_TTL_SECS")]
+    pub session_idle_ttl_secs: Option<u64>,
+
+    /// Maximum sessions one agent may hold at once.
+    ///
+    /// Bounds a burst of conversations arriving faster than the idle TTL can
+    /// retire them. Unset keeps the per-harness default; 0 disables the cap.
+    /// Total across the pool is this times `--agents`.
+    #[arg(long, env = "BUZZ_ACP_MAX_LIVE_SESSIONS")]
+    pub max_live_sessions: Option<usize>,
+
     /// Disable automatic presence (online/offline) status.
     #[arg(long, env = "BUZZ_ACP_NO_PRESENCE")]
     pub no_presence: bool,
@@ -638,6 +654,10 @@ pub struct Config {
     pub context_message_limit: u32,
     /// Maximum turns per session before proactive rotation. 0 = disabled.
     pub max_turns_per_session: u32,
+    /// Idle seconds before a session is closed. `None` = per-harness default.
+    pub session_idle_ttl_secs: Option<u64>,
+    /// Cap on live sessions per agent. `None` = per-harness default.
+    pub max_live_sessions: Option<usize>,
     pub presence_enabled: bool,
     pub typing_enabled: bool,
     /// Whether NIP-AE agent core memory injection is enabled. When false,
@@ -1376,6 +1396,8 @@ impl Config {
             config_path: args.config,
             context_message_limit: args.context_message_limit,
             max_turns_per_session: args.max_turns_per_session,
+            session_idle_ttl_secs: args.session_idle_ttl_secs,
+            max_live_sessions: args.max_live_sessions,
             presence_enabled: !args.no_presence,
             typing_enabled: !args.no_typing,
             memory_enabled: args.memory && !args.no_memory,
@@ -1755,6 +1777,8 @@ mod tests {
             config_path: PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            session_idle_ttl_secs: None,
+            max_live_sessions: None,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: true,

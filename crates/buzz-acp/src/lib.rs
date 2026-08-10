@@ -1375,7 +1375,7 @@ fn any_respawn_in_flight(crash_history: &[SlotCircuit]) -> bool {
 struct RespawnResult {
     index: usize,
     /// Tuple: (initialized client, protocol version, agent name).
-    result: Result<(AcpClient, u32, String)>,
+    result: Result<(AcpClient, u32, String, bool)>,
 }
 
 /// Outcome of a non-cancelling steer attempt, forwarded from a per-attempt
@@ -1419,7 +1419,7 @@ impl RespawnGuard {
     /// Send the result and disarm the guard. Uses `try_send` (sync) so there
     /// is no await boundary between marking `sent` and actually enqueueing —
     /// cancellation cannot slip between the two.
-    fn send(mut self, result: Result<(AcpClient, u32, String)>) {
+    fn send(mut self, result: Result<(AcpClient, u32, String, bool)>) {
         // Invariant: try_send succeeds because the channel capacity equals the
         // slot count, and respawn_in_flight guarantees at most one outstanding
         // result per slot. If this ever fails, the channel sizing or the
@@ -2072,6 +2072,20 @@ async fn tokio_main() -> Result<()> {
             last_maintenance = std::time::Instant::now();
             queue.compact_expired_state();
 
+            // Reclaim conversations that have gone idle. This runs at the top
+            // of the loop for the same reason the rest of maintenance does: it
+            // cannot be starved by the biased select. Only idle agents are
+            // swept, so no in-flight turn can have its session closed under it.
+            let evicted = pool::evict_idle_sessions(
+                &mut pool,
+                config.session_idle_ttl_secs,
+                config.max_live_sessions,
+            )
+            .await;
+            if evicted > 0 {
+                tracing::info!(evicted, "idle session sweep closed sessions");
+            }
+
             // Slot refill: spawn background tasks for empty slots whose
             // circuit breaker allows it. spawn_and_init runs off the main
             // loop so it never blocks event processing.
@@ -2124,7 +2138,7 @@ async fn tokio_main() -> Result<()> {
         while let Ok(rr) = respawn_rx.try_recv() {
             crash_history[rr.index].respawn_in_flight = false;
             match rr.result {
-                Ok((acp, protocol_version, agent_name)) => {
+                Ok((acp, protocol_version, agent_name, session_close_supported)) => {
                     let agent = OwnedAgent {
                         index: rr.index,
                         acp,
@@ -2135,6 +2149,7 @@ async fn tokio_main() -> Result<()> {
                         agent_name,
                         goose_system_prompt_supported: None,
                         protocol_version,
+                        session_close_supported,
                     };
                     pool.return_agent(agent);
                     tracing::info!(agent = rr.index, "respawn complete");
@@ -3056,7 +3071,7 @@ async fn tokio_main() -> Result<()> {
     // Drain any respawn results that completed before the abort. Explicitly
     // shut down returned agents instead of relying on AcpClient::Drop.
     while let Ok(rr) = respawn_rx.try_recv() {
-        if let Ok((mut acp, _, _)) = rr.result {
+        if let Ok((mut acp, _, _, _)) = rr.result {
             acp.shutdown().await;
             tracing::debug!(agent = rr.index, "reaped respawned agent on shutdown");
         }
@@ -4225,6 +4240,16 @@ async fn initialize_agent_pool(
                             }),
                         );
                         let agent_name = normalized_agent_name(&init_result);
+                        let session_close_supported = pool::advertises_session_close(&init_result);
+                        if !session_close_supported {
+                            tracing::warn!(
+                                agent = i,
+                                name = %agent_name,
+                                "adapter does not advertise session/close — idle sessions \
+                                 cannot be reclaimed and will hold their resources until \
+                                 the agent restarts"
+                            );
+                        }
                         agent_slots.push(Some(OwnedAgent {
                             index: i,
                             acp,
@@ -4235,6 +4260,7 @@ async fn initialize_agent_pool(
                             agent_name,
                             goose_system_prompt_supported: None,
                             protocol_version,
+                            session_close_supported,
                         }));
                     }
                     Ok(Err(e)) => {
@@ -4286,7 +4312,7 @@ async fn spawn_and_init(
     thinking_effort: Option<buzz_core::reasoning::ThinkingEffort>,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
-) -> Result<(AcpClient, u32, String)> {
+) -> Result<(AcpClient, u32, String, bool)> {
     let mut acp = AcpClient::spawn(
         command,
         args,
@@ -4310,7 +4336,8 @@ async fn spawn_and_init(
                 }),
             );
             let agent_name = normalized_agent_name(&init_result);
-            Ok((acp, protocol_version, agent_name))
+            let session_close_supported = pool::advertises_session_close(&init_result);
+            Ok((acp, protocol_version, agent_name, session_close_supported))
         }
         Err(e) => {
             // Explicitly shut down the spawned child to prevent zombie/leak.
@@ -6276,6 +6303,8 @@ mod build_mcp_servers_tests {
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            session_idle_ttl_secs: None,
+            max_live_sessions: None,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
@@ -6501,6 +6530,8 @@ mod error_outcome_emission_tests {
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            session_idle_ttl_secs: None,
+            max_live_sessions: None,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
@@ -6558,6 +6589,7 @@ mod error_outcome_emission_tests {
             // Error branches under test never read this; 1 is the legacy
             // non-systemPrompt path, the simplest valid value.
             protocol_version: 1,
+            session_close_supported: true,
         }
     }
 

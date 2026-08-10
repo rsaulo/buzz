@@ -817,6 +817,21 @@ impl AcpClient {
         self.send_request("session/set_model", params).await
     }
 
+    /// Send `session/close`, releasing whatever the adapter holds for a session.
+    ///
+    /// This is what makes per-thread sessions affordable: in `claude-agent-acp`
+    /// a session owns a CLI process of its own (~535 MB measured), so a session
+    /// that is never closed is a process that is never reclaimed. Closing also
+    /// ends the session cleanly on the harness side, which is what lets memory
+    /// retention run on a real session boundary instead of never running.
+    ///
+    /// Gate calls on the adapter advertising `sessionCapabilities.close` in its
+    /// `initialize` response — adapters without it answer method-not-found.
+    pub async fn session_close(&mut self, session_id: &str) -> Result<serde_json::Value, AcpError> {
+        let params = serde_json::json!({ "sessionId": session_id });
+        self.send_request("session/close", params).await
+    }
+
     /// Send `session/prompt` with idle-based timeout instead of wall-clock.
     ///
     /// The idle deadline resets on any stdout activity from the agent. The hard

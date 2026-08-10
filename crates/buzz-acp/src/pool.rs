@@ -94,6 +94,69 @@ struct SessionWorkspace {
     kind: crate::queue::WorkspaceKind,
 }
 
+/// When an idle session is closed, and how many one agent may hold at once.
+///
+/// Both limits exist because they fail differently. The TTL bounds how long a
+/// *forgotten* conversation keeps costing; the cap bounds how bad a *burst* of
+/// live conversations can get before the TTL has had time to fire.
+///
+/// Defaults come from the phase-0 measurement of what one session costs inside
+/// each harness, which differs by three orders of magnitude — a single global
+/// number would either strand memory under `claude-agent-acp` or throw away
+/// context for nothing under `opencode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SessionEvictionPolicy {
+    /// Idle time after which a session is closed. Zero disables eviction.
+    pub idle_ttl: Duration,
+    /// Maximum sessions one agent may hold. Zero means unbounded.
+    pub max_live_sessions: usize,
+}
+
+impl SessionEvictionPolicy {
+    /// `claude-agent-acp` spawns a CLI process per session (~535 MB measured),
+    /// so its sessions are evicted hard.
+    const CLAUDE: Self = Self {
+        idle_ttl: Duration::from_secs(10 * 60),
+        max_live_sessions: 3,
+    };
+    /// `codex-acp` shares one core process across sessions; what still costs
+    /// per session is its MCP servers (~200 MB measured).
+    const CODEX: Self = Self {
+        idle_ttl: Duration::from_secs(30 * 60),
+        max_live_sessions: 12,
+    };
+    /// Everything else measured (notably `opencode acp`) keeps sessions in
+    /// process at ~0.7 MB each, so eviction is about hygiene, not survival.
+    const IN_PROCESS: Self = Self {
+        idle_ttl: Duration::from_secs(2 * 60 * 60),
+        max_live_sessions: 64,
+    };
+
+    /// The measured default for a harness, with operator overrides applied.
+    ///
+    /// `None` keeps the harness default; `Some(0)` disables that limit.
+    pub fn resolve(
+        agent_name: &str,
+        idle_ttl_secs: Option<u64>,
+        max_live_sessions: Option<usize>,
+    ) -> Self {
+        let mut policy = if agent_name == CLAUDE_AGENT_ACP_NAME {
+            Self::CLAUDE
+        } else if agent_name.contains("codex") {
+            Self::CODEX
+        } else {
+            Self::IN_PROCESS
+        };
+        if let Some(secs) = idle_ttl_secs {
+            policy.idle_ttl = Duration::from_secs(secs);
+        }
+        if let Some(max) = max_live_sessions {
+            policy.max_live_sessions = max;
+        }
+        policy
+    }
+}
+
 /// Per-conversation session IDs and turn counters.
 ///
 /// Keyed by [`SessionKey`] — one session per thread, plus one ambient session
@@ -127,6 +190,12 @@ pub struct SessionState {
     /// fetch fails — all fail open. Cleared on session invalidation alongside
     /// `core_sections` so the next session picks up any canvas change.
     pub canvas_sections: HashMap<SessionKey, String>,
+    /// When each session was last used — created or prompted.
+    ///
+    /// Drives idle eviction. A session with no entry here is treated as idle
+    /// since forever, so a session that somehow escapes bookkeeping is reclaimed
+    /// rather than kept alive indefinitely.
+    last_active: HashMap<SessionKey, Instant>,
 }
 
 impl SessionState {
@@ -150,7 +219,62 @@ impl SessionState {
         self.core_sections.remove(key);
         self.canvas_sections.remove(key);
         self.session_workspaces.remove(key);
+        self.last_active.remove(key);
         self.sessions.remove(key).is_some()
+    }
+
+    /// Record that a session was just used, restarting its idle clock.
+    pub fn touch(&mut self, key: &SessionKey) {
+        self.last_active.insert(key.clone(), Instant::now());
+    }
+
+    /// Sessions that should be closed now, oldest-idle first.
+    ///
+    /// Two independent reasons, unioned: idle past `idle_ttl`, and — once the
+    /// agent holds more than `max_live_sessions` — the least recently used ones
+    /// beyond the cap. The cap is what covers a burst of conversations arriving
+    /// faster than the TTL can retire them.
+    ///
+    /// Returns `(key, session_id)` so the caller can close on the wire before
+    /// dropping local state.
+    pub fn evictable(
+        &self,
+        policy: &SessionEvictionPolicy,
+        now: Instant,
+    ) -> Vec<(SessionKey, String)> {
+        // Oldest idle first, so both rules and the caller agree on priority.
+        // `None` (no activity record) sorts ahead of every timestamp: a
+        // bookkeeping gap must not create an immortal session.
+        let mut ranked: Vec<(&SessionKey, Option<Instant>)> = self
+            .sessions
+            .keys()
+            .map(|key| (key, self.last_active.get(key).copied()))
+            .collect();
+        ranked.sort_by_key(|(key, last)| (*last, (*key).clone()));
+
+        let over_cap = if policy.max_live_sessions == 0 {
+            0
+        } else {
+            ranked.len().saturating_sub(policy.max_live_sessions)
+        };
+
+        ranked
+            .iter()
+            .enumerate()
+            .filter(|(rank, (_, last))| {
+                let idle_expired = !policy.idle_ttl.is_zero()
+                    && match last {
+                        None => true,
+                        Some(last) => now.saturating_duration_since(*last) >= policy.idle_ttl,
+                    };
+                idle_expired || *rank < over_cap
+            })
+            .filter_map(|(_, (key, _))| {
+                self.sessions
+                    .get(*key)
+                    .map(|sid| ((*key).clone(), sid.clone()))
+            })
+            .collect()
     }
 
     /// Invalidate **every** session belonging to a channel — the ambient one and
@@ -188,6 +312,7 @@ impl SessionState {
         self.heartbeat_turn_count = 0;
         self.core_sections.clear();
         self.canvas_sections.clear();
+        self.last_active.clear();
     }
 
     #[cfg(test)]
@@ -231,6 +356,20 @@ pub struct OwnedAgent {
     pub goose_system_prompt_supported: Option<bool>,
     /// Protocol version reported by the agent in its initialize response.
     pub protocol_version: u32,
+    /// Whether the adapter advertised `sessionCapabilities.close` at initialize.
+    ///
+    /// Without it, evicting a session frees local bookkeeping but leaves the
+    /// adapter holding whatever the session owns — which for a process-per-
+    /// session harness means the process leaks. Eviction is therefore skipped
+    /// entirely on adapters that cannot close, and says so once in the log.
+    pub session_close_supported: bool,
+}
+
+/// Whether an `initialize` result advertises `session/close`.
+pub fn advertises_session_close(init_result: &serde_json::Value) -> bool {
+    init_result
+        .pointer("/agentCapabilities/sessionCapabilities/close")
+        .is_some()
 }
 
 /// Package name reported by `claude-agent-acp` in its `initialize` response.
@@ -326,6 +465,88 @@ impl PromptSource {
             PromptSource::Heartbeat => None,
         }
     }
+}
+
+/// Close sessions that have gone idle, across every agent sitting in the pool.
+///
+/// This is the mechanism that makes per-thread sessions affordable rather than
+/// a leak: with `claude-agent-acp` each live session holds a CLI process of its
+/// own, so without eviction the cost grows with every thread ever touched.
+///
+/// It is also what restores memory retention. A session that never ends never
+/// produces a session boundary, so a forced retain never fires; closing an idle
+/// thread's session ends it for real.
+///
+/// A failed close leaves local state intact on purpose — dropping the session ID
+/// would strand the remote session with no way to ever close it. The next sweep
+/// retries.
+///
+/// Returns the number of sessions actually closed.
+pub async fn evict_idle_sessions(
+    pool: &mut AgentPool,
+    idle_ttl_secs: Option<u64>,
+    max_live_sessions: Option<usize>,
+) -> usize {
+    /// A close that hangs must not stall the main loop's maintenance pass.
+    const CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    let now = Instant::now();
+    let mut closed = 0usize;
+
+    for agent in pool.idle_agents_mut() {
+        let policy =
+            SessionEvictionPolicy::resolve(&agent.agent_name, idle_ttl_secs, max_live_sessions);
+        if policy.idle_ttl.is_zero() && policy.max_live_sessions == 0 {
+            continue;
+        }
+        let victims = agent.state.evictable(&policy, now);
+        if victims.is_empty() {
+            continue;
+        }
+        if !agent.session_close_supported {
+            // Warned once at initialize; here it would repeat every sweep.
+            tracing::debug!(
+                target: "pool::evict",
+                agent = agent.index,
+                candidates = victims.len(),
+                "adapter cannot close sessions — skipping eviction"
+            );
+            continue;
+        }
+        for (key, session_id) in victims {
+            match tokio::time::timeout(CLOSE_TIMEOUT, agent.acp.session_close(&session_id)).await {
+                Ok(Ok(_)) => {
+                    agent.state.invalidate_session(&key);
+                    closed += 1;
+                    tracing::info!(
+                        target: "pool::evict",
+                        agent = agent.index,
+                        session = %key,
+                        session_id = %session_id,
+                        idle_ttl_secs = policy.idle_ttl.as_secs(),
+                        max_live_sessions = policy.max_live_sessions,
+                        "closed idle session"
+                    );
+                }
+                Ok(Err(e)) => tracing::warn!(
+                    target: "pool::evict",
+                    agent = agent.index,
+                    session = %key,
+                    error = %e,
+                    "session close failed — keeping state to retry next sweep"
+                ),
+                Err(_) => tracing::warn!(
+                    target: "pool::evict",
+                    agent = agent.index,
+                    session = %key,
+                    timeout_secs = CLOSE_TIMEOUT.as_secs(),
+                    "session close timed out — keeping state to retry next sweep"
+                ),
+            }
+        }
+    }
+
+    closed
 }
 
 /// Apply state effects for Race 1, where a control signal arrives just after the
@@ -908,6 +1129,14 @@ impl AgentPool {
             );
         }
         self.agents[idx] = Some(agent);
+    }
+
+    /// Mutable access to every agent currently sitting in its slot.
+    ///
+    /// Checked-out agents are deliberately excluded: they are mid-turn, so
+    /// their session is in use by definition.
+    pub fn idle_agents_mut(&mut self) -> impl Iterator<Item = &mut OwnedAgent> {
+        self.agents.iter_mut().flatten()
     }
 
     /// Whether any agent is currently idle (sitting in its slot).
@@ -2066,6 +2295,7 @@ pub async fn run_prompt_task(
                             "created session {sid} for {key}"
                         );
                         agent.state.sessions.insert(key.clone(), sid.clone());
+                        agent.state.touch(key);
                         agent
                             .state
                             .session_workspaces
@@ -2618,6 +2848,12 @@ pub async fn run_prompt_task(
     match prompt_result {
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
+
+            // Restart the idle clock on every completed turn, independently of
+            // the turn-rotation limit below (which is off by default).
+            if let PromptSource::Channel(key) = &source {
+                agent.state.touch(key);
+            }
 
             let should_rotate = matches!(
                 stop_reason,
@@ -6091,6 +6327,151 @@ mod tests {
         );
     }
 
+    // ── idle session eviction ────────────────────────────────────────────────
+
+    /// Seed `count` sessions in one channel, each last used `age` ago.
+    fn state_with_sessions(base: Instant, ages: &[(char, Duration)]) -> (SessionState, Uuid) {
+        let ch = Uuid::new_v4();
+        let mut s = SessionState::default();
+        for (seed, age) in ages {
+            let key = SessionKey::thread(ch, std::iter::repeat_n(*seed, 64).collect::<String>());
+            s.sessions.insert(key.clone(), format!("sess-{seed}"));
+            s.last_active.insert(key, base - *age);
+        }
+        (s, ch)
+    }
+
+    #[test]
+    fn test_evictable_selects_only_sessions_idle_past_the_ttl() {
+        let now = Instant::now();
+        let (s, ch) = state_with_sessions(
+            now,
+            &[
+                ('a', Duration::from_secs(20 * 60)),
+                ('b', Duration::from_secs(60)),
+            ],
+        );
+        let policy = SessionEvictionPolicy {
+            idle_ttl: Duration::from_secs(10 * 60),
+            max_live_sessions: 0,
+        };
+
+        let victims = s.evictable(&policy, now);
+
+        assert_eq!(victims.len(), 1);
+        assert_eq!(victims[0].0, SessionKey::thread(ch, "a".repeat(64)));
+        assert_eq!(victims[0].1, "sess-a");
+    }
+
+    /// The cap is the burst valve: it fires on the least recently used sessions
+    /// even when none of them is old enough for the TTL.
+    #[test]
+    fn test_evictable_trims_least_recently_used_beyond_the_cap() {
+        let now = Instant::now();
+        let (s, ch) = state_with_sessions(
+            now,
+            &[
+                ('a', Duration::from_secs(30)),
+                ('b', Duration::from_secs(20)),
+                ('c', Duration::from_secs(10)),
+            ],
+        );
+        let policy = SessionEvictionPolicy {
+            idle_ttl: Duration::from_secs(60 * 60),
+            max_live_sessions: 2,
+        };
+
+        let victims = s.evictable(&policy, now);
+
+        assert_eq!(victims.len(), 1, "only the excess is evicted");
+        assert_eq!(
+            victims[0].0,
+            SessionKey::thread(ch, "a".repeat(64)),
+            "the least recently used session goes first"
+        );
+    }
+
+    #[test]
+    fn test_evictable_honors_disabled_limits() {
+        let now = Instant::now();
+        let (s, _) = state_with_sessions(
+            now,
+            &[
+                ('a', Duration::from_secs(60 * 60)),
+                ('b', Duration::from_secs(60 * 60)),
+            ],
+        );
+
+        let disabled = SessionEvictionPolicy {
+            idle_ttl: Duration::ZERO,
+            max_live_sessions: 0,
+        };
+        assert!(
+            s.evictable(&disabled, now).is_empty(),
+            "both limits off must never evict, however idle the sessions are"
+        );
+    }
+
+    /// A session with no activity record must not become immortal.
+    #[test]
+    fn test_evictable_reclaims_sessions_with_no_activity_record() {
+        let now = Instant::now();
+        let ch = Uuid::new_v4();
+        let mut s = SessionState::default();
+        s.sessions
+            .insert(SessionKey::ambient(ch), "sess-orphan".into());
+
+        let policy = SessionEvictionPolicy {
+            idle_ttl: Duration::from_secs(60),
+            max_live_sessions: 1,
+        };
+        // Idle-since-forever, so it is reclaimed once the clock moves past the TTL.
+        let victims = s.evictable(&policy, now + Duration::from_secs(61));
+
+        assert_eq!(victims.len(), 1);
+        assert_eq!(victims[0].1, "sess-orphan");
+    }
+
+    /// The measured cost per session differs by three orders of magnitude
+    /// between harnesses, so the defaults must too.
+    #[test]
+    fn test_eviction_policy_defaults_follow_the_harness() {
+        let claude = SessionEvictionPolicy::resolve(CLAUDE_AGENT_ACP_NAME, None, None);
+        let codex = SessionEvictionPolicy::resolve("codex-acp", None, None);
+        let opencode = SessionEvictionPolicy::resolve("opencode", None, None);
+
+        assert!(claude.idle_ttl < codex.idle_ttl);
+        assert!(codex.idle_ttl < opencode.idle_ttl);
+        assert!(claude.max_live_sessions < codex.max_live_sessions);
+        assert!(codex.max_live_sessions < opencode.max_live_sessions);
+    }
+
+    #[test]
+    fn test_eviction_policy_overrides_replace_the_harness_default() {
+        let overridden = SessionEvictionPolicy::resolve(CLAUDE_AGENT_ACP_NAME, Some(45), Some(9));
+        assert_eq!(overridden.idle_ttl, Duration::from_secs(45));
+        assert_eq!(overridden.max_live_sessions, 9);
+
+        // An explicit zero disables that limit rather than falling back.
+        let disabled = SessionEvictionPolicy::resolve(CLAUDE_AGENT_ACP_NAME, Some(0), Some(0));
+        assert!(disabled.idle_ttl.is_zero());
+        assert_eq!(disabled.max_live_sessions, 0);
+    }
+
+    #[test]
+    fn test_advertises_session_close_reads_the_initialize_capability() {
+        let with_close = serde_json::json!({
+            "agentCapabilities": { "sessionCapabilities": { "close": {}, "fork": {} } }
+        });
+        let without = serde_json::json!({
+            "agentCapabilities": { "sessionCapabilities": { "fork": {} } }
+        });
+
+        assert!(advertises_session_close(&with_close));
+        assert!(!advertises_session_close(&without));
+        assert!(!advertises_session_close(&serde_json::json!({})));
+    }
+
     #[test]
     fn test_invalidate_heartbeat_clears_session_and_turn_count() {
         let (mut s, ch_a, ch_b) = make_state();
@@ -6777,6 +7158,7 @@ mod tests {
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
+            session_close_supported: true,
         };
 
         // Simulate dispatch: install a steer receiver (normally done by
@@ -6836,6 +7218,7 @@ mod tests {
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
+            session_close_supported: true,
         };
 
         // Simulate a completed turn: `steer_rx` was consumed by the read loop
