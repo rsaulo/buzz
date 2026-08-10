@@ -84,6 +84,12 @@ pub struct AgentModelCapabilities {
     pub available_models_raw: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionWorkspace {
+    cwd: PathBuf,
+    kind: crate::queue::WorkspaceKind,
+}
+
 /// Per-channel session IDs and turn counters.
 ///
 /// Separated from `OwnedAgent` so the state machine is testable without
@@ -92,6 +98,10 @@ pub struct AgentModelCapabilities {
 pub struct SessionState {
     /// channel_id → session_id
     pub sessions: HashMap<Uuid, String>,
+    /// The exact cwd decision used when each channel session was created.
+    /// Kept with the session ID so later turns cannot drift if the workspace
+    /// index changes while that session remains alive.
+    session_workspaces: HashMap<Uuid, SessionWorkspace>,
     pub heartbeat_session: Option<String>,
     /// Per-channel turn counters for proactive session rotation.
     /// Incremented on each successful prompt; reset when the session is rotated.
@@ -130,12 +140,14 @@ impl SessionState {
         self.turn_counts.remove(channel_id);
         self.core_sections.remove(channel_id);
         self.canvas_sections.remove(channel_id);
+        self.session_workspaces.remove(channel_id);
         self.sessions.remove(channel_id).is_some()
     }
 
     /// Invalidate all sessions and turn counters (e.g. after agent exit).
     pub fn invalidate_all(&mut self) {
         self.sessions.clear();
+        self.session_workspaces.clear();
         self.turn_counts.clear();
         self.heartbeat_session = None;
         self.heartbeat_turn_count = 0;
@@ -149,6 +161,7 @@ impl SessionState {
             || self.turn_counts.contains_key(channel_id)
             || self.core_sections.contains_key(channel_id)
             || self.canvas_sections.contains_key(channel_id)
+            || self.session_workspaces.contains_key(channel_id)
     }
 }
 
@@ -1089,6 +1102,7 @@ async fn resolve_new_session_channel_context(
 /// Cwd and channel metadata passed together at the session-creation boundary.
 struct NewSessionParameters<'a> {
     cwd: &'a Path,
+    workspace_kind: crate::queue::WorkspaceKind,
     channel_name: Option<&'a str>,
     channel_id: Option<Uuid>,
     channel_type: Option<&'a str>,
@@ -1118,7 +1132,12 @@ async fn create_session_and_apply_model(
     let combined_system_prompt = with_canvas(
         with_core(
             with_team(
-                framed_system_prompt(&session_cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
+                framed_system_prompt_with_kind(
+                    &session_cwd,
+                    parameters.workspace_kind,
+                    ctx.base_prompt,
+                    ctx.system_prompt.as_deref(),
+                ),
                 ctx.team_instructions.as_deref(),
             ),
             agent_core,
@@ -1423,21 +1442,27 @@ async fn apply_permission_mode(
     Ok(())
 }
 
-/// Prepend the `[Base]` section to a user-message body for legacy agents.
+/// Prepend `[Workspace]` and `[Base]` sections to a legacy user-message body.
 ///
 /// Legacy agents (`protocol_version < 2`) don't receive `base_prompt` via the
-/// system role in `session/new`, so it must ride along in the user message.
+/// system role in `session/new`, so both must ride along in the user message.
 /// Agents with `protocol_version >= 2`, or any agent without a `base_prompt`,
 /// get `body` unchanged. The gate lives here so the heartbeat and
 /// initial-message dispatch paths can't drift apart again.
 pub(crate) fn prepend_base_for_legacy(
     protocol_version: u32,
+    cwd: Option<&str>,
+    workspace_kind: crate::queue::WorkspaceKind,
     base_prompt: Option<&str>,
     body: &str,
 ) -> String {
     match base_prompt {
         Some(bp) if protocol_version < 2 => {
-            format!("{}\n\n{body}", crate::queue::base_section(bp))
+            let base = crate::queue::base_section(bp);
+            match cwd.and_then(|cwd| crate::queue::workspace_section(cwd, workspace_kind)) {
+                Some(workspace) => format!("{workspace}\n\n{base}\n\n{body}"),
+                None => format!("{base}\n\n{body}"),
+            }
         }
         _ => body.to_string(),
     }
@@ -1477,8 +1502,23 @@ pub(crate) fn prepend_canvas_for_legacy(
 /// directory. The line is emitted only when a real base prompt is present and
 /// `cwd` is an absolute path other than the `/` fallback — naming `/` as the
 /// workspace would itself invite a `$HOME`-wide scan.
+#[cfg(test)]
 fn framed_system_prompt(
     cwd: &str,
+    base_prompt: Option<&str>,
+    system_prompt: Option<&str>,
+) -> Option<String> {
+    framed_system_prompt_with_kind(
+        cwd,
+        crate::queue::WorkspaceKind::Root,
+        base_prompt,
+        system_prompt,
+    )
+}
+
+fn framed_system_prompt_with_kind(
+    cwd: &str,
+    workspace_kind: crate::queue::WorkspaceKind,
     base_prompt: Option<&str>,
     system_prompt: Option<&str>,
 ) -> Option<String> {
@@ -1494,29 +1534,18 @@ fn framed_system_prompt(
     // Anchor the workspace only when a base prompt is present — the workspace
     // section grounds the base prompt's layout description, so it is meaningless
     // for a persona-only (`[System]`-only) agent that never received that layout.
-    match (base_prompt, workspace_section(cwd)) {
+    match (
+        base_prompt,
+        crate::queue::workspace_section(cwd, workspace_kind),
+    ) {
         (Some(_), Some(workspace)) => Some(format!("{workspace}\n\n{body}")),
         _ => Some(body),
     }
 }
 
-/// Render the `[Workspace]` grounding section, or `None` when `cwd` is unusable.
-///
-/// Skips relative paths and the `/` fallback (`std::env::current_dir()` resolves
-/// to `/` on failure): a `/`-rooted workspace line would actively encourage the
-/// `$HOME`-wide scan this section exists to prevent.
+#[cfg(test)]
 fn workspace_section(cwd: &str) -> Option<String> {
-    if cwd != "/" && cwd.starts_with('/') {
-        Some(format!(
-            "[Workspace]\nYour absolute working directory is `{cwd}`. All workspace \
-             files — `AGENTS.md`, `RESEARCH/`, `PLANS/`, `GUIDES/`, `WORK_LOGS/`, \
-             `OUTBOX/` — and any repositories you clone (under `{cwd}/REPOS/`) live \
-             here. This is where you already are; do not search `$HOME` or other \
-             directories for them."
-        ))
-    } else {
-        None
-    }
+    crate::queue::workspace_section(cwd, crate::queue::WorkspaceKind::Root)
 }
 
 /// Append the team-owned instruction section after `[System]` and before core memory.
@@ -1811,12 +1840,22 @@ pub async fn run_prompt_task(
         PromptSource::Heartbeat => None,
     };
 
-    let (session_id, is_new_session) = match &source {
+    let (session_id, is_new_session, session_workspace) = match &source {
         PromptSource::Channel(cid) => {
-            if let Some(sid) = agent.state.sessions.get(cid) {
-                (sid.clone(), false)
+            let existing_session = agent.state.sessions.get(cid).cloned();
+            let existing_workspace = agent.state.session_workspaces.get(cid).cloned();
+            if let (Some(sid), Some(workspace)) = (existing_session, existing_workspace) {
+                (sid, false, workspace)
             } else {
-                let session_cwd = match ctx.session_cwd.resolve_channel(
+                if agent.state.sessions.contains_key(cid) {
+                    tracing::warn!(
+                        target: "pool::session",
+                        channel = %cid,
+                        "session missing its cwd decision; rotating before prompt"
+                    );
+                    agent.state.invalidate_channel(cid);
+                }
+                let session_workspace = match ctx.session_cwd.resolve_channel(
                     *cid,
                     match origin_channel_type.as_deref() {
                         Some("dm") => ChannelTypeSignal::Dm,
@@ -1832,7 +1871,10 @@ pub async fn run_prompt_task(
                             decision = "pinned",
                             "resolved channel session working directory"
                         );
-                        path
+                        SessionWorkspace {
+                            cwd: path,
+                            kind: crate::queue::WorkspaceKind::Root,
+                        }
                     }
                     SessionCwdDecision::Workspace(path) => {
                         tracing::info!(
@@ -1842,7 +1884,10 @@ pub async fn run_prompt_task(
                             decision = "workspace",
                             "resolved channel session working directory"
                         );
-                        path
+                        SessionWorkspace {
+                            cwd: path,
+                            kind: crate::queue::WorkspaceKind::Repository,
+                        }
                     }
                     SessionCwdDecision::RootMode(reason) => {
                         // RootMode deliberately shares the heartbeat/process
@@ -1857,7 +1902,10 @@ pub async fn run_prompt_task(
                             reason = reason.as_log_value(),
                             "resolved channel session working directory"
                         );
-                        path
+                        SessionWorkspace {
+                            cwd: path,
+                            kind: crate::queue::WorkspaceKind::Root,
+                        }
                     }
                     SessionCwdDecision::Refused(reason) => {
                         if ctx.session_cwd.should_post_refusal_notice(*cid) {
@@ -1924,7 +1972,8 @@ pub async fn run_prompt_task(
                     agent_core.as_deref(),
                     agent_canvas.as_deref(),
                     NewSessionParameters {
-                        cwd: &session_cwd,
+                        cwd: &session_workspace.cwd,
+                        workspace_kind: session_workspace.kind,
                         channel_name: title_channel.as_deref(),
                         channel_id: Some(*cid),
                         channel_type: origin_channel_type.as_deref(),
@@ -1938,11 +1987,15 @@ pub async fn run_prompt_task(
                             "created session {sid} for channel {cid}"
                         );
                         agent.state.sessions.insert(*cid, sid.clone());
+                        agent
+                            .state
+                            .session_workspaces
+                            .insert(*cid, session_workspace.clone());
                         // Commit canvas only after session creation succeeds (I3).
                         if let Some((pending_cid, section)) = pending_canvas.take() {
                             agent.state.canvas_sections.insert(pending_cid, section);
                         }
-                        (sid, true)
+                        (sid, true, session_workspace)
                     }
                     Err(AcpError::AgentExited) => {
                         agent.state.invalidate_all();
@@ -1973,13 +2026,16 @@ pub async fn run_prompt_task(
             }
         }
         PromptSource::Heartbeat => {
+            let heartbeat_workspace = SessionWorkspace {
+                cwd: ctx.session_cwd.heartbeat_cwd().to_path_buf(),
+                kind: crate::queue::WorkspaceKind::Root,
+            };
             if let Some(sid) = &agent.state.heartbeat_session {
-                (sid.clone(), false)
+                (sid.clone(), false, heartbeat_workspace)
             } else {
-                let heartbeat_cwd = ctx.session_cwd.heartbeat_cwd().to_path_buf();
                 tracing::info!(
                     target: "pool::session",
-                    cwd = %heartbeat_cwd.display(),
+                    cwd = %heartbeat_workspace.cwd.display(),
                     decision = "heartbeat_process_cwd",
                     "resolved heartbeat session working directory"
                 );
@@ -1989,7 +2045,8 @@ pub async fn run_prompt_task(
                     None,
                     None,
                     NewSessionParameters {
-                        cwd: &heartbeat_cwd,
+                        cwd: &heartbeat_workspace.cwd,
+                        workspace_kind: heartbeat_workspace.kind,
                         channel_name: None,
                         channel_id: None,
                         channel_type: None,
@@ -2004,7 +2061,7 @@ pub async fn run_prompt_task(
                             agent.index
                         );
                         agent.state.heartbeat_session = Some(sid.clone());
-                        (sid, true)
+                        (sid, true, heartbeat_workspace)
                     }
                     Err(AcpError::AgentExited) => {
                         agent.state.invalidate_all();
@@ -2033,6 +2090,7 @@ pub async fn run_prompt_task(
             }
         }
     };
+    let session_cwd = session_workspace.cwd.to_string_lossy();
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
         Some(session_id.clone()),
@@ -2069,6 +2127,8 @@ pub async fn run_prompt_task(
                 } else {
                     1
                 },
+                Some(&session_cwd),
+                session_workspace.kind,
                 ctx.base_prompt,
                 initial_msg,
             );
@@ -2207,6 +2267,8 @@ pub async fn run_prompt_task(
             } else {
                 1
             },
+            Some(&session_cwd),
+            session_workspace.kind,
             ctx.base_prompt,
             &text,
         );
@@ -2250,6 +2312,8 @@ pub async fn run_prompt_task(
                 profile_lookup: profile_lookup.as_ref(),
                 has_system_prompt_support: agent.has_system_prompt_support(),
                 base_prompt: ctx.base_prompt,
+                cwd: Some(&session_cwd),
+                workspace_kind: session_workspace.kind,
                 system_prompt: ctx.system_prompt.as_deref(),
                 team_instructions: ctx.team_instructions.as_deref(),
                 agent_canvas: agent_canvas.as_deref(),
@@ -4590,16 +4654,30 @@ mod tests {
     fn test_initial_message_legacy_agent_gets_base_prepended() {
         // protocol_version 1 + Some(base_prompt): [Base] rides along in the
         // user message, composed as `[Base]\n{bp}\n\n{initial_msg}`.
-        let composed = prepend_base_for_legacy(1, Some("you are a helpful agent"), "hello channel");
-        assert_eq!(composed, "[Base]\nyou are a helpful agent\n\nhello channel");
-        assert!(composed.starts_with("[Base]\nyou are a helpful agent\n\n"));
+        let composed = prepend_base_for_legacy(
+            1,
+            Some("/Users/me/git/channel-repo"),
+            crate::queue::WorkspaceKind::Repository,
+            Some("you are a helpful agent"),
+            "hello channel",
+        );
+        assert!(composed.starts_with(
+            "[Workspace]\nYour absolute working directory is `/Users/me/git/channel-repo`."
+        ));
+        assert!(composed.contains("\n\n[Base]\nyou are a helpful agent\n\nhello channel"));
     }
 
     #[test]
     fn test_initial_message_modern_agent_omits_base() {
         // protocol_version 2 receives base_prompt via session/new, so the user
         // message is left untouched even when a base_prompt is present.
-        let composed = prepend_base_for_legacy(2, Some("you are a helpful agent"), "hello channel");
+        let composed = prepend_base_for_legacy(
+            2,
+            Some("/Users/me/git/channel-repo"),
+            crate::queue::WorkspaceKind::Repository,
+            Some("you are a helpful agent"),
+            "hello channel",
+        );
         assert_eq!(composed, "hello channel");
     }
 
@@ -4671,8 +4749,15 @@ mod tests {
     #[test]
     fn test_initial_message_legacy_agent_without_base_is_unchanged() {
         // No base_prompt configured: nothing to prepend regardless of version.
-        let composed = prepend_base_for_legacy(1, None, "hello channel");
+        let composed = prepend_base_for_legacy(
+            1,
+            Some("/Users/me/git/channel-repo"),
+            crate::queue::WorkspaceKind::Repository,
+            None,
+            "hello channel",
+        );
         assert_eq!(composed, "hello channel");
+        assert!(!composed.contains("[Workspace]"));
     }
 
     // ── prepend_canvas_for_legacy ─────────────────────────────────────────────
@@ -4725,7 +4810,13 @@ mod tests {
         // Verify the full composition order when both base and canvas are present:
         // [Base] → canvas section → initial-message body.
         let canvas = "[Channel Canvas]\ncanvas content";
-        let base_composed = prepend_base_for_legacy(1, Some("be helpful"), "do the thing");
+        let base_composed = prepend_base_for_legacy(
+            1,
+            Some("/Users/me/.buzz"),
+            crate::queue::WorkspaceKind::Root,
+            Some("be helpful"),
+            "do the thing",
+        );
         let full = prepend_canvas_for_legacy(1, Some(canvas), &base_composed);
         assert!(
             full.starts_with("[Channel Canvas]"),
@@ -4739,13 +4830,14 @@ mod tests {
             full.ends_with("do the thing"),
             "body must be last in composed message"
         );
-        // Order: canvas → base → body
+        // Order: canvas → workspace → base → body
         let canvas_pos = full.find("[Channel Canvas]").unwrap();
+        let workspace_pos = full.find("[Workspace]").unwrap();
         let base_pos = full.find("[Base]").unwrap();
         let body_pos = full.find("do the thing").unwrap();
         assert!(
-            canvas_pos < base_pos && base_pos < body_pos,
-            "order must be: canvas → base → body"
+            canvas_pos < workspace_pos && workspace_pos < base_pos && base_pos < body_pos,
+            "order must be: canvas → workspace → base → body"
         );
     }
 

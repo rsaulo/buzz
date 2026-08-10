@@ -1366,6 +1366,13 @@ pub struct FormatPromptArgs<'a> {
     pub has_system_prompt_support: bool,
     /// Base prompt content for legacy agents (protocol_version < 2).
     pub base_prompt: Option<&'a str>,
+    /// Absolute working directory selected for this session.
+    ///
+    /// Legacy agents receive its `[Workspace]` anchor in the user message;
+    /// modern agents receive the same section through `session/new`.
+    pub cwd: Option<&'a str>,
+    /// Whether `cwd` is the channel's repository or the harness root/nest.
+    pub workspace_kind: WorkspaceKind,
     /// System prompt content for legacy agents (protocol_version < 2).
     pub system_prompt: Option<&'a str>,
     /// Team instructions for legacy agents, rendered after `[System]`.
@@ -1379,6 +1386,16 @@ pub struct FormatPromptArgs<'a> {
     pub agent_canvas: Option<&'a str>,
 }
 
+/// Meaning of the working directory rendered in a `[Workspace]` section.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceKind {
+    /// Harness root/nest, including an operator-pinned `AGENT_CWD`.
+    #[default]
+    Root,
+    /// Repository selected from the channel-to-workspace index.
+    Repository,
+}
+
 /// Format the `[Base]` section for the base prompt.
 ///
 /// Single source of truth for the `[Base]` framing so the format is defined in
@@ -1388,15 +1405,43 @@ pub(crate) fn base_section(base_prompt: &str) -> String {
     format!("[Base]\n{}", base_prompt.trim_end())
 }
 
+/// Render the `[Workspace]` grounding section, or `None` when `cwd` is unusable.
+///
+/// Skips relative paths and the `/` fallback (`std::env::current_dir()` used to
+/// resolve to `/` on failure): a `/`-rooted workspace line would actively
+/// encourage the `$HOME`-wide scan this section exists to prevent.
+pub(crate) fn workspace_section(cwd: &str, kind: WorkspaceKind) -> Option<String> {
+    if cwd == "/" || !cwd.starts_with('/') {
+        return None;
+    }
+
+    Some(match kind {
+        WorkspaceKind::Root => format!(
+            "[Workspace]\nYour absolute working directory is `{cwd}`. All workspace \
+             files — `AGENTS.md`, `RESEARCH/`, `PLANS/`, `GUIDES/`, `WORK_LOGS/`, \
+             `OUTBOX/` — and any repositories you clone (under `{cwd}/REPOS/`) live \
+             here. This is where you already are; do not search `$HOME` or other \
+             directories for them."
+        ),
+        WorkspaceKind::Repository => format!(
+            "[Workspace]\nYour absolute working directory is `{cwd}`. This is the \
+             repository for this channel and is where you already are. Work with the \
+             repository files here; do not search `$HOME` or other directories for \
+             another workspace."
+        ),
+    })
+}
+
 /// Format a [`FlushBatch`] into the per-section prompt blocks for the agent.
 ///
 /// Produces a stable prompt with these sections (in order):
-/// 0. `[Base]` — base prompt (only for legacy agents without systemPrompt support)
-/// 1. `[System]` — system prompt (only for legacy agents without systemPrompt support)
-/// 2. `[Agent Memory — core]` — if agent core memory is set
-/// 3. `[Context]` — scope, channel name, and contextual hints for the agent
-/// 4. `[Thread Context]` or `[Conversation Context]` — if fetched
-/// 5. `[Event]` / `[Buzz events]` — the triggering event(s)
+/// 0. `[Workspace]` — resolved cwd (legacy agents with a base prompt only)
+/// 1. `[Base]` — base prompt (only for legacy agents without systemPrompt support)
+/// 2. `[System]` — system prompt (only for legacy agents without systemPrompt support)
+/// 3. `[Agent Memory — core]` — if agent core memory is set
+/// 4. `[Context]` — scope, channel name, and contextual hints for the agent
+/// 5. `[Thread Context]` or `[Conversation Context]` — if fetched
+/// 6. `[Event]` / `[Buzz events]` — the triggering event(s)
 ///
 /// Each section is returned as its own block rather than one joined string so
 /// the observer frame's size trimmer (`fit_observer_event_to_budget`) elides
@@ -1433,6 +1478,12 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     // via the system role in session/new.
     if !args.has_system_prompt_support {
         if let Some(bp) = args.base_prompt {
+            if let Some(workspace) = args
+                .cwd
+                .and_then(|cwd| workspace_section(cwd, args.workspace_kind))
+            {
+                sections.push(workspace);
+            }
             sections.push(base_section(bp));
         }
         if let Some(sp) = args.system_prompt {
@@ -2374,6 +2425,8 @@ mod tests {
             &FormatPromptArgs {
                 has_system_prompt_support: false,
                 base_prompt: Some("test base prompt"),
+                cwd: Some("/Users/me/git/channel-repo"),
+                workspace_kind: WorkspaceKind::Repository,
                 system_prompt: Some("test system prompt"),
                 agent_core: Some(core),
                 ..Default::default()
@@ -2381,7 +2434,13 @@ mod tests {
         )
         .join("\n\n");
 
-        // Both sections must be present
+        // All legacy framing sections must be present.
+        assert!(
+            prompt.contains(
+                "[Workspace]\nYour absolute working directory is `/Users/me/git/channel-repo`."
+            ),
+            "missing [Workspace] section"
+        );
         assert!(
             prompt.contains("[Base]\ntest base prompt"),
             "missing [Base] section"
@@ -2391,12 +2450,17 @@ mod tests {
             "missing [System] section"
         );
 
-        // [Base] and [System] must appear BEFORE [Agent Memory] and [Context]
+        // [Workspace], [Base], and [System] must appear before memory/context.
+        let workspace_pos = prompt.find("[Workspace]").unwrap();
         let base_pos = prompt.find("[Base]").unwrap();
         let system_pos = prompt.find("[System]").unwrap();
         let core_pos = prompt.find("[Agent Memory").unwrap();
         let context_pos = prompt.find("[Context]").unwrap();
 
+        assert!(
+            workspace_pos < base_pos,
+            "[Workspace] should come before [Base]"
+        );
         assert!(base_pos < system_pos, "[Base] should come before [System]");
         assert!(
             system_pos < core_pos,
@@ -2406,6 +2470,79 @@ mod tests {
             core_pos < context_pos,
             "[Agent Memory] should come before [Context]"
         );
+    }
+
+    #[test]
+    fn test_format_prompt_legacy_channels_use_their_resolved_repository_cwds() {
+        fn prompt_for(channel_id: Uuid, cwd: &str) -> String {
+            let batch = FlushBatch {
+                channel_id,
+                events: vec![BatchEvent {
+                    event: make_event("hello"),
+                    prompt_tag: "test".into(),
+                    received_at: Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            };
+            format_prompt(
+                &batch,
+                &FormatPromptArgs {
+                    base_prompt: Some("base"),
+                    cwd: Some(cwd),
+                    workspace_kind: WorkspaceKind::Repository,
+                    ..Default::default()
+                },
+            )
+            .join("\n\n")
+        }
+
+        let first = prompt_for(Uuid::new_v4(), "/Users/me/git/first");
+        let second = prompt_for(Uuid::new_v4(), "/Users/me/git/second");
+
+        assert!(first.contains("`/Users/me/git/first`"));
+        assert!(!first.contains("`/Users/me/git/second`"));
+        assert!(second.contains("`/Users/me/git/second`"));
+        assert!(!second.contains("`/Users/me/git/first`"));
+    }
+
+    #[test]
+    fn test_format_prompt_legacy_persona_only_omits_workspace() {
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            events: vec![BatchEvent {
+                event: make_event("hello"),
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let prompt = format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                system_prompt: Some("persona only"),
+                cwd: Some("/Users/me/git/channel-repo"),
+                workspace_kind: WorkspaceKind::Repository,
+                ..Default::default()
+            },
+        )
+        .join("\n\n");
+
+        assert!(!prompt.contains("[Workspace]"));
+        assert!(prompt.starts_with("[System]\npersona only"));
+    }
+
+    #[test]
+    fn test_workspace_section_repository_text_differs_from_root_layout() {
+        let root = workspace_section("/Users/me/.buzz", WorkspaceKind::Root).unwrap();
+        let repository =
+            workspace_section("/Users/me/git/channel-repo", WorkspaceKind::Repository).unwrap();
+
+        assert!(root.contains("repositories you clone (under `/Users/me/.buzz/REPOS/`)"));
+        assert!(repository.contains("This is the repository for this channel"));
+        assert!(!repository.contains("REPOS/"));
+        assert_ne!(root, repository);
     }
 
     #[test]
