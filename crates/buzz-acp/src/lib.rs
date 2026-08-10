@@ -4664,20 +4664,39 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
     // environment. The agent's secret key and auth tag belong to `buzz-mcp`
     // alone; forwarding them to a third-party server would hand out the
     // agent's Nostr credentials to anything an operator wires up here.
-    for command in config
+    for entry in config
         .mcp_extra
         .iter()
         .map(|c| c.trim())
         .filter(|c| !c.is_empty())
     {
+        let (name, command) = parse_extra_mcp_entry(entry);
         servers.push(McpServer {
-            name: mcp_server_name(command),
-            command: command.to_string(),
+            name,
+            command,
             args: vec![],
             env: vec![],
         });
     }
     servers
+}
+
+/// Split an extra-MCP entry into `(name, command)`.
+///
+/// Accepts `name=/path/to/server` and a bare `/path/to/server`, which is named
+/// after its file stem. The `=` is only treated as a separator when the left
+/// side has no `/`: an MCP server name never contains one, while a path may
+/// (`/opt/a=b/server.js`), and reading that as a name would silently truncate
+/// the command to `b/server.js`.
+fn parse_extra_mcp_entry(entry: &str) -> (String, String) {
+    if let Some((name, command)) = entry.split_once('=') {
+        let name = name.trim();
+        let command = command.trim();
+        if !name.is_empty() && !command.is_empty() && !name.contains('/') {
+            return (name.to_string(), command.to_string());
+        }
+    }
+    (mcp_server_name(entry), entry.to_string())
 }
 
 /// Name an MCP server after its executable, as the protocol expects a stable id.
@@ -6534,6 +6553,32 @@ mod build_mcp_servers_tests {
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "hindsight-mcp");
         assert_eq!(servers[0].command, "/opt/tools/hindsight-mcp.js");
+    }
+
+    #[test]
+    fn extra_mcp_entry_accepts_an_explicit_name() {
+        let mut config = test_config();
+        config.mcp_command = "".into();
+        config.mcp_extra = vec!["hindsight=/opt/tools/mcp-server.js".into()];
+
+        let servers = build_mcp_servers(&config);
+
+        assert_eq!(servers[0].name, "hindsight");
+        assert_eq!(servers[0].command, "/opt/tools/mcp-server.js");
+    }
+
+    /// A path may legitimately contain `=`; reading it as a name would truncate
+    /// the command and produce a server that cannot start.
+    #[test]
+    fn extra_mcp_entry_with_equals_in_the_path_stays_a_path() {
+        let mut config = test_config();
+        config.mcp_command = "".into();
+        config.mcp_extra = vec!["/opt/a=b/server.js".into()];
+
+        let servers = build_mcp_servers(&config);
+
+        assert_eq!(servers[0].command, "/opt/a=b/server.js");
+        assert_eq!(servers[0].name, "server");
     }
 
     /// Buzz's identity belongs to `buzz-mcp` alone. An extra server is a plain

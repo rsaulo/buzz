@@ -351,12 +351,14 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_MCP_COMMAND", default_value = "")]
     pub mcp_command: String,
 
-    /// Additional MCP servers, as a comma-separated list of executable paths.
+    /// Additional MCP servers, comma-separated, each `name=/path` or `/path`.
     ///
     /// Exists because `BUZZ_ACP_MCP_COMMAND` is a single slot reserved by Buzz
     /// Desktop for `buzz-mcp`, so an operator has no way to add a server of
     /// their own. Each entry must be directly executable (a shebang is enough);
     /// arguments are not parsed, so wrap anything that needs them in a script.
+    /// Without an explicit name the server is named after its file stem, which
+    /// is why `hindsight=…/mcp-server.js` reads better than the bare path.
     ///
     /// These servers receive an EMPTY environment — no relay URL, no agent
     /// secret key, no auth tag. Only `buzz-mcp` gets the agent's identity.
