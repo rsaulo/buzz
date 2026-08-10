@@ -7,6 +7,7 @@ mod filter;
 mod observer;
 mod pool;
 mod pool_lifecycle;
+mod project_channel;
 mod queue;
 mod relay;
 mod setup_mode;
@@ -1595,7 +1596,7 @@ async fn tokio_main() -> Result<()> {
     } else {
         tracing::info!(
             process_cwd = %process_cwd.display(),
-            "buzz-acp channel sessions require an indexed workspace"
+            "buzz-acp channel sessions use workspace/project/DM cwd policy"
         );
     }
 
@@ -1850,7 +1851,12 @@ async fn tokio_main() -> Result<()> {
             Some(include_str!("base_prompt.md"))
         },
         heartbeat_prompt: config.heartbeat_prompt.clone(),
-        session_cwd: pool::SessionCwdResolver::new(pinned_cwd, process_cwd, workspace_index),
+        session_cwd: pool::SessionCwdResolver::new(
+            pinned_cwd,
+            process_cwd,
+            workspace_index,
+            project_channel::ProjectChannelResolver::new(relay.rest_client()),
+        ),
         rest_client: relay.rest_client(),
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
         context_message_limit: config.context_message_limit,

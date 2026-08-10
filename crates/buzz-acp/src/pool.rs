@@ -21,9 +21,10 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
@@ -37,6 +38,7 @@ use crate::acp::{
 };
 use crate::config::{compose_session_title, DedupMode, PermissionMode};
 use crate::observer;
+use crate::project_channel::{ProjectChannelResolver, ProjectChannelSignal};
 use crate::queue::{
     CancelReason, ContextMessage, ConversationContext, FlushBatch, PromptChannelInfo,
     PromptProfile, PromptProfileLookup, ThreadTags,
@@ -577,47 +579,148 @@ pub enum SessionCwdDecision {
     Pinned(PathBuf),
     /// The channel is declared by a locally indexed repository.
     Workspace(PathBuf),
-    /// Explicit non-project mode reserved for DM/ad-hoc channels in Phase 3.
-    #[allow(dead_code)]
-    RootMode,
+    /// Explicit non-project mode using the harness process cwd.
+    RootMode(RootModeReason),
     /// No safe working directory was resolved, so session creation must stop.
     Refused(String),
 }
 
+/// Auditable reason why using the harness process cwd was explicitly allowed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RootModeReason {
+    Dm,
+    NotProject,
+    UndeterminedFailOpen,
+}
+
+impl RootModeReason {
+    fn as_log_value(&self) -> &'static str {
+        match self {
+            Self::Dm => "dm",
+            Self::NotProject => "not-a-project",
+            Self::UndeterminedFailOpen => "undetermined-fail-open",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChannelTypeSignal {
+    Dm,
+    NonDm,
+    Undetermined,
+}
+
+/// One hour makes a refusal visible without letting a busy channel turn the
+/// agent into a notice bot. A successful workspace lookup clears the channel's
+/// entry immediately, independent of this window.
+const REFUSAL_NOTICE_WINDOW: Duration = Duration::from_secs(60 * 60);
+
 /// Thread-safe resolver shared by all prompt tasks in [`PromptContext`].
-#[derive(Debug)]
 pub struct SessionCwdResolver {
     pinned_cwd: Option<PathBuf>,
     process_cwd: PathBuf,
     workspace_index: WorkspaceIndex,
+    project_channels: ProjectChannelResolver,
+    refusal_notices: Mutex<HashMap<Uuid, Instant>>,
+    refusal_notice_window: Duration,
+    clock: Arc<dyn Fn() -> Instant + Send + Sync>,
+}
+
+impl fmt::Debug for SessionCwdResolver {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionCwdResolver")
+            .field("pinned_cwd", &self.pinned_cwd)
+            .field("process_cwd", &self.process_cwd)
+            .field("workspace_index", &self.workspace_index)
+            .field("project_channels", &self.project_channels)
+            .field("refusal_notice_window", &self.refusal_notice_window)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SessionCwdResolver {
-    pub fn new(
+    pub(crate) fn new(
         pinned_cwd: Option<PathBuf>,
         process_cwd: PathBuf,
         workspace_index: WorkspaceIndex,
+        project_channels: ProjectChannelResolver,
     ) -> Self {
         Self {
             pinned_cwd,
             process_cwd,
             workspace_index,
+            project_channels,
+            refusal_notices: Mutex::new(HashMap::new()),
+            refusal_notice_window: REFUSAL_NOTICE_WINDOW,
+            clock: Arc::new(Instant::now),
         }
     }
 
-    /// Resolve a channel using the locked Phase 2 precedence.
-    pub fn resolve_channel(&self, channel_id: Uuid) -> SessionCwdDecision {
+    /// Resolve a channel using the complete pinned → workspace → relay-signal
+    /// precedence. Only an explicit RootMode decision may use `process_cwd`.
+    pub(crate) async fn resolve_channel(
+        &self,
+        channel_id: Uuid,
+        channel_type: ChannelTypeSignal,
+    ) -> SessionCwdDecision {
         if let Some(path) = &self.pinned_cwd {
             return SessionCwdDecision::Pinned(path.clone());
         }
 
-        match self.workspace_index.lookup(channel_id) {
-            Some(path) => SessionCwdDecision::Workspace(path),
-            None => SessionCwdDecision::Refused(format!(
-                "channel {channel_id} is not declared by any indexed workspace; refusing to open \
-                 an ACP session instead of silently using the harness process directory"
-            )),
+        if let Some(path) = self.workspace_index.lookup(channel_id) {
+            self.reset_refusal_notice(channel_id);
+            return SessionCwdDecision::Workspace(path);
         }
+
+        let project = self.project_channels.classify(channel_id).await;
+        if let ProjectChannelSignal::FailOpen(reason) = &project {
+            tracing::warn!(
+                target: "pool::session",
+                channel = %channel_id,
+                reason = %reason,
+                "project-channel signal unavailable; allowing RootMode (fail open)"
+            );
+        }
+
+        decide_unindexed_channel(
+            channel_id,
+            project,
+            channel_type,
+            &self.workspace_index.roots(),
+        )
+    }
+
+    /// Atomically claim this channel's notice slot for the current window.
+    pub fn should_post_refusal_notice(&self, channel_id: Uuid) -> bool {
+        let now = (self.clock)();
+        let mut notices = self
+            .refusal_notices
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if notices.get(&channel_id).is_some_and(|posted_at| {
+            now.saturating_duration_since(*posted_at) < self.refusal_notice_window
+        }) {
+            return false;
+        }
+        notices.insert(channel_id, now);
+        true
+    }
+
+    fn reset_refusal_notice(&self, channel_id: Uuid) {
+        self.refusal_notices
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&channel_id);
+    }
+
+    pub fn refusal_notice(&self, channel_id: Uuid) -> String {
+        let roots = crate::workspace_index::display_paths(&self.workspace_index.roots());
+        format!(
+            "Cannot start an ACP session for channel `{channel_id}` because it is not declared by \
+             any local workspace. Create `<repo>/.buzz/workspace.json` with \
+             `{{\"channels\":[\"{channel_id}\"]}}`. Scanned roots: {roots}."
+        )
     }
 
     /// Heartbeats are harness maintenance, not project work. They deliberately
@@ -625,6 +728,35 @@ impl SessionCwdResolver {
     /// index; therefore they cannot be refused for lacking a channel.
     pub fn heartbeat_cwd(&self) -> &Path {
         &self.process_cwd
+    }
+}
+
+fn decide_unindexed_channel(
+    channel_id: Uuid,
+    project: ProjectChannelSignal,
+    channel_type: ChannelTypeSignal,
+    roots: &[PathBuf],
+) -> SessionCwdDecision {
+    match project {
+        ProjectChannelSignal::FailOpen(_) => {
+            SessionCwdDecision::RootMode(RootModeReason::UndeterminedFailOpen)
+        }
+        ProjectChannelSignal::Project => SessionCwdDecision::Refused(format!(
+            "channel {channel_id} belongs to a Buzz project but is not declared by any indexed \
+             workspace (scanned roots: {}); refusing to use the harness process directory",
+            crate::workspace_index::display_paths(roots)
+        )),
+        ProjectChannelSignal::Indeterminate => SessionCwdDecision::Refused(format!(
+            "channel {channel_id} is not indexed and neither project status nor channel type was \
+             determined (scanned roots: {}); refusing to use the harness process directory",
+            crate::workspace_index::display_paths(roots)
+        )),
+        ProjectChannelSignal::NotProject => match channel_type {
+            ChannelTypeSignal::Dm => SessionCwdDecision::RootMode(RootModeReason::Dm),
+            ChannelTypeSignal::NonDm | ChannelTypeSignal::Undetermined => {
+                SessionCwdDecision::RootMode(RootModeReason::NotProject)
+            }
+        },
     }
 }
 
@@ -933,7 +1065,11 @@ async fn resolve_new_session_channel_context(
     let Some(info) = channel_info.resolve(channel_id).await else {
         return (true, None, None);
     };
-    let is_dm = info.channel_type == "dm";
+    // Reuse the author gate's canonical predicate after proving metadata
+    // exists. The proof is load-bearing: `is_dm_channel` intentionally maps an
+    // unknown type to DM for its fail-closed author gate, but unknown metadata
+    // must not grant RootMode in the cwd policy.
+    let is_dm = crate::is_dm_channel(channel_id, channel_info).await;
     let title_channel = (!is_dm && info.name != UNKNOWN_CHANNEL_NAME).then_some(info.name);
     (is_dm, title_channel, Some(info.channel_type))
 }
@@ -1667,7 +1803,18 @@ pub async fn run_prompt_task(
             if let Some(sid) = agent.state.sessions.get(cid) {
                 (sid.clone(), false)
             } else {
-                let session_cwd = match ctx.session_cwd.resolve_channel(*cid) {
+                let session_cwd = match ctx
+                    .session_cwd
+                    .resolve_channel(
+                        *cid,
+                        match origin_channel_type.as_deref() {
+                            Some("dm") => ChannelTypeSignal::Dm,
+                            Some(_) => ChannelTypeSignal::NonDm,
+                            None => ChannelTypeSignal::Undetermined,
+                        },
+                    )
+                    .await
+                {
                     SessionCwdDecision::Pinned(path) => {
                         tracing::info!(
                             target: "pool::session",
@@ -1688,13 +1835,17 @@ pub async fn run_prompt_task(
                         );
                         path
                     }
-                    SessionCwdDecision::RootMode => {
+                    SessionCwdDecision::RootMode(reason) => {
+                        // RootMode deliberately shares the heartbeat/process
+                        // cwd. Under Buzz Desktop that process cwd is the nest
+                        // (`~/.buzz`); it is never an implicit fallback.
                         let path = ctx.session_cwd.heartbeat_cwd().to_path_buf();
                         tracing::info!(
                             target: "pool::session",
                             channel = %cid,
                             cwd = %path.display(),
                             decision = "root_mode",
+                            reason = reason.as_log_value(),
                             "resolved channel session working directory"
                         );
                         path
@@ -1706,6 +1857,16 @@ pub async fn run_prompt_task(
                             reason = %reason,
                             "channel session working directory refused"
                         );
+                        if ctx.session_cwd.should_post_refusal_notice(*cid) {
+                            let thread_tags = batch
+                                .as_ref()
+                                .and_then(|batch| batch.events.last())
+                                .map(|event| crate::queue::parse_thread_tags(&event.event))
+                                .unwrap_or_default();
+                            let notice = ctx.session_cwd.refusal_notice(*cid);
+                            post_failure_notice(&ctx.rest_client, *cid, &thread_tags, &notice)
+                                .await;
+                        }
                         send_prompt_result(
                             &result_tx,
                             &turn_id,
@@ -4181,11 +4342,14 @@ mod tests {
             pinned_cwd,
             PathBuf::from("/tmp/harness-process"),
             WorkspaceIndex::from_test_channels(channels, |_| true),
+            ProjectChannelResolver::from_test_signals([ProjectChannelSignal::FailOpen(
+                "unused test transport".to_string(),
+            )]),
         )
     }
 
-    #[test]
-    fn session_cwd_pinned_override_wins_for_indexed_and_absent_channels() {
+    #[tokio::test]
+    async fn session_cwd_pinned_override_wins_for_indexed_absent_and_dm_channels() {
         let indexed = Uuid::new_v4();
         let absent = Uuid::new_v4();
         let pinned = PathBuf::from("/tmp/operator-pinned");
@@ -4195,32 +4359,128 @@ mod tests {
         );
 
         assert_eq!(
-            resolver.resolve_channel(indexed),
+            resolver
+                .resolve_channel(indexed, ChannelTypeSignal::NonDm)
+                .await,
             SessionCwdDecision::Pinned(pinned.clone())
         );
         assert_eq!(
-            resolver.resolve_channel(absent),
+            resolver
+                .resolve_channel(absent, ChannelTypeSignal::Dm)
+                .await,
             SessionCwdDecision::Pinned(pinned)
         );
     }
 
-    #[test]
-    fn session_cwd_without_pin_uses_workspace_or_refuses() {
+    #[tokio::test]
+    async fn indexed_workspace_wins_without_consulting_project_or_dm_signals() {
         let indexed = Uuid::new_v4();
-        let absent = Uuid::new_v4();
         let workspace = PathBuf::from("/tmp/indexed");
         let resolver =
             test_session_cwd_resolver(None, BTreeMap::from([(indexed, workspace.clone())]));
 
         assert_eq!(
-            resolver.resolve_channel(indexed),
+            resolver
+                .resolve_channel(indexed, ChannelTypeSignal::Dm)
+                .await,
             SessionCwdDecision::Workspace(workspace)
         );
+    }
+
+    #[test]
+    fn unindexed_project_channel_is_refused() {
+        let channel = Uuid::new_v4();
         assert!(matches!(
-            resolver.resolve_channel(absent),
+            decide_unindexed_channel(
+                channel,
+                ProjectChannelSignal::Project,
+                ChannelTypeSignal::Undetermined,
+                &[PathBuf::from("/repos")],
+            ),
             SessionCwdDecision::Refused(reason)
-                if reason.contains(&absent.to_string()) && reason.contains("refusing")
+                if reason.contains(&channel.to_string()) && reason.contains("/repos")
         ));
+    }
+
+    #[test]
+    fn dm_uses_root_mode_only_after_positive_identification() {
+        assert_eq!(
+            decide_unindexed_channel(
+                Uuid::new_v4(),
+                ProjectChannelSignal::NotProject,
+                ChannelTypeSignal::Dm,
+                &[],
+            ),
+            SessionCwdDecision::RootMode(RootModeReason::Dm)
+        );
+    }
+
+    #[test]
+    fn confirmed_non_project_channel_uses_root_mode() {
+        assert_eq!(
+            decide_unindexed_channel(
+                Uuid::new_v4(),
+                ProjectChannelSignal::NotProject,
+                ChannelTypeSignal::NonDm,
+                &[],
+            ),
+            SessionCwdDecision::RootMode(RootModeReason::NotProject)
+        );
+    }
+
+    #[test]
+    fn transport_error_uses_root_mode_and_never_refuses() {
+        assert_eq!(
+            decide_unindexed_channel(
+                Uuid::new_v4(),
+                ProjectChannelSignal::FailOpen("offline".to_string()),
+                ChannelTypeSignal::Undetermined,
+                &[],
+            ),
+            SessionCwdDecision::RootMode(RootModeReason::UndeterminedFailOpen)
+        );
+    }
+
+    #[test]
+    fn indeterminate_type_without_non_project_confirmation_is_refused() {
+        assert!(matches!(
+            decide_unindexed_channel(
+                Uuid::new_v4(),
+                ProjectChannelSignal::Indeterminate,
+                ChannelTypeSignal::Undetermined,
+                &[],
+            ),
+            SessionCwdDecision::Refused(_)
+        ));
+    }
+
+    #[test]
+    fn repeated_refusals_claim_one_notice_slot_per_channel() {
+        let channel = Uuid::new_v4();
+        let resolver = test_session_cwd_resolver(None, BTreeMap::new());
+        let claims = (0..8)
+            .filter(|_| resolver.should_post_refusal_notice(channel))
+            .count();
+        assert_eq!(claims, 1);
+    }
+
+    #[tokio::test]
+    async fn indexed_channel_resets_refusal_notice_state() {
+        let channel = Uuid::new_v4();
+        let resolver = test_session_cwd_resolver(
+            None,
+            BTreeMap::from([(channel, PathBuf::from("/tmp/indexed"))]),
+        );
+        assert!(resolver.should_post_refusal_notice(channel));
+        assert!(!resolver.should_post_refusal_notice(channel));
+
+        assert!(matches!(
+            resolver
+                .resolve_channel(channel, ChannelTypeSignal::NonDm)
+                .await,
+            SessionCwdDecision::Workspace(_)
+        ));
+        assert!(resolver.should_post_refusal_notice(channel));
     }
 
     #[test]
@@ -4231,8 +4491,8 @@ mod tests {
         assert_eq!(resolver.heartbeat_cwd(), Path::new("/tmp/harness-process"));
     }
 
-    #[test]
-    fn rotated_session_re_resolves_and_refuses_a_removed_repository() {
+    #[tokio::test]
+    async fn rotated_session_re_resolves_and_never_reuses_a_removed_repository() {
         let channel = Uuid::new_v4();
         let workspace = PathBuf::from("/tmp/workspace-removed-after-first-session");
         let directory_exists = Arc::new(AtomicBool::new(true));
@@ -4244,9 +4504,14 @@ mod tests {
                 BTreeMap::from([(channel, workspace.clone())]),
                 move |_| check_exists.load(Ordering::SeqCst),
             ),
+            ProjectChannelResolver::from_test_signals([ProjectChannelSignal::FailOpen(
+                "relay unavailable".to_string(),
+            )]),
         );
         assert_eq!(
-            resolver.resolve_channel(channel),
+            resolver
+                .resolve_channel(channel, ChannelTypeSignal::NonDm)
+                .await,
             SessionCwdDecision::Workspace(workspace)
         );
 
@@ -4256,10 +4521,12 @@ mod tests {
         state.invalidate(&PromptSource::Channel(channel));
         directory_exists.store(false, Ordering::SeqCst);
 
-        assert!(matches!(
-            resolver.resolve_channel(channel),
-            SessionCwdDecision::Refused(_)
-        ));
+        assert_eq!(
+            resolver
+                .resolve_channel(channel, ChannelTypeSignal::NonDm)
+                .await,
+            SessionCwdDecision::RootMode(RootModeReason::UndeterminedFailOpen)
+        );
     }
 
     fn test_mcp_server() -> McpServer {
@@ -6754,6 +7021,9 @@ mod tests {
                 Some(PathBuf::from("/tmp")),
                 PathBuf::from("/tmp"),
                 WorkspaceIndex::from_test_channels(BTreeMap::new(), |_| true),
+                ProjectChannelResolver::from_test_signals([ProjectChannelSignal::FailOpen(
+                    "unused test transport".to_string(),
+                )]),
             ),
             rest_client: RestClient {
                 http: reqwest::Client::new(),

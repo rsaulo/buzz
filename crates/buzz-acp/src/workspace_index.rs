@@ -236,7 +236,7 @@ struct Discovery {
     errors: Vec<WorkspaceIndexError>,
 }
 
-fn display_paths<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> String {
+pub(crate) fn display_paths<'a>(paths: impl IntoIterator<Item = &'a PathBuf>) -> String {
     let values = paths
         .into_iter()
         .map(|path| path.display().to_string())
@@ -602,6 +602,16 @@ impl WorkspaceIndex {
             .len()
     }
 
+    /// Canonical roots scanned by the most recent discovery. Used in the
+    /// actionable refusal notice when a channel has no local declaration.
+    pub(crate) fn roots(&self) -> Vec<PathBuf> {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .roots
+            .clone()
+    }
+
     fn rebuild(&self, action: &str) {
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         Self::rebuild_locked(&mut state, action);
@@ -876,7 +886,7 @@ mod tests {
         let rebuild_count = Arc::clone(&rebuilds);
         let queued_results = Arc::clone(&results);
 
-        let mut index = WorkspaceIndex::with_rebuilder(move || {
+        let index = WorkspaceIndex::with_rebuilder(move || {
             rebuild_count.fetch_add(1, Ordering::SeqCst);
             queued_results
                 .lock()
@@ -910,9 +920,11 @@ mod tests {
             move || {
                 let rebuild = rebuild_count.fetch_add(1, Ordering::SeqCst);
                 Discovery {
-                    channels: (rebuild >= 2)
-                        .then(|| BTreeMap::from([(channel, expected.clone())]))
-                        .unwrap_or_default(),
+                    channels: if rebuild >= 2 {
+                        BTreeMap::from([(channel, expected.clone())])
+                    } else {
+                        BTreeMap::default()
+                    },
                     roots: vec![PathBuf::from("/tmp")],
                     errors: Vec::new(),
                 }
