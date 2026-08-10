@@ -113,23 +113,58 @@ All configuration is via environment variables (or CLI flags — every env var h
 | `BUZZ_ACP_MCP_COMMAND` | no | `""` (empty) | Path to an optional MCP server binary to provide to the agent subprocess. |
 | `BUZZ_ACP_IDLE_TIMEOUT` | no | `620` | Idle timeout: max seconds of silence before cancelling a turn. Resets on any agent stdout activity. |
 | `BUZZ_ACP_MAX_TURN_DURATION` | no | `7200` | Absolute wall-clock cap per turn (safety valve). |
-| `BUZZ_ACP_CLAUDE_ISOLATE_USER_CONFIG` | no | `true` | For Claude ACP sessions, pass `settingSources: ["project","local"]` so personal user-scoped settings, hooks, and MCP servers are excluded. Set to `false` to restore the adapter's user-inclusive session default. |
 | `BUZZ_API_TOKEN` | no | — | API token (required if relay enforces token auth). |
-| `AGENT_CWD` | no | process working directory | Absolute path passed as `NewSessionRequest.cwd`. This is the directory the agent runtime resolves `AGENTS.md`/`CLAUDE.md`, skills, hooks and settings from, so pinning it is how one supervised runtime serves a workspace other than the directory it was launched from. Must be an existing absolute directory; buzz-acp refuses to start otherwise. |
 
 **Note:** `BUZZ_ACP_AGENT_ARGS` splits on commas. For args with values, use: `-c,key="value"`.
 
-**Note:** `AGENT_CWD` sets the *session* working directory delivered over ACP; it does not change the working directory of the buzz-acp process or of the agent subprocess. One buzz-acp process still serves all its channels from a single workspace — see [#3822](https://github.com/block/buzz/issues/3822) for the channel-scoped follow-up.
-
-**Claude user-config isolation:** Claude harnesses also default
-`CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` and
-`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` in the child environment. Together with the
-session-level `BUZZ_ACP_CLAUDE_ISOLATE_USER_CONFIG=true` default, this keeps the
-Desktop owner's personal instructions, auto-memory, hooks, and user MCP servers
-out of Buzz-managed agents without changing any files in `~/.claude`. Project
-and local settings remain available through the session's `AGENT_CWD`.
-
 **Legacy env vars:** `BUZZ_ACP_PRIVATE_KEY`, `BUZZ_ACP_API_TOKEN`, and `BUZZ_ACP_TURN_TIMEOUT` (replaced by `BUZZ_ACP_IDLE_TIMEOUT`) are still accepted as fallbacks.
+
+### Fork: workspace routing and managed-agent isolation
+
+This fork resolves the ACP `NewSessionRequest.cwd` per channel and keeps the
+managed subprocess environment separate from the Desktop owner's personal
+agent configuration.
+
+| Option or contract | Default | Behavior |
+|--------------------|---------|----------|
+| `AGENT_CWD` | unset | Pins every channel session to one existing absolute directory. It has precedence over the workspace index and does not change the cwd of the `buzz-acp` process or agent subprocess. An invalid non-empty value stops startup instead of falling back. |
+| `<repo>/.buzz/workspace.json` | absent | Declares which Buzz channel UUIDs belong to that local repository. The repository directory becomes `NewSessionRequest.cwd` for those channels. |
+| `BUZZ_ACP_REPOS_ROOTS` | `$HOME/.buzz/REPOS` | Colon-separated absolute roots whose direct repository children are scanned for workspace declarations. Invalid declarations and channel conflicts are rejected and logged rather than selected by scan order. |
+| `--unindexed-channel-policy` / `BUZZ_ACP_UNINDEXED_CHANNEL_POLICY` | `refuse` | Policy for a known non-DM channel absent from the index: `refuse` or `root`. `root` is an explicit opt-in to use the harness process cwd. |
+| `--claude-isolate-user-config` / `BUZZ_ACP_CLAUDE_ISOLATE_USER_CONFIG` | `true` | For Claude ACP sessions, sends `settingSources: ["project","local"]`, excluding user-scoped settings, hooks, MCP servers, and personal instructions. Set to `false` to restore the adapter's user-inclusive default. |
+| `BUZZ_LOCAL_AGENT` (child env) | `1` | Marks every spawned ACP runtime as a Buzz-managed agent. Repository hooks and plugins should use this signal to distinguish a Buzz agent session from the human's terminal session in the same repository. The harness only supplies the default when the inherited environment has not already defined it, so an operator can override it. |
+| `HINDSIGHT_BANK_ID`, `HINDSIGHT_DYNAMIC_BANK_ID` (child env) | removed | Both selectors are removed after inherited, runtime-default, and persona env layers are merged. Repository-local Hindsight configuration therefore owns project bank selection and neither parent nor persona env can force one bank across workspaces. |
+
+Workspace declaration example:
+
+```json
+{
+  "channels": [
+    "3580ca9b-47b4-4af9-b22a-1068778f26c6",
+    "b99a4669-0687-4a73-856a-9df80e536796"
+  ]
+}
+```
+
+The cwd decision is deterministic and follows this order:
+
+| Situation | Decision |
+|-----------|----------|
+| `AGENT_CWD` is set | `Pinned` — use `AGENT_CWD`. |
+| Channel is declared by an indexed repository | `Workspace` — use that repository. |
+| Channel is a DM | `RootMode` — use the harness process cwd. |
+| Known non-DM channel is not indexed and policy is `refuse` | `Refused` (default). |
+| Known non-DM channel is not indexed and policy is `root` | `RootMode` — use the harness process cwd. |
+| Channel type is indeterminate and channel is not indexed | `Refused`, regardless of the knob. |
+
+The relay's kind `30621` project signal is diagnostic only. It is queried
+after an unindexed channel has already been refused, to enrich the refusal log
+and notice with a project name or `d` tag when available. A failed, empty, or
+timed-out query cannot change the decision and is never on a session-creation
+path. Claude subprocesses also default
+`CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` and
+`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`; project and local settings remain available
+through the resolved session cwd without modifying `~/.claude`.
 
 ### Parallel Agents & Heartbeat
 
