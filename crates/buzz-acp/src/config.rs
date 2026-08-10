@@ -134,6 +134,15 @@ pub enum DedupMode {
     Queue,
 }
 
+/// Policy for non-DM channels that are absent from the local workspace index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum UnindexedChannelPolicy {
+    /// Refuse to create a session outside a declared workspace.
+    Refuse,
+    /// Explicitly allow the harness process directory as the session cwd.
+    Root,
+}
+
 /// How to handle new @mentions while a turn is already in-flight for that channel.
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
 pub enum MultipleEventHandling {
@@ -513,6 +522,16 @@ pub struct CliArgs {
     )]
     pub claude_isolate_user_config: bool,
 
+    /// Policy for non-DM channels not declared by a local workspace index.
+    /// Channels whose type cannot be determined are always refused.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_UNINDEXED_CHANNEL_POLICY",
+        default_value = "refuse",
+        value_enum
+    )]
+    pub unindexed_channel_policy: UnindexedChannelPolicy,
+
     /// Permission mode for agents that support `session/set_config_option`
     /// with `configId: "mode"` (e.g. `claude-agent-acp`).
     ///
@@ -623,6 +642,8 @@ pub struct Config {
     /// Whether Claude ACP sessions exclude user-scoped settings, hooks, MCP
     /// servers, and personal instructions. Enabled by default.
     pub claude_isolate_user_config: bool,
+    /// Policy for non-DM channels absent from the local workspace index.
+    pub unindexed_channel_policy: UnindexedChannelPolicy,
     /// Permission mode to apply after session creation. `Default` = skip.
     pub permission_mode: PermissionMode,
     /// Inbound author gate mode.
@@ -1194,6 +1215,7 @@ impl Config {
                 .as_deref()
                 .and_then(sanitize_session_title),
             claude_isolate_user_config: args.claude_isolate_user_config,
+            unindexed_channel_policy: args.unindexed_channel_policy,
             permission_mode: args.permission_mode,
             respond_to: args.respond_to,
             respond_to_allowlist,
@@ -1227,7 +1249,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} claude_isolate_user_config={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} claude_isolate_user_config={} unindexed_channel_policy={:?} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1248,6 +1270,7 @@ impl Config {
             self.memory_enabled,
             self.model.as_deref().unwrap_or("(agent default)"),
             self.claude_isolate_user_config,
+            self.unindexed_channel_policy,
             self.permission_mode,
             respond_to_detail,
             allowed_respond_to_detail,
@@ -1567,6 +1590,7 @@ mod tests {
             model: None,
             session_title: None,
             claude_isolate_user_config: true,
+            unindexed_channel_policy: UnindexedChannelPolicy::Refuse,
             permission_mode: PermissionMode::BypassPermissions,
             respond_to: RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
@@ -2335,6 +2359,26 @@ channels = "ALL"
                 "--claude-isolate-user-config=false",
             ])
             .claude_isolate_user_config
+        );
+    }
+
+    #[test]
+    fn unindexed_channel_policy_defaults_to_refuse_and_accepts_root_opt_in() {
+        let key = "0".repeat(64);
+        assert_eq!(
+            CliArgs::parse_from(["buzz-acp", "--private-key", &key]).unindexed_channel_policy,
+            UnindexedChannelPolicy::Refuse
+        );
+        assert_eq!(
+            CliArgs::parse_from([
+                "buzz-acp",
+                "--private-key",
+                &key,
+                "--unindexed-channel-policy",
+                "root",
+            ])
+            .unindexed_channel_policy,
+            UnindexedChannelPolicy::Root
         );
     }
 

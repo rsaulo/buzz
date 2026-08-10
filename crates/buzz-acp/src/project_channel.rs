@@ -6,7 +6,7 @@
 //! private protocol extension. Projects are intentionally few, so we query the
 //! live kind:30621 heads and scan their `buzz-channel` tags client-side.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,23 +21,15 @@ use uuid::Uuid;
 
 use crate::relay::RestClient;
 
-/// A minute keeps the relay off the per-turn path while bounding the interval
-/// in which a newly-created project could still be treated as ad-hoc.
+/// A minute avoids repeating a best-effort diagnostic query for every refusal.
 pub(crate) const PROJECT_CHANNEL_CACHE_TTL: Duration = Duration::from_secs(60);
 
-/// Session policy input derived from the project query.
+/// Best-effort diagnostic context for an already-refused channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum ProjectChannelSignal {
-    Project,
+pub(crate) enum ProjectChannelDiagnostic {
+    Project { label: String },
     NotProject,
-    /// No positive project/non-project fact is available, but this is not a
-    /// transport failure eligible for fail-open behavior.
-    #[allow(dead_code)]
-    // Production transport returns a fact or FailOpen; policy tests inject this.
-    Indeterminate,
-    /// Transport, timeout, and malformed-response failures are deliberately
-    /// distinct from confirmed absence so callers can fail open.
-    FailOpen(String),
+    Unavailable(String),
 }
 
 type QueryFuture<'a> = Pin<Box<dyn Future<Output = Result<Value, String>> + Send + 'a>>;
@@ -68,7 +60,7 @@ impl ProjectQueryTransport for RestProjectQuery {
 #[derive(Debug, Clone)]
 struct CachedProjectQuery {
     cached_at: Instant,
-    result: Result<HashSet<Uuid>, String>,
+    result: Result<HashMap<Uuid, String>, String>,
 }
 
 /// Query-level TTL cache around the relay project signal.
@@ -119,14 +111,14 @@ impl ProjectChannelResolver {
         }
     }
 
-    pub(crate) async fn classify(&self, channel_id: Uuid) -> ProjectChannelSignal {
+    pub(crate) async fn diagnose(&self, channel_id: Uuid) -> ProjectChannelDiagnostic {
         let now = (self.clock)();
         let mut cache = self.cache.lock().await;
         if let Some(cached) = cache
             .as_ref()
             .filter(|cached| now.saturating_duration_since(cached.cached_at) < self.ttl)
         {
-            return signal_for_channel(&cached.result, channel_id);
+            return diagnostic_for_channel(&cached.result, channel_id);
         }
 
         let result = match tokio::time::timeout(self.timeout, self.transport.fetch_projects()).await
@@ -139,54 +131,27 @@ impl ProjectChannelResolver {
             )),
         };
 
-        let signal = signal_for_channel(&result, channel_id);
+        let diagnostic = diagnostic_for_channel(&result, channel_id);
         *cache = Some(CachedProjectQuery {
             cached_at: (self.clock)(),
             result,
         });
-        signal
+        diagnostic
     }
 
     #[cfg(test)]
-    pub(crate) fn from_test_signals(
-        signals: impl IntoIterator<Item = ProjectChannelSignal>,
-    ) -> Self {
-        struct SignalTransport {
-            signals: Mutex<std::collections::VecDeque<ProjectChannelSignal>>,
-        }
+    pub(crate) fn unavailable_for_tests(reason: &str) -> Self {
+        struct UnavailableTransport(String);
 
-        impl ProjectQueryTransport for SignalTransport {
+        impl ProjectQueryTransport for UnavailableTransport {
             fn fetch_projects(&self) -> QueryFuture<'_> {
-                let signal = self
-                    .signals
-                    .lock()
-                    .unwrap()
-                    .pop_front()
-                    .expect("test project signal");
-                Box::pin(async move {
-                    match signal {
-                        ProjectChannelSignal::Project => {
-                            Err("direct project signal requires policy injection".to_string())
-                        }
-                        ProjectChannelSignal::NotProject => Ok(serde_json::json!([])),
-                        ProjectChannelSignal::Indeterminate => {
-                            Err("direct indeterminate signal requires policy injection".to_string())
-                        }
-                        ProjectChannelSignal::FailOpen(reason) => Err(reason),
-                    }
-                })
+                let reason = self.0.clone();
+                Box::pin(async move { Err(reason) })
             }
         }
 
-        let signals = signals
-            .into_iter()
-            .collect::<std::collections::VecDeque<_>>();
-        // This helper is used only where NotProject/FailOpen must travel through
-        // the real cache. Project decisions use the pure policy seam in pool.rs.
         Self::with_components(
-            Arc::new(SignalTransport {
-                signals: Mutex::new(signals),
-            }),
+            Arc::new(UnavailableTransport(reason.to_string())),
             PROJECT_CHANNEL_CACHE_TTL,
             Duration::from_secs(1),
             Instant::now,
@@ -194,25 +159,29 @@ impl ProjectChannelResolver {
     }
 }
 
-fn signal_for_channel(
-    result: &Result<HashSet<Uuid>, String>,
+fn diagnostic_for_channel(
+    result: &Result<HashMap<Uuid, String>, String>,
     channel_id: Uuid,
-) -> ProjectChannelSignal {
+) -> ProjectChannelDiagnostic {
     match result {
-        Ok(channels) if channels.contains(&channel_id) => ProjectChannelSignal::Project,
-        Ok(_) => ProjectChannelSignal::NotProject,
-        Err(reason) => ProjectChannelSignal::FailOpen(reason.clone()),
+        Ok(channels) => channels
+            .get(&channel_id)
+            .map(|label| ProjectChannelDiagnostic::Project {
+                label: label.clone(),
+            })
+            .unwrap_or(ProjectChannelDiagnostic::NotProject),
+        Err(reason) => ProjectChannelDiagnostic::Unavailable(reason.clone()),
     }
 }
 
 /// Decode a successful relay response into the complete project-channel set.
 /// Any malformed event makes the whole answer indeterminate: malformed data
 /// must never be collapsed into a confident negative for any channel.
-fn project_channels_from_response(value: &Value) -> Result<HashSet<Uuid>, String> {
+fn project_channels_from_response(value: &Value) -> Result<HashMap<Uuid, String>, String> {
     let events = value
         .as_array()
         .ok_or_else(|| "project query returned a non-array response".to_string())?;
-    let mut project_channels = HashSet::new();
+    let mut project_channels = HashMap::new();
 
     for raw in events {
         let event: Event = serde_json::from_value(raw.clone())
@@ -243,17 +212,36 @@ fn project_channels_from_response(value: &Value) -> Result<HashSet<Uuid>, String
             .ok_or_else(|| "project event has a valueless buzz-channel tag".to_string())?;
         let project_channel = Uuid::parse_str(raw_channel)
             .map_err(|error| format!("project event has an invalid buzz-channel UUID: {error}"))?;
-        project_channels.insert(project_channel);
+        let name = singleton_tag_value(&event, "name")?;
+        let dtag = singleton_tag_value(&event, "d")?;
+        let label = name
+            .filter(|value| !value.trim().is_empty())
+            .or(dtag)
+            .unwrap_or_else(|| event.id.to_hex());
+        project_channels.insert(project_channel, label);
     }
 
     Ok(project_channels)
+}
+
+fn singleton_tag_value(event: &Event, tag_name: &str) -> Result<Option<String>, String> {
+    let mut tags = event
+        .tags
+        .iter()
+        .filter(|tag| tag.as_slice().first().map(String::as_str) == Some(tag_name));
+    let Some(first) = tags.next() else {
+        return Ok(None);
+    };
+    if tags.next().is_some() {
+        return Err(format!("project event has multiple {tag_name} tags"));
+    }
+    Ok(first.as_slice().get(1).cloned())
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use std::sync::Mutex;
 
     use nostr::{EventBuilder, Keys, Kind, Tag};
     use serde_json::json;
@@ -312,8 +300,10 @@ mod tests {
         );
 
         assert_eq!(
-            resolver.classify(channel).await,
-            ProjectChannelSignal::Project
+            resolver.diagnose(channel).await,
+            ProjectChannelDiagnostic::Project {
+                label: "project".to_string()
+            }
         );
     }
 
@@ -329,13 +319,13 @@ mod tests {
         );
 
         assert_eq!(
-            resolver.classify(channel).await,
-            ProjectChannelSignal::NotProject
+            resolver.diagnose(channel).await,
+            ProjectChannelDiagnostic::NotProject
         );
     }
 
     #[tokio::test]
-    async fn transport_error_is_fail_open_and_never_confirmed_absence() {
+    async fn transport_error_is_reported_as_unavailable() {
         let channel = Uuid::new_v4();
         let transport = Arc::new(StubTransport::new([Err("offline".to_string())]));
         let resolver = ProjectChannelResolver::with_components(
@@ -346,13 +336,13 @@ mod tests {
         );
 
         assert!(matches!(
-            resolver.classify(channel).await,
-            ProjectChannelSignal::FailOpen(reason) if reason == "offline"
+            resolver.diagnose(channel).await,
+            ProjectChannelDiagnostic::Unavailable(reason) if reason == "offline"
         ));
     }
 
     #[tokio::test]
-    async fn fail_open_is_cached_without_becoming_confirmed_absence() {
+    async fn unavailable_diagnostic_is_cached_without_becoming_confirmed_absence() {
         let transport = Arc::new(StubTransport::new([Err("offline".to_string())]));
         let resolver = ProjectChannelResolver::with_components(
             transport.clone(),
@@ -363,15 +353,15 @@ mod tests {
 
         for channel in [Uuid::new_v4(), Uuid::new_v4()] {
             assert!(matches!(
-                resolver.classify(channel).await,
-                ProjectChannelSignal::FailOpen(reason) if reason == "offline"
+                resolver.diagnose(channel).await,
+                ProjectChannelDiagnostic::Unavailable(reason) if reason == "offline"
             ));
         }
         assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
-    async fn malformed_response_is_fail_open() {
+    async fn malformed_response_makes_diagnostic_unavailable() {
         let channel = Uuid::new_v4();
         let transport = Arc::new(StubTransport::new([Ok(json!({"not": "events"}))]));
         let resolver = ProjectChannelResolver::with_components(
@@ -382,13 +372,13 @@ mod tests {
         );
 
         assert!(matches!(
-            resolver.classify(channel).await,
-            ProjectChannelSignal::FailOpen(reason) if reason.contains("non-array")
+            resolver.diagnose(channel).await,
+            ProjectChannelDiagnostic::Unavailable(reason) if reason.contains("non-array")
         ));
     }
 
     #[tokio::test(start_paused = true)]
-    async fn timeout_is_bounded_and_fail_open() {
+    async fn timeout_is_bounded_and_makes_diagnostic_unavailable() {
         struct PendingTransport;
         impl ProjectQueryTransport for PendingTransport {
             fn fetch_projects(&self) -> QueryFuture<'_> {
@@ -403,8 +393,8 @@ mod tests {
             Instant::now,
         );
         assert!(matches!(
-            resolver.classify(Uuid::new_v4()).await,
-            ProjectChannelSignal::FailOpen(reason) if reason.contains("timed out after 2000ms")
+            resolver.diagnose(Uuid::new_v4()).await,
+            ProjectChannelDiagnostic::Unavailable(reason) if reason.contains("timed out after 2000ms")
         ));
     }
 
@@ -421,12 +411,12 @@ mod tests {
         );
 
         assert_eq!(
-            resolver.classify(first_channel).await,
-            ProjectChannelSignal::NotProject
+            resolver.diagnose(first_channel).await,
+            ProjectChannelDiagnostic::NotProject
         );
         assert_eq!(
-            resolver.classify(second_channel).await,
-            ProjectChannelSignal::NotProject
+            resolver.diagnose(second_channel).await,
+            ProjectChannelDiagnostic::NotProject
         );
         assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
     }
@@ -452,13 +442,15 @@ mod tests {
         );
 
         assert_eq!(
-            resolver.classify(Uuid::new_v4()).await,
-            ProjectChannelSignal::NotProject
+            resolver.diagnose(Uuid::new_v4()).await,
+            ProjectChannelDiagnostic::NotProject
         );
         elapsed_secs.store(60, Ordering::SeqCst);
         assert_eq!(
-            resolver.classify(project_channel).await,
-            ProjectChannelSignal::Project
+            resolver.diagnose(project_channel).await,
+            ProjectChannelDiagnostic::Project {
+                label: "project".to_string()
+            }
         );
         assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
     }
@@ -490,12 +482,12 @@ mod tests {
         );
 
         let (first, second) = tokio::join!(
-            resolver.classify(Uuid::new_v4()),
-            resolver.classify(Uuid::new_v4())
+            resolver.diagnose(Uuid::new_v4()),
+            resolver.diagnose(Uuid::new_v4())
         );
 
-        assert_eq!(first, ProjectChannelSignal::NotProject);
-        assert_eq!(second, ProjectChannelSignal::NotProject);
+        assert_eq!(first, ProjectChannelDiagnostic::NotProject);
+        assert_eq!(second, ProjectChannelDiagnostic::NotProject);
         assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
     }
 }
