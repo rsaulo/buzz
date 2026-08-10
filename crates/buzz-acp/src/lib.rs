@@ -1140,7 +1140,7 @@ fn handle_cancel_turn_control(
         return;
     };
 
-    let fired = signal_in_flight_task(pool, channel_id, ControlSignal::Cancel);
+    let fired = signal_channel_turns(pool, channel_id, ControlSignal::Cancel) > 0;
     let status = if fired { "sent" } else { "no_active_turn" };
     if let Some(observer) = observer {
         observer.emit(
@@ -1201,11 +1201,12 @@ fn handle_switch_model_control(
         // Busy path: deliver over the oneshot. `false` means the oneshot was
         // already consumed this turn (a prior cancel/interrupt) — the turn is
         // already ending, so the switch cannot land on it.
-        if signal_in_flight_task(
+        if signal_channel_turns(
             pool,
             channel_id,
             ControlSignal::SwitchModel(model_id.to_string()),
-        ) {
+        ) > 0
+        {
             "sent"
         } else {
             "turn_ending"
@@ -1388,7 +1389,7 @@ struct RespawnResult {
 /// `EventQueue::withheld_native_steer`: `channel_id` is the routing key,
 /// `event_id` is the hex id of the single event the steer carried.
 struct SteerAckEvent {
-    channel_id: Uuid,
+    session_key: queue::SessionKey,
     event_id: String,
     /// `Ok` if the read loop sent any of the locked `SteerAck` variants.
     /// `Err` if the oneshot was dropped without a send — should not happen
@@ -2426,9 +2427,14 @@ async fn tokio_main() -> Result<()> {
                             if is_cancel {
                                 if let Some(owner) = owner_cache.get() {
                                     if buzz_event.event.pubkey.to_hex() == *owner {
+                                        // Cancels the conversation it was
+                                        // posted in, not the whole channel.
                                         let fired = signal_in_flight_task(
                                             &mut pool,
-                                            buzz_event.channel_id,
+                                            &session_key_for(
+                                                buzz_event.channel_id,
+                                                &buzz_event.event,
+                                            ),
                                             ControlSignal::Cancel,
                                         );
                                         if !fired {
@@ -2466,7 +2472,10 @@ async fn tokio_main() -> Result<()> {
                                     if buzz_event.event.pubkey.to_hex() == *owner {
                                         let fired = signal_in_flight_task(
                                             &mut pool,
-                                            buzz_event.channel_id,
+                                            &session_key_for(
+                                                buzz_event.channel_id,
+                                                &buzz_event.event,
+                                            ),
                                             ControlSignal::Rotate,
                                         );
                                         if fired {
@@ -2550,6 +2559,9 @@ async fn tokio_main() -> Result<()> {
                             // first. `nostr::Event::clone` is cheap (Arc-
                             // backed payload) so the cost is negligible.
                             let event_for_steer = buzz_event.event.clone();
+                            // Captured before the event is moved into the steer.
+                            let steer_session_key =
+                                session_key_for(buzz_event.channel_id, &buzz_event.event);
                             let prompt_tag_for_steer = prompt_tag.clone();
                             let accepted = queue.push(QueuedEvent {
                                 channel_id: buzz_event.channel_id,
@@ -2599,7 +2611,7 @@ async fn tokio_main() -> Result<()> {
                                         && try_native_steer(
                                             &mut pool,
                                             &mut queue,
-                                            buzz_event.channel_id,
+                                            &steer_session_key,
                                             event_for_steer,
                                             prompt_tag_for_steer,
                                             &steer_ack_tx,
@@ -2607,7 +2619,7 @@ async fn tokio_main() -> Result<()> {
                                     if !native_attempted {
                                         signal_in_flight_task(
                                             &mut pool,
-                                            buzz_event.channel_id,
+                                            &steer_session_key,
                                             signal,
                                         );
                                     }
@@ -2796,7 +2808,7 @@ async fn tokio_main() -> Result<()> {
                 }
             }
             Some(PoolEvent::SteerAck(SteerAckEvent {
-                channel_id,
+                session_key,
                 event_id,
                 ack,
             })) => {
@@ -2901,7 +2913,7 @@ async fn tokio_main() -> Result<()> {
                     Err(_recv_err) => (true, false, false),
                 };
                 tracing::info!(
-                    channel = %channel_id,
+                    session = %session_key,
                     event_id = %event_id,
                     ?ack,
                     release_withheld,
@@ -2910,13 +2922,13 @@ async fn tokio_main() -> Result<()> {
                     "non-cancelling steer ack received"
                 );
                 if matches!(ack, Ok(pool::SteerAck::Success)) {
-                    queue.extend_in_flight_deadline(channel_id, config.max_turn_duration_secs);
+                    queue.extend_in_flight_deadline(&session_key, config.max_turn_duration_secs);
                 }
                 if drop_withheld {
-                    queue.remove_event(channel_id, &event_id);
+                    queue.remove_event(&session_key, &event_id);
                 }
                 if release_withheld {
-                    queue.release_native_steer(channel_id, &event_id);
+                    queue.release_native_steer(&session_key, &event_id);
                 }
                 if signal_fallback {
                     // Universal cancel+merge fallback. Note: the
@@ -2924,7 +2936,7 @@ async fn tokio_main() -> Result<()> {
                     // front of `queues[channel_id]`, so the cancel
                     // will pick it up as part of the merged batch and
                     // re-prompt the agent.
-                    signal_in_flight_task(&mut pool, channel_id, ControlSignal::Steer);
+                    signal_in_flight_task(&mut pool, &session_key, ControlSignal::Steer);
                 }
                 // After releasing a withheld event, give dispatch a chance
                 // to re-flush. If the prompt is still in flight, the
@@ -3162,19 +3174,50 @@ fn mode_gate_signal(
 
 /// Send a control signal to the in-flight task for `channel_id`.
 /// Returns `true` if a signal was sent, `false` if no in-flight task was found.
-fn signal_in_flight_task(
+/// The conversation an incoming event belongs to.
+fn session_key_for(channel_id: uuid::Uuid, event: &nostr::Event) -> queue::SessionKey {
+    match queue::event_thread_root(event) {
+        Some(root) => queue::SessionKey::thread(channel_id, root),
+        None => queue::SessionKey::ambient(channel_id),
+    }
+}
+
+/// Signal **every** in-flight turn of a channel, returning how many were hit.
+///
+/// For callers that only know a channel and mean all of it: the observer's
+/// out-of-band control frames and model switches. An event-driven signal should
+/// use [`signal_in_flight_task`] with the event's own conversation instead.
+fn signal_channel_turns(
     pool: &mut AgentPool,
     channel_id: uuid::Uuid,
     mode: ControlSignal,
+) -> usize {
+    let keys: Vec<queue::SessionKey> = pool
+        .task_map_mut()
+        .values()
+        .filter(|m| m.channel_id == Some(channel_id))
+        .filter_map(|m| m.session_key.clone())
+        .collect();
+    keys.iter()
+        .filter(|key| signal_in_flight_task(pool, key, mode.clone()))
+        .count()
+}
+
+fn signal_in_flight_task(
+    pool: &mut AgentPool,
+    key: &queue::SessionKey,
+    mode: ControlSignal,
 ) -> bool {
+    // Routed by conversation: a channel can now hold several in-flight turns,
+    // and a signal aimed at one thread must not cancel another's work.
     let entry = pool
         .task_map_mut()
         .values_mut()
-        .find(|m| m.channel_id == Some(channel_id));
+        .find(|m| m.session_key.as_ref() == Some(key));
 
     if let Some(meta) = entry {
         if let Some(tx) = meta.control_tx.take() {
-            tracing::info!(channel = %channel_id, ?mode, "control signal sent to in-flight task");
+            tracing::info!(session = %key, ?mode, "control signal sent to in-flight task");
             let _ = tx.send(mode);
             return true;
         }
@@ -3209,11 +3252,12 @@ fn signal_in_flight_task(
 fn try_native_steer(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
-    channel_id: uuid::Uuid,
+    session_key: &queue::SessionKey,
     event: nostr::Event,
     prompt_tag: String,
     steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
 ) -> bool {
+    let channel_id = session_key.channel_id;
     // Build the steer body: framing strings come from
     // `queue::native_steer_framing()` (Eva's drift-proof requirement —
     // native and cancel+merge fallback share these so the agent gets the
@@ -3243,14 +3287,14 @@ fn try_native_steer(
         ack_tx,
     };
 
-    match pool.send_steer(channel_id, request) {
+    match pool.send_steer(session_key, request) {
         Ok(()) => {
             // Withhold the queued event synchronously BEFORE spawning
             // the watcher: this closes the race where `mark_complete`
             // clears `in_flight_channels` and a stray `flush_next` could
             // re-deliver the event via normal dispatch. See
             // `EventQueue::mark_native_steer_pending` docs at queue.rs:606.
-            let withheld = queue.mark_native_steer_pending(channel_id, &event_id_hex);
+            let withheld = queue.mark_native_steer_pending(session_key, &event_id_hex);
             if !withheld {
                 // Race: the event was already drained out of the queue
                 // before we got here (e.g. a concurrent flush picked it
@@ -3268,10 +3312,11 @@ fn try_native_steer(
             }
             let ack_tx_clone = steer_ack_tx.clone();
             let event_id_for_watcher = event_id_hex.clone();
+            let key_for_watcher = session_key.clone();
             tokio::spawn(async move {
                 let ack = ack_rx.await;
                 let _ = ack_tx_clone.send(SteerAckEvent {
-                    channel_id,
+                    session_key: key_for_watcher,
                     event_id: event_id_for_watcher,
                     ack,
                 });
@@ -3317,10 +3362,10 @@ fn dispatch_pending(
         let mut agent = match pool.try_claim(Some(&session_key)) {
             Some(a) => a,
             None => {
-                let pending = queue.pending_channels();
-                tracing::debug!(pending_channels = pending, "pool_exhausted");
+                let pending = queue.pending_conversations();
+                tracing::debug!(pending_conversations = pending, "pool_exhausted");
                 queue.requeue_preserve_timestamps(batch);
-                queue.mark_complete(channel_id);
+                queue.mark_complete(&session_key);
                 break;
             }
         };
@@ -3372,6 +3417,7 @@ fn dispatch_pending(
             pool::TaskMeta {
                 agent_index,
                 channel_id: Some(channel_id),
+                session_key: Some(session_key.clone()),
                 turn_id,
                 recoverable_batch,
                 control_tx: Some(control_tx),
@@ -3383,7 +3429,7 @@ fn dispatch_pending(
     }
     tracing::debug!(
         dispatched = dispatched_channels.len(),
-        queue_depth = queue.pending_channels(),
+        queue_depth = queue.pending_conversations(),
         "dispatch_pending"
     );
     dispatched_channels
@@ -3579,9 +3625,7 @@ fn handle_prompt_result(
     }
 
     match &result.source {
-        // The queue still enforces one in-flight turn per channel; only the
-        // session is per thread (per-thread dispatch is the next phase).
-        PromptSource::Channel(key) => queue.mark_complete(key.channel_id),
+        PromptSource::Channel(key) => queue.mark_complete(key),
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
     }
 
@@ -3849,10 +3893,14 @@ fn recover_panicked_agent(
         }
     }
 
-    if let Some(ch) = meta.channel_id {
-        queue.mark_complete(ch);
-        typing_channels.remove(&ch);
-        tracing::warn!("cleared wedged in-flight channel {ch} from panicked agent {i}");
+    if let (Some(ch), Some(key)) = (meta.channel_id, meta.session_key.as_ref()) {
+        queue.mark_complete(key);
+        // Typing is channel-level; clear it only when nothing else in the
+        // channel is still running.
+        if !queue.is_channel_in_flight(ch) {
+            typing_channels.remove(&ch);
+        }
+        tracing::warn!("cleared wedged in-flight conversation {key} from panicked agent {i}");
     } else {
         *heartbeat_in_flight = false;
         tracing::warn!("cleared wedged heartbeat_in_flight from panicked agent {i}");
@@ -3990,6 +4038,7 @@ fn dispatch_heartbeat(
         pool::TaskMeta {
             agent_index,
             channel_id: None,
+            session_key: None,
             turn_id,
             recoverable_batch: None,
             control_tx: None,
@@ -4808,6 +4857,7 @@ mod owner_control_command_tests {
             pool::TaskMeta {
                 agent_index: 0,
                 channel_id: Some(channel_id),
+                session_key: Some(crate::queue::SessionKey::ambient(channel_id)),
                 turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
@@ -4817,18 +4867,18 @@ mod owner_control_command_tests {
 
         assert!(!signal_in_flight_task(
             &mut pool,
-            other_channel_id,
+            &crate::queue::SessionKey::ambient(other_channel_id),
             ControlSignal::Rotate
         ));
         assert!(signal_in_flight_task(
             &mut pool,
-            channel_id,
+            &crate::queue::SessionKey::ambient(channel_id),
             ControlSignal::Rotate
         ));
         assert_eq!(control_rx.await.unwrap(), ControlSignal::Rotate);
         assert!(!signal_in_flight_task(
             &mut pool,
-            channel_id,
+            &crate::queue::SessionKey::ambient(channel_id),
             ControlSignal::Rotate
         ));
     }
@@ -6609,6 +6659,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: None,
+                session_key: None,
                 turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -6685,6 +6736,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: Some(channel_id),
+                session_key: Some(crate::queue::SessionKey::ambient(channel_id)),
                 turn_id: "panic-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -6777,6 +6829,7 @@ mod error_outcome_emission_tests {
                 crate::pool::TaskMeta {
                     agent_index: 0,
                     channel_id: None,
+                    session_key: None,
                     turn_id: "test-turn-id".to_string(),
                     recoverable_batch: None,
                     control_tx: None,
@@ -6869,6 +6922,7 @@ mod error_outcome_emission_tests {
                 crate::pool::TaskMeta {
                     agent_index: 0,
                     channel_id: None,
+                    session_key: None,
                     turn_id: "test-turn-id".to_string(),
                     recoverable_batch: None,
                     control_tx: None,
@@ -6907,8 +6961,8 @@ mod error_outcome_emission_tests {
                 None,
             );
             (
-                queue.pending_channels(),
-                queue.queued_event_count(&channel_id),
+                queue.pending_conversations(),
+                queue.queued_event_count(&crate::queue::SessionKey::ambient(channel_id)),
             )
         };
 
@@ -6975,6 +7029,7 @@ mod error_outcome_emission_tests {
                 crate::pool::TaskMeta {
                     agent_index: 0,
                     channel_id: None,
+                    session_key: None,
                     turn_id: "test-turn-id".to_string(),
                     recoverable_batch: None,
                     control_tx: None,
@@ -7013,8 +7068,8 @@ mod error_outcome_emission_tests {
                 None,
             );
             (
-                queue.pending_channels(),
-                queue.queued_event_count(&channel_id),
+                queue.pending_conversations(),
+                queue.queued_event_count(&crate::queue::SessionKey::ambient(channel_id)),
             )
         };
 
@@ -7051,6 +7106,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: None,
+                session_key: None,
                 turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -7118,7 +7174,7 @@ mod error_outcome_emission_tests {
             ),
         );
         assert_eq!(
-            queue.pending_channels(),
+            queue.pending_conversations(),
             1,
             "batch must be requeued, not dead-lettered, while within the retry budget"
         );
@@ -7136,7 +7192,10 @@ mod error_outcome_emission_tests {
         // Simulate MAX_RETRIES prior failed attempts on this channel so the
         // upcoming requeue() call in handle_prompt_result crosses the
         // dead-letter threshold.
-        queue.set_retry_count_for_test(channel_id, crate::queue::MAX_RETRIES);
+        queue.set_retry_count_for_test(
+            &crate::queue::SessionKey::ambient(channel_id),
+            crate::queue::MAX_RETRIES,
+        );
 
         let agent = dummy_agent(0).await;
         let mut pool = AgentPool::from_slots(vec![None]);
@@ -7146,6 +7205,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: None,
+                session_key: None,
                 turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -7212,7 +7272,7 @@ mod error_outcome_emission_tests {
             ),
         );
         assert_eq!(
-            queue.queued_event_count(&channel_id),
+            queue.queued_event_count(&crate::queue::SessionKey::ambient(channel_id)),
             0,
             "batch with an exhausted retry budget must be dead-lettered, not requeued"
         );
@@ -7264,6 +7324,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: None,
+                session_key: None,
                 turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -7403,6 +7464,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: None,
+                session_key: None,
                 turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -7449,7 +7511,7 @@ mod error_outcome_emission_tests {
 
         // No batch to merge — the queue has nothing pending for any channel.
         assert_eq!(
-            queue.pending_channels(),
+            queue.pending_conversations(),
             0,
             "a dropped Stop batch must not leave anything queued"
         );
@@ -7592,6 +7654,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: None,
+                session_key: None,
                 turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -7632,12 +7695,12 @@ mod error_outcome_emission_tests {
 
         // The batch must not be requeued: pending_channels returns 0.
         assert_eq!(
-            queue.pending_channels(),
+            queue.pending_conversations(),
             0,
             "auth error must dead-letter immediately — batch must not be requeued"
         );
         assert_eq!(
-            queue.queued_event_count(&channel_id),
+            queue.queued_event_count(&crate::queue::SessionKey::ambient(channel_id)),
             0,
             "auth error must dead-letter immediately — no events should be pending"
         );
@@ -7678,6 +7741,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: None,
+                session_key: None,
                 turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -7718,12 +7782,12 @@ mod error_outcome_emission_tests {
 
         // Non-auth application error: batch IS requeued (first attempt, retry budget > 0).
         assert_eq!(
-            queue.pending_channels(),
+            queue.pending_conversations(),
             1,
             "non-auth application error must requeue the batch for retry"
         );
         assert_eq!(
-            queue.queued_event_count(&channel_id),
+            queue.queued_event_count(&crate::queue::SessionKey::ambient(channel_id)),
             1,
             "non-auth application error must preserve the event for retry"
         );

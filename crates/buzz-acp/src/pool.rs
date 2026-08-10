@@ -61,6 +61,12 @@ const RECENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(60);
 pub struct TaskMeta {
     pub agent_index: usize,
     pub channel_id: Option<Uuid>,
+    /// The conversation this turn belongs to.
+    ///
+    /// Control signals route by this, not by `channel_id`: with per-thread
+    /// concurrency a channel can have several turns in flight at once, and a
+    /// steer or cancel must reach the one whose conversation it was aimed at.
+    pub session_key: Option<SessionKey>,
     /// Identifies terminal events when the task panics before returning a result.
     pub turn_id: String,
     /// Clone of batch for Queue mode panic recovery.
@@ -1195,13 +1201,13 @@ impl AgentPool {
     /// event and let normal dispatch handle delivery.
     pub fn send_steer(
         &mut self,
-        channel_id: Uuid,
+        key: &SessionKey,
         request: SteerRequest,
     ) -> Result<(), SteerError> {
         let meta = self
             .task_map
             .values_mut()
-            .find(|m| m.channel_id == Some(channel_id))
+            .find(|m| m.session_key.as_ref() == Some(key))
             .ok_or(SteerError::PromptCompleted)?;
         let tx = meta
             .steer_tx
