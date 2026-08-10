@@ -11,8 +11,10 @@ mod queue;
 mod relay;
 mod setup_mode;
 mod usage;
+mod workspace_index;
 
 pub use usage::TurnUsage;
+pub use workspace_index::{WorkspaceIndex, WorkspaceIndexError};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -1575,6 +1577,11 @@ async fn tokio_main() -> Result<()> {
         tracing::info!("buzz-acp: setup payload present, entering setup-listener mode");
         return setup_mode::run_setup_listener(config, payload).await;
     }
+
+    // Phase 1 builds and reports the channel-to-checkout index at boot. The
+    // session pool deliberately does not consume it yet; per-channel cwd
+    // selection is wired in the next phase.
+    let _workspace_index = WorkspaceIndex::from_env();
 
     // Resolved after the setup branch on purpose: setup mode never opens a
     // session, so a workspace typo must not block an operator from fixing the
