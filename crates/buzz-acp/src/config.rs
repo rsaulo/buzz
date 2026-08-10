@@ -126,6 +126,8 @@ pub fn resolve_agent_cwd() -> Result<String, AgentCwdError> {
 
 const CLAUDE_UNRESOLVED_MODEL_MESSAGE: &str =
     "resolved BUZZ_AGENT_THINKING_EFFORT for Claude: model name does not identify a versioned Claude family, omitting thinking options; use a canonical model ID through Custom model... (for example, claude-opus-5[1m])";
+const LOCAL_CLAUDE_ALIAS_ASSUMPTION_MESSAGE: &str =
+    "resolved BUZZ_AGENT_THINKING_EFFORT for Claude via local fork assumption for unversioned model alias";
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
 pub enum SubscribeMode {
     Mentions,
@@ -854,7 +856,8 @@ pub(crate) fn claude_thinking_options(
     if matches!(effort, ThinkingEffort::None | ThinkingEffort::Minimal) {
         return None;
     }
-    match resolve_anthropic_thinking(model, effort)? {
+    let effective_model = local_unversioned_claude_alias_family(model).unwrap_or(model);
+    match resolve_anthropic_thinking(effective_model, effort)? {
         AnthropicThinking::Adaptive { effort } => Some(serde_json::json!({
             "effort": effort.as_str(),
             "thinking": { "type": "adaptive" }
@@ -862,6 +865,29 @@ pub(crate) fn claude_thinking_options(
         AnthropicThinking::ManualBudget { budget_tokens } => Some(serde_json::json!({
             "thinking": { "type": "enabled", "budgetTokens": budget_tokens }
         })),
+    }
+}
+
+/// Resolve unversioned Claude aliases according to this fork owner's runtime policy.
+///
+/// This is a local assumption, not a fact about the aliases. The upstream
+/// `feat/acp-thinking-effort` branch deliberately requires a versioned model ID.
+/// These concrete families will become stale when an alias moves (for example,
+/// `opus` starts selecting Opus 6), so they must be updated with the local model
+/// policy. We cannot safely represent "latest adaptive family" instead:
+/// `clamp_adaptive_effort` derives capabilities such as `xhigh` support from a
+/// concrete family ID.
+fn local_unversioned_claude_alias_family(model: &str) -> Option<&'static str> {
+    let alias = if model.ends_with(']') {
+        model.rfind('[').map_or(model, |index| &model[..index])
+    } else {
+        model
+    };
+    match alias {
+        "opus" => Some("claude-opus-5"),
+        "fable" => Some("claude-fable-5"),
+        "sonnet" => Some("claude-sonnet-5"),
+        _ => None,
     }
 }
 
@@ -886,12 +912,26 @@ fn resolve_thinking_effort(
                 )));
             }
             match model.and_then(|model| claude_thinking_options(model, effort)) {
-                Some(options) => tracing::info!(
-                    effort = effort.as_str(),
-                    model = model.unwrap_or_default(),
-                    options = %options,
-                    "resolved BUZZ_AGENT_THINKING_EFFORT for Claude via session/new _meta.claudeCode.options"
-                ),
+                Some(options) => {
+                    if let Some(assumed_family) =
+                        model.and_then(local_unversioned_claude_alias_family)
+                    {
+                        tracing::info!(
+                            effort = effort.as_str(),
+                            model = model.unwrap_or_default(),
+                            assumed_family,
+                            options = %options,
+                            "{LOCAL_CLAUDE_ALIAS_ASSUMPTION_MESSAGE}"
+                        );
+                    } else {
+                        tracing::info!(
+                            effort = effort.as_str(),
+                            model = model.unwrap_or_default(),
+                            options = %options,
+                            "resolved BUZZ_AGENT_THINKING_EFFORT for Claude via session/new _meta.claudeCode.options"
+                        );
+                    }
+                }
                 None => tracing::info!(
                     effort = effort.as_str(),
                     model = model.unwrap_or("<unset>"),
@@ -3441,18 +3481,25 @@ channels = "ALL"
     }
 
     #[test]
-    fn unresolved_claude_alias_omits_options_with_actionable_message() {
-        use buzz_core::reasoning::ThinkingEffort::Medium;
-        for alias in ["opus", "opus[1m]", "sonnet", "haiku"] {
-            assert_eq!(
-                claude_thinking_options(alias, Medium),
-                None,
-                "alias: {alias}"
-            );
+    fn local_claude_alias_policy_produces_named_adaptive_effort() {
+        use buzz_core::reasoning::ThinkingEffort::{High, Max, Medium, XHigh};
+        for alias in ["opus", "opus[1m]", "sonnet", "fable"] {
+            for effort in [Medium, High, XHigh, Max] {
+                let options = claude_thinking_options(alias, effort).unwrap();
+                assert_eq!(options["thinking"]["type"], "adaptive", "alias: {alias}");
+                assert_eq!(options["effort"], effort.as_str(), "alias: {alias}");
+            }
         }
+    }
+
+    #[test]
+    fn unresolved_haiku_alias_omits_options_with_actionable_message() {
+        use buzz_core::reasoning::ThinkingEffort::Medium;
+        assert_eq!(claude_thinking_options("haiku", Medium), None);
         assert!(CLAUDE_UNRESOLVED_MODEL_MESSAGE.contains("versioned Claude family"));
         assert!(CLAUDE_UNRESOLVED_MODEL_MESSAGE.contains("Custom model..."));
         assert!(CLAUDE_UNRESOLVED_MODEL_MESSAGE.contains("claude-opus-5[1m]"));
+        assert!(LOCAL_CLAUDE_ALIAS_ASSUMPTION_MESSAGE.contains("local fork assumption"));
     }
 
     #[test]
