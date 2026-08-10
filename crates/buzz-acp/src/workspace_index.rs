@@ -8,6 +8,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use thiserror::Error;
@@ -17,6 +19,14 @@ use uuid::Uuid;
 pub const REPOS_ROOTS_ENV: &str = "BUZZ_ACP_REPOS_ROOTS";
 
 const WORKSPACE_DECLARATION: &str = ".buzz/workspace.json";
+
+/// How long a channel known to be absent stays negatively cached.
+///
+/// Thirty seconds bounds filesystem discovery for undeclared channels (including
+/// the DM/root-mode cases introduced in the next phase) to two scans per minute
+/// per channel, while keeping the delay after adding a declaration short enough
+/// for an operator to retry without restarting the harness.
+pub const NEGATIVE_CACHE_WINDOW: Duration = Duration::from_secs(30);
 
 /// A rejected root, repository, declaration, channel entry, or conflict.
 ///
@@ -425,23 +435,37 @@ fn discover_with(source: &DiscoverySource, fs: &impl WorkspaceFilesystem) -> Dis
 }
 
 type Rebuilder = Box<dyn FnMut() -> Discovery + Send>;
+type Clock = Box<dyn Fn() -> Instant + Send + Sync>;
+type DirectoryCheck = Box<dyn Fn(&Path) -> bool + Send + Sync>;
+
+struct WorkspaceIndexState {
+    channels: BTreeMap<Uuid, PathBuf>,
+    roots: Vec<PathBuf>,
+    negative_cache: BTreeMap<Uuid, Instant>,
+    rebuild: Rebuilder,
+}
 
 /// Cached channel-to-repository index.
 ///
-/// The index is built at construction. A hit is served without filesystem IO;
-/// a miss performs exactly one full rebuild and checks the rebuilt map once.
+/// The index is built at construction. Lookups use interior mutability so one
+/// index can be shared by every harness task. A miss performs at most one full
+/// rebuild per channel per [`NEGATIVE_CACHE_WINDOW`]. Cached paths are checked
+/// before use so session rotation refuses a repository removed after startup.
 pub struct WorkspaceIndex {
-    channels: BTreeMap<Uuid, PathBuf>,
-    roots: Vec<PathBuf>,
-    rebuild: Rebuilder,
+    state: Mutex<WorkspaceIndexState>,
+    negative_cache_window: Duration,
+    clock: Clock,
+    is_directory: DirectoryCheck,
 }
 
 impl fmt::Debug for WorkspaceIndex {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
         formatter
             .debug_struct("WorkspaceIndex")
-            .field("channels", &self.channels)
-            .field("roots", &self.roots)
+            .field("channels", &state.channels)
+            .field("roots", &state.roots)
+            .field("negative_cache_window", &self.negative_cache_window)
             .finish_non_exhaustive()
     }
 }
@@ -450,65 +474,157 @@ impl WorkspaceIndex {
     /// Build an index from the real process environment and filesystem.
     pub fn from_env() -> Self {
         let source = DiscoverySource::from_process();
-        Self::with_rebuilder(move || discover_with(&source, &RealFilesystem))
+        Self::with_components(
+            move || discover_with(&source, &RealFilesystem),
+            NEGATIVE_CACHE_WINDOW,
+            Instant::now,
+            Path::is_dir,
+        )
     }
 
+    #[cfg(test)]
     fn with_rebuilder(rebuild: impl FnMut() -> Discovery + Send + 'static) -> Self {
-        let mut index = Self {
-            channels: BTreeMap::new(),
-            roots: Vec::new(),
-            rebuild: Box::new(rebuild),
+        Self::with_components(rebuild, NEGATIVE_CACHE_WINDOW, Instant::now, |_| true)
+    }
+
+    fn with_components(
+        rebuild: impl FnMut() -> Discovery + Send + 'static,
+        negative_cache_window: Duration,
+        clock: impl Fn() -> Instant + Send + Sync + 'static,
+        is_directory: impl Fn(&Path) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        let index = Self {
+            state: Mutex::new(WorkspaceIndexState {
+                channels: BTreeMap::new(),
+                roots: Vec::new(),
+                negative_cache: BTreeMap::new(),
+                rebuild: Box::new(rebuild),
+            }),
+            negative_cache_window,
+            clock: Box::new(clock),
+            is_directory: Box::new(is_directory),
         };
         index.rebuild("built");
         index
     }
 
+    #[cfg(test)]
+    pub(crate) fn from_test_channels(
+        channels: BTreeMap<Uuid, PathBuf>,
+        is_directory: impl Fn(&Path) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_components(
+            move || Discovery {
+                channels: channels.clone(),
+                roots: Vec::new(),
+                errors: Vec::new(),
+            },
+            NEGATIVE_CACHE_WINDOW,
+            Instant::now,
+            is_directory,
+        )
+    }
+
     /// Return the canonical repository path for `channel_id`.
     ///
-    /// On a cache miss, discovery is rerun exactly once before absence is
-    /// reported, allowing declarations created after process start to appear.
-    pub fn lookup(&mut self, channel_id: Uuid) -> Option<PathBuf> {
-        if let Some(path) = self.channels.get(&channel_id) {
-            return Some(path.clone());
+    /// On a cache miss, discovery is rerun once before absence is reported,
+    /// unless that channel was already absent within the negative-cache window.
+    pub fn lookup(&self, channel_id: Uuid) -> Option<PathBuf> {
+        let now = (self.clock)();
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+
+        if let Some(path) = state.channels.get(&channel_id) {
+            if (self.is_directory)(path) {
+                return Some(path.clone());
+            }
+            tracing::warn!(
+                channel = %channel_id,
+                repository = %path.display(),
+                "workspace index cached repository disappeared; rebuilding"
+            );
+        }
+
+        if state
+            .negative_cache
+            .get(&channel_id)
+            .is_some_and(|cached_at| {
+                now.saturating_duration_since(*cached_at) < self.negative_cache_window
+            })
+        {
+            tracing::debug!(
+                channel = %channel_id,
+                window_seconds = self.negative_cache_window.as_secs(),
+                "workspace index negative-cache hit"
+            );
+            return None;
         }
 
         tracing::info!(
             channel = %channel_id,
-            roots = %display_paths(&self.roots),
-            "workspace index cache miss; rebuilding once"
+            roots = %display_paths(&state.roots),
+            window_seconds = self.negative_cache_window.as_secs(),
+            "workspace index cache miss; rebuilding once per negative-cache window"
         );
-        self.rebuild("rebuilt after cache miss");
-        self.channels.get(&channel_id).cloned()
+        Self::rebuild_locked(&mut state, "rebuilt after cache miss");
+
+        let resolved = state
+            .channels
+            .get(&channel_id)
+            .filter(|path| (self.is_directory)(path))
+            .cloned();
+        if resolved.is_some() {
+            state.negative_cache.remove(&channel_id);
+        } else {
+            // Start the quiet window after discovery finishes, not before it;
+            // a slow scan must not consume its own negative-cache interval.
+            state.negative_cache.insert(channel_id, (self.clock)());
+        }
+        resolved
     }
 
     /// Number of channels currently mapped without conflicts.
     pub fn channel_count(&self) -> usize {
-        self.channels.len()
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .channels
+            .len()
     }
 
     /// Number of canonical repositories represented in the current index.
     pub fn repository_count(&self) -> usize {
-        self.channels.values().collect::<BTreeSet<_>>().len()
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .channels
+            .values()
+            .collect::<BTreeSet<_>>()
+            .len()
     }
 
-    fn rebuild(&mut self, action: &str) {
-        let discovery = (self.rebuild)();
+    fn rebuild(&self, action: &str) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        Self::rebuild_locked(&mut state, action);
+    }
+
+    fn rebuild_locked(state: &mut WorkspaceIndexState, action: &str) {
+        let discovery = (state.rebuild)();
         for error in &discovery.errors {
             error.log();
         }
-        self.channels = discovery.channels;
-        self.roots = discovery.roots;
+        state.channels = discovery.channels;
+        state.roots = discovery.roots;
 
-        let mappings = self
+        let mappings = state
             .channels
             .iter()
             .map(|(channel, path)| format!("{channel} → {}", path.display()))
             .collect::<Vec<_>>()
             .join(", ");
         tracing::info!(
-            repositories = self.repository_count(),
-            channels = self.channel_count(),
-            roots = %display_paths(&self.roots),
+            repositories = state.channels.values().collect::<BTreeSet<_>>().len(),
+            channels = state.channels.len(),
+            roots = %display_paths(&state.roots),
             mappings = %format!("[{mappings}]"),
             "workspace index {action}"
         );
@@ -778,6 +894,54 @@ mod tests {
             rebuilds.load(Ordering::SeqCst),
             2,
             "cache hit does not rebuild"
+        );
+    }
+
+    #[test]
+    fn negative_cache_rebuilds_absent_channel_at_most_once_per_window() {
+        let channel = Uuid::parse_str(CHANNEL_A).unwrap();
+        let expected = PathBuf::from("/tmp/repository-created-later");
+        let rebuilds = Arc::new(AtomicUsize::new(0));
+        let now = Arc::new(Mutex::new(Instant::now()));
+        let rebuild_count = Arc::clone(&rebuilds);
+        let test_now = Arc::clone(&now);
+
+        let index = WorkspaceIndex::with_components(
+            move || {
+                let rebuild = rebuild_count.fetch_add(1, Ordering::SeqCst);
+                Discovery {
+                    channels: (rebuild >= 2)
+                        .then(|| BTreeMap::from([(channel, expected.clone())]))
+                        .unwrap_or_default(),
+                    roots: vec![PathBuf::from("/tmp")],
+                    errors: Vec::new(),
+                }
+            },
+            NEGATIVE_CACHE_WINDOW,
+            move || *test_now.lock().expect("test clock lock"),
+            |_| true,
+        );
+        assert_eq!(rebuilds.load(Ordering::SeqCst), 1, "boot build");
+
+        assert_eq!(index.lookup(channel), None);
+        assert_eq!(rebuilds.load(Ordering::SeqCst), 2, "first miss rebuild");
+
+        assert_eq!(index.lookup(channel), None);
+        assert_eq!(
+            rebuilds.load(Ordering::SeqCst),
+            2,
+            "same-window miss is negatively cached"
+        );
+
+        *now.lock().expect("test clock lock") += NEGATIVE_CACHE_WINDOW;
+        assert_eq!(
+            index.lookup(channel),
+            Some(PathBuf::from("/tmp/repository-created-later"))
+        );
+        assert_eq!(
+            rebuilds.load(Ordering::SeqCst),
+            3,
+            "expired negative entry permits one new rebuild"
         );
     }
 }

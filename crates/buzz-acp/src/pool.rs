@@ -21,6 +21,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -41,6 +42,7 @@ use crate::queue::{
     PromptProfile, PromptProfileLookup, ThreadTags,
 };
 use crate::relay::{ChannelInfo, RestClient};
+use crate::workspace_index::WorkspaceIndex;
 
 /// Window within which agent activity before a hard-cap death qualifies
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
@@ -534,7 +536,9 @@ pub struct PromptContext {
     /// after validated file read in `Config::from_cli()`. The compiled-in default
     /// (`include_str!`) is inherently `'static`.
     pub base_prompt: Option<&'static str>,
-    pub cwd: String,
+    /// Per-session working-directory resolver. Channel sessions consult it only
+    /// when they are created; heartbeat sessions use its process cwd directly.
+    pub session_cwd: SessionCwdResolver,
     /// REST client for pre-prompt context fetches (thread/DM history).
     pub rest_client: RestClient,
     /// Shared channel metadata for startup-known and dynamically joined channels.
@@ -564,6 +568,64 @@ pub struct PromptContext {
     /// the desktop keys per (agent, relay) pair, e.g. `session_config_captured`,
     /// mirroring the `managed_agent_runtime_lifecycle` frames.
     pub relay_url: String,
+}
+
+/// Explicit channel-session cwd decision, in precedence order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionCwdDecision {
+    /// `AGENT_CWD` was explicitly set by the operator and overrides the index.
+    Pinned(PathBuf),
+    /// The channel is declared by a locally indexed repository.
+    Workspace(PathBuf),
+    /// Explicit non-project mode reserved for DM/ad-hoc channels in Phase 3.
+    #[allow(dead_code)]
+    RootMode,
+    /// No safe working directory was resolved, so session creation must stop.
+    Refused(String),
+}
+
+/// Thread-safe resolver shared by all prompt tasks in [`PromptContext`].
+#[derive(Debug)]
+pub struct SessionCwdResolver {
+    pinned_cwd: Option<PathBuf>,
+    process_cwd: PathBuf,
+    workspace_index: WorkspaceIndex,
+}
+
+impl SessionCwdResolver {
+    pub fn new(
+        pinned_cwd: Option<PathBuf>,
+        process_cwd: PathBuf,
+        workspace_index: WorkspaceIndex,
+    ) -> Self {
+        Self {
+            pinned_cwd,
+            process_cwd,
+            workspace_index,
+        }
+    }
+
+    /// Resolve a channel using the locked Phase 2 precedence.
+    pub fn resolve_channel(&self, channel_id: Uuid) -> SessionCwdDecision {
+        if let Some(path) = &self.pinned_cwd {
+            return SessionCwdDecision::Pinned(path.clone());
+        }
+
+        match self.workspace_index.lookup(channel_id) {
+            Some(path) => SessionCwdDecision::Workspace(path),
+            None => SessionCwdDecision::Refused(format!(
+                "channel {channel_id} is not declared by any indexed workspace; refusing to open \
+                 an ACP session instead of silently using the harness process directory"
+            )),
+        }
+    }
+
+    /// Heartbeats are harness maintenance, not project work. They deliberately
+    /// use the harness process cwd and never consult `AGENT_CWD` or the channel
+    /// index; therefore they cannot be refused for lacking a channel.
+    pub fn heartbeat_cwd(&self) -> &Path {
+        &self.process_cwd
+    }
 }
 
 impl AgentPool {
@@ -876,6 +938,14 @@ async fn resolve_new_session_channel_context(
     (is_dm, title_channel, Some(info.channel_type))
 }
 
+/// Cwd and channel metadata passed together at the session-creation boundary.
+struct NewSessionParameters<'a> {
+    cwd: &'a Path,
+    channel_name: Option<&'a str>,
+    channel_id: Option<Uuid>,
+    channel_type: Option<&'a str>,
+}
+
 /// Create a new ACP session via `session_new_full()`, populate model capabilities
 /// on the agent (first session only), and apply `desired_model` if set.
 ///
@@ -887,10 +957,9 @@ async fn create_session_and_apply_model(
     ctx: &PromptContext,
     agent_core: Option<&str>,
     agent_canvas: Option<&str>,
-    channel_name: Option<&str>,
-    channel_id: Option<Uuid>,
-    channel_type: Option<&str>,
+    parameters: NewSessionParameters<'_>,
 ) -> Result<String, AcpError> {
+    let session_cwd = parameters.cwd.to_string_lossy();
     // Build base_prompt + system_prompt + agent core + canvas metadata into a
     // single prompt. Standard protocol-v2 agents receive it in `session/new`;
     // Goose receives it through the custom request below. Legacy agents receive
@@ -901,7 +970,7 @@ async fn create_session_and_apply_model(
     let combined_system_prompt = with_canvas(
         with_core(
             with_team(
-                framed_system_prompt(&ctx.cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
+                framed_system_prompt(&session_cwd, ctx.base_prompt, ctx.system_prompt.as_deref()),
                 ctx.team_instructions.as_deref(),
             ),
             agent_core,
@@ -912,18 +981,18 @@ async fn create_session_and_apply_model(
     let session_title = ctx
         .session_title
         .as_deref()
-        .map(|agent_name| compose_session_title(agent_name, channel_name));
+        .map(|agent_name| compose_session_title(agent_name, parameters.channel_name));
     let mcp_servers = mcp_servers_with_git_origin(
         &ctx.mcp_servers,
-        channel_id,
-        channel_type,
+        parameters.channel_id,
+        parameters.channel_type,
         ctx.session_title.as_deref(),
     );
 
     let resp = agent
         .acp
         .session_new_full(
-            &ctx.cwd,
+            &session_cwd,
             mcp_servers,
             session_new_system_prompt(
                 is_goose,
@@ -1598,6 +1667,56 @@ pub async fn run_prompt_task(
             if let Some(sid) = agent.state.sessions.get(cid) {
                 (sid.clone(), false)
             } else {
+                let session_cwd = match ctx.session_cwd.resolve_channel(*cid) {
+                    SessionCwdDecision::Pinned(path) => {
+                        tracing::info!(
+                            target: "pool::session",
+                            channel = %cid,
+                            cwd = %path.display(),
+                            decision = "pinned",
+                            "resolved channel session working directory"
+                        );
+                        path
+                    }
+                    SessionCwdDecision::Workspace(path) => {
+                        tracing::info!(
+                            target: "pool::session",
+                            channel = %cid,
+                            cwd = %path.display(),
+                            decision = "workspace",
+                            "resolved channel session working directory"
+                        );
+                        path
+                    }
+                    SessionCwdDecision::RootMode => {
+                        let path = ctx.session_cwd.heartbeat_cwd().to_path_buf();
+                        tracing::info!(
+                            target: "pool::session",
+                            channel = %cid,
+                            cwd = %path.display(),
+                            decision = "root_mode",
+                            "resolved channel session working directory"
+                        );
+                        path
+                    }
+                    SessionCwdDecision::Refused(reason) => {
+                        tracing::error!(
+                            target: "pool::session",
+                            channel = %cid,
+                            reason = %reason,
+                            "channel session working directory refused"
+                        );
+                        send_prompt_result(
+                            &result_tx,
+                            &turn_id,
+                            agent,
+                            source,
+                            PromptOutcome::Error(AcpError::Protocol(reason)),
+                            requeue_batch_if_queue(&ctx, batch),
+                        );
+                        return;
+                    }
+                };
                 // The title is channel-qualified (`Agent · #channel`) so one
                 // agent in several channels doesn't produce identical session
                 // rows; `title_channel` comes from the single resolve above and
@@ -1607,9 +1726,12 @@ pub async fn run_prompt_task(
                     &ctx,
                     agent_core.as_deref(),
                     agent_canvas.as_deref(),
-                    title_channel.as_deref(),
-                    Some(*cid),
-                    origin_channel_type.as_deref(),
+                    NewSessionParameters {
+                        cwd: &session_cwd,
+                        channel_name: title_channel.as_deref(),
+                        channel_id: Some(*cid),
+                        channel_type: origin_channel_type.as_deref(),
+                    },
                 )
                 .await
                 {
@@ -1657,8 +1779,26 @@ pub async fn run_prompt_task(
             if let Some(sid) = &agent.state.heartbeat_session {
                 (sid.clone(), false)
             } else {
-                match create_session_and_apply_model(&mut agent, &ctx, None, None, None, None, None)
-                    .await
+                let heartbeat_cwd = ctx.session_cwd.heartbeat_cwd().to_path_buf();
+                tracing::info!(
+                    target: "pool::session",
+                    cwd = %heartbeat_cwd.display(),
+                    decision = "heartbeat_process_cwd",
+                    "resolved heartbeat session working directory"
+                );
+                match create_session_and_apply_model(
+                    &mut agent,
+                    &ctx,
+                    None,
+                    None,
+                    NewSessionParameters {
+                        cwd: &heartbeat_cwd,
+                        channel_name: None,
+                        channel_id: None,
+                        channel_type: None,
+                    },
+                )
+                .await
                 {
                     Ok(sid) => {
                         tracing::info!(
@@ -4026,9 +4166,101 @@ async fn clear_reactions(rest: crate::relay::RestClient, event_ids: Vec<String>)
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use super::*;
     use nostr::{EventBuilder, Keys, Kind, Tag, Timestamp};
     use serde_json::json;
+
+    fn test_session_cwd_resolver(
+        pinned_cwd: Option<PathBuf>,
+        channels: BTreeMap<Uuid, PathBuf>,
+    ) -> SessionCwdResolver {
+        SessionCwdResolver::new(
+            pinned_cwd,
+            PathBuf::from("/tmp/harness-process"),
+            WorkspaceIndex::from_test_channels(channels, |_| true),
+        )
+    }
+
+    #[test]
+    fn session_cwd_pinned_override_wins_for_indexed_and_absent_channels() {
+        let indexed = Uuid::new_v4();
+        let absent = Uuid::new_v4();
+        let pinned = PathBuf::from("/tmp/operator-pinned");
+        let resolver = test_session_cwd_resolver(
+            Some(pinned.clone()),
+            BTreeMap::from([(indexed, PathBuf::from("/tmp/indexed"))]),
+        );
+
+        assert_eq!(
+            resolver.resolve_channel(indexed),
+            SessionCwdDecision::Pinned(pinned.clone())
+        );
+        assert_eq!(
+            resolver.resolve_channel(absent),
+            SessionCwdDecision::Pinned(pinned)
+        );
+    }
+
+    #[test]
+    fn session_cwd_without_pin_uses_workspace_or_refuses() {
+        let indexed = Uuid::new_v4();
+        let absent = Uuid::new_v4();
+        let workspace = PathBuf::from("/tmp/indexed");
+        let resolver =
+            test_session_cwd_resolver(None, BTreeMap::from([(indexed, workspace.clone())]));
+
+        assert_eq!(
+            resolver.resolve_channel(indexed),
+            SessionCwdDecision::Workspace(workspace)
+        );
+        assert!(matches!(
+            resolver.resolve_channel(absent),
+            SessionCwdDecision::Refused(reason)
+                if reason.contains(&absent.to_string()) && reason.contains("refusing")
+        ));
+    }
+
+    #[test]
+    fn heartbeat_uses_process_cwd_even_when_channel_sessions_are_pinned() {
+        let resolver =
+            test_session_cwd_resolver(Some(PathBuf::from("/tmp/operator-pinned")), BTreeMap::new());
+
+        assert_eq!(resolver.heartbeat_cwd(), Path::new("/tmp/harness-process"));
+    }
+
+    #[test]
+    fn rotated_session_re_resolves_and_refuses_a_removed_repository() {
+        let channel = Uuid::new_v4();
+        let workspace = PathBuf::from("/tmp/workspace-removed-after-first-session");
+        let directory_exists = Arc::new(AtomicBool::new(true));
+        let check_exists = Arc::clone(&directory_exists);
+        let resolver = SessionCwdResolver::new(
+            None,
+            PathBuf::from("/tmp/harness-process"),
+            WorkspaceIndex::from_test_channels(
+                BTreeMap::from([(channel, workspace.clone())]),
+                move |_| check_exists.load(Ordering::SeqCst),
+            ),
+        );
+        assert_eq!(
+            resolver.resolve_channel(channel),
+            SessionCwdDecision::Workspace(workspace)
+        );
+
+        let mut state = SessionState::default();
+        state.sessions.insert(channel, "old-session".to_string());
+        state.turn_counts.insert(channel, 1);
+        state.invalidate(&PromptSource::Channel(channel));
+        directory_exists.store(false, Ordering::SeqCst);
+
+        assert!(matches!(
+            resolver.resolve_channel(channel),
+            SessionCwdDecision::Refused(_)
+        ));
+    }
 
     fn test_mcp_server() -> McpServer {
         McpServer {
@@ -6518,7 +6750,11 @@ mod tests {
             team_instructions: None,
             heartbeat_prompt: None,
             base_prompt: None,
-            cwd: ".".to_string(),
+            session_cwd: SessionCwdResolver::new(
+                Some(PathBuf::from("/tmp")),
+                PathBuf::from("/tmp"),
+                WorkspaceIndex::from_test_channels(BTreeMap::new(), |_| true),
+            ),
             rest_client: RestClient {
                 http: reqwest::Client::new(),
                 base_url: "http://127.0.0.1:0".to_string(),

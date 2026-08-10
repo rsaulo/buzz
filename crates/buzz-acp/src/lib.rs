@@ -1578,16 +1578,26 @@ async fn tokio_main() -> Result<()> {
         return setup_mode::run_setup_listener(config, payload).await;
     }
 
-    // Phase 1 builds and reports the channel-to-checkout index at boot. The
-    // session pool deliberately does not consume it yet; per-channel cwd
-    // selection is wired in the next phase.
-    let _workspace_index = WorkspaceIndex::from_env();
+    let workspace_index = WorkspaceIndex::from_env();
 
     // Resolved after the setup branch on purpose: setup mode never opens a
     // session, so a workspace typo must not block an operator from fixing the
     // credentials that put the agent in setup mode to begin with.
     let agent_cwd = config::resolve_agent_cwd().map_err(|e| anyhow::anyhow!("{e}"))?;
-    tracing::info!("buzz-acp session working directory: {agent_cwd}");
+    let pinned_cwd = std::env::var(config::AGENT_CWD_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|_| std::path::PathBuf::from(&agent_cwd));
+    let process_cwd = std::env::current_dir()
+        .map_err(|error| anyhow::anyhow!("cannot resolve heartbeat process cwd: {error}"))?;
+    if pinned_cwd.is_some() {
+        tracing::info!("buzz-acp channel sessions pinned to: {agent_cwd}");
+    } else {
+        tracing::info!(
+            process_cwd = %process_cwd.display(),
+            "buzz-acp channel sessions require an indexed workspace"
+        );
+    }
 
     tracing::info!("buzz-acp starting: {}", config.summary());
 
@@ -1840,7 +1850,7 @@ async fn tokio_main() -> Result<()> {
             Some(include_str!("base_prompt.md"))
         },
         heartbeat_prompt: config.heartbeat_prompt.clone(),
-        cwd: agent_cwd,
+        session_cwd: pool::SessionCwdResolver::new(pinned_cwd, process_cwd, workspace_index),
         rest_client: relay.rest_client(),
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
         context_message_limit: config.context_message_limit,
