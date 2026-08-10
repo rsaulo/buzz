@@ -6,10 +6,12 @@
 //! private protocol extension. Projects are intentionally few, so we query the
 //! live kind:30621 heads and scan their `buzz-channel` tags client-side.
 
-use std::collections::HashMap;
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+#[cfg(test)]
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use buzz_core::kind::KIND_PROJECT;
@@ -64,15 +66,19 @@ impl ProjectQueryTransport for RestProjectQuery {
 }
 
 #[derive(Debug, Clone)]
-struct CachedSignal {
+struct CachedProjectQuery {
     cached_at: Instant,
-    signal: ProjectChannelSignal,
+    result: Result<HashSet<Uuid>, String>,
 }
 
-/// Per-channel TTL cache around the relay project signal.
+/// Query-level TTL cache around the relay project signal.
 pub(crate) struct ProjectChannelResolver {
     transport: Arc<dyn ProjectQueryTransport>,
-    cache: Mutex<HashMap<Uuid, CachedSignal>>,
+    // Held through a cache miss so concurrent channel classifications share the
+    // same in-flight relay query instead of multiplying identical kind-only
+    // fetches. Project queries are bounded by `timeout`, so lock occupancy is
+    // bounded as well.
+    cache: tokio::sync::Mutex<Option<CachedProjectQuery>>,
     ttl: Duration,
     timeout: Duration,
     clock: Arc<dyn Fn() -> Instant + Send + Sync>,
@@ -106,7 +112,7 @@ impl ProjectChannelResolver {
     ) -> Self {
         Self {
             transport,
-            cache: Mutex::new(HashMap::new()),
+            cache: tokio::sync::Mutex::new(None),
             ttl,
             timeout,
             clock: Arc::new(clock),
@@ -115,38 +121,29 @@ impl ProjectChannelResolver {
 
     pub(crate) async fn classify(&self, channel_id: Uuid) -> ProjectChannelSignal {
         let now = (self.clock)();
-        if let Some(cached) = self
-            .cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&channel_id)
+        let mut cache = self.cache.lock().await;
+        if let Some(cached) = cache
+            .as_ref()
             .filter(|cached| now.saturating_duration_since(cached.cached_at) < self.ttl)
-            .cloned()
         {
-            return cached.signal;
+            return signal_for_channel(&cached.result, channel_id);
         }
 
-        let signal =
-            match tokio::time::timeout(self.timeout, self.transport.fetch_projects()).await {
-                Ok(Ok(value)) => classify_response(&value, channel_id)
-                    .unwrap_or_else(ProjectChannelSignal::FailOpen),
-                Ok(Err(reason)) => ProjectChannelSignal::FailOpen(reason),
-                Err(_) => ProjectChannelSignal::FailOpen(format!(
-                    "project query timed out after {}ms",
-                    self.timeout.as_millis()
-                )),
-            };
+        let result = match tokio::time::timeout(self.timeout, self.transport.fetch_projects()).await
+        {
+            Ok(Ok(value)) => project_channels_from_response(&value),
+            Ok(Err(reason)) => Err(reason),
+            Err(_) => Err(format!(
+                "project query timed out after {}ms",
+                self.timeout.as_millis()
+            )),
+        };
 
-        self.cache
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .insert(
-                channel_id,
-                CachedSignal {
-                    cached_at: (self.clock)(),
-                    signal: signal.clone(),
-                },
-            );
+        let signal = signal_for_channel(&result, channel_id);
+        *cache = Some(CachedProjectQuery {
+            cached_at: (self.clock)(),
+            result,
+        });
         signal
     }
 
@@ -197,12 +194,25 @@ impl ProjectChannelResolver {
     }
 }
 
-/// Decode a successful relay response. Any malformed event makes the answer
-/// indeterminate: malformed data must never be collapsed into "not a project".
-fn classify_response(value: &Value, channel_id: Uuid) -> Result<ProjectChannelSignal, String> {
+fn signal_for_channel(
+    result: &Result<HashSet<Uuid>, String>,
+    channel_id: Uuid,
+) -> ProjectChannelSignal {
+    match result {
+        Ok(channels) if channels.contains(&channel_id) => ProjectChannelSignal::Project,
+        Ok(_) => ProjectChannelSignal::NotProject,
+        Err(reason) => ProjectChannelSignal::FailOpen(reason.clone()),
+    }
+}
+
+/// Decode a successful relay response into the complete project-channel set.
+/// Any malformed event makes the whole answer indeterminate: malformed data
+/// must never be collapsed into a confident negative for any channel.
+fn project_channels_from_response(value: &Value) -> Result<HashSet<Uuid>, String> {
     let events = value
         .as_array()
         .ok_or_else(|| "project query returned a non-array response".to_string())?;
+    let mut project_channels = HashSet::new();
 
     for raw in events {
         let event: Event = serde_json::from_value(raw.clone())
@@ -233,18 +243,17 @@ fn classify_response(value: &Value, channel_id: Uuid) -> Result<ProjectChannelSi
             .ok_or_else(|| "project event has a valueless buzz-channel tag".to_string())?;
         let project_channel = Uuid::parse_str(raw_channel)
             .map_err(|error| format!("project event has an invalid buzz-channel UUID: {error}"))?;
-        if project_channel == channel_id {
-            return Ok(ProjectChannelSignal::Project);
-        }
+        project_channels.insert(project_channel);
     }
 
-    Ok(ProjectChannelSignal::NotProject)
+    Ok(project_channels)
 }
 
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     use nostr::{EventBuilder, Keys, Kind, Tag};
     use serde_json::json;
@@ -343,6 +352,25 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fail_open_is_cached_without_becoming_confirmed_absence() {
+        let transport = Arc::new(StubTransport::new([Err("offline".to_string())]));
+        let resolver = ProjectChannelResolver::with_components(
+            transport.clone(),
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            Instant::now,
+        );
+
+        for channel in [Uuid::new_v4(), Uuid::new_v4()] {
+            assert!(matches!(
+                resolver.classify(channel).await,
+                ProjectChannelSignal::FailOpen(reason) if reason == "offline"
+            ));
+        }
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn malformed_response_is_fail_open() {
         let channel = Uuid::new_v4();
         let transport = Arc::new(StubTransport::new([Ok(json!({"not": "events"}))]));
@@ -381,8 +409,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_query_inside_ttl_does_not_hit_transport() {
-        let channel = Uuid::new_v4();
+    async fn different_channels_inside_ttl_share_one_transport_query() {
+        let first_channel = Uuid::new_v4();
+        let second_channel = Uuid::new_v4();
         let transport = Arc::new(StubTransport::new([Ok(json!([]))]));
         let resolver = ProjectChannelResolver::with_components(
             transport.clone(),
@@ -392,13 +421,81 @@ mod tests {
         );
 
         assert_eq!(
-            resolver.classify(channel).await,
+            resolver.classify(first_channel).await,
             ProjectChannelSignal::NotProject
         );
         assert_eq!(
-            resolver.classify(channel).await,
+            resolver.classify(second_channel).await,
             ProjectChannelSignal::NotProject
         );
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn expired_query_cache_is_refreshed_for_any_channel() {
+        let project_channel = Uuid::new_v4();
+        let elapsed_secs = Arc::new(AtomicU64::new(0));
+        let start = Instant::now();
+        let clock = {
+            let elapsed_secs = elapsed_secs.clone();
+            move || start + Duration::from_secs(elapsed_secs.load(Ordering::SeqCst))
+        };
+        let transport = Arc::new(StubTransport::new([
+            Ok(json!([])),
+            Ok(json!([project(project_channel)])),
+        ]));
+        let resolver = ProjectChannelResolver::with_components(
+            transport.clone(),
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            clock,
+        );
+
+        assert_eq!(
+            resolver.classify(Uuid::new_v4()).await,
+            ProjectChannelSignal::NotProject
+        );
+        elapsed_secs.store(60, Ordering::SeqCst);
+        assert_eq!(
+            resolver.classify(project_channel).await,
+            ProjectChannelSignal::Project
+        );
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_channel_misses_share_one_in_flight_query() {
+        struct SlowTransport {
+            calls: AtomicUsize,
+        }
+
+        impl ProjectQueryTransport for SlowTransport {
+            fn fetch_projects(&self) -> QueryFuture<'_> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                    Ok(json!([]))
+                })
+            }
+        }
+
+        let transport = Arc::new(SlowTransport {
+            calls: AtomicUsize::new(0),
+        });
+        let resolver = ProjectChannelResolver::with_components(
+            transport.clone(),
+            Duration::from_secs(60),
+            Duration::from_secs(1),
+            Instant::now,
+        );
+
+        let (first, second) = tokio::join!(
+            resolver.classify(Uuid::new_v4()),
+            resolver.classify(Uuid::new_v4())
+        );
+
+        assert_eq!(first, ProjectChannelSignal::NotProject);
+        assert_eq!(second, ProjectChannelSignal::NotProject);
         assert_eq!(transport.calls.load(Ordering::SeqCst), 1);
     }
 }
