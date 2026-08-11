@@ -849,10 +849,6 @@ impl EventQueue {
     }
 
     /// Whether a prompt is currently in-flight for one specific conversation.
-    ///
-    /// Test-only for now: production paths that care about in-flight state go
-    /// through `flush_next`/`mark_complete`, which own the set directly.
-    #[cfg(test)]
     pub fn is_session_in_flight(&self, key: &SessionKey) -> bool {
         self.in_flight_sessions.contains(key)
     }

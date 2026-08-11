@@ -1,10 +1,10 @@
 //! Usage tracking for NIP-AM agent turn metrics.
 //!
-//! Agents that support usage reporting emit a `_goose/unstable/session/update`
-//! notification (with `sessionUpdate: "usage_update"`) at the end of every
-//! turn.  Both goose and buzz-agent use this same wire format.  The payload
-//! carries session-cumulative token counts from which we derive per-turn
-//! deltas.
+//! Goose and buzz-agent emit `_goose/unstable/session/update` notifications
+//! carrying session-cumulative counters from which we derive per-turn deltas.
+//! Standard ACP adapters instead return per-turn token usage in the
+//! `session/prompt` response; Claude and OpenCode supplement it with a standard
+//! `usage_update` notification carrying session-cumulative cost.
 //!
 //! # Delta computation
 //!
@@ -188,7 +188,7 @@ struct SessionState {
 /// because the session prefix can no longer be proven.
 #[derive(Debug, Clone)]
 pub struct TurnUsage {
-    /// Goose session id (maps to NIP-AM `sessionId`).
+    /// ACP session id (maps to NIP-AM `sessionId`).
     pub session_id: String,
     /// Per-session monotonic sequence number for this turn (maps to NIP-AM `turnSeq`).
     pub turn_seq: u64,
@@ -243,6 +243,236 @@ pub struct TurnUsage {
     /// `None` when the publisher omitted it (unrecognised endpoint, mixed
     /// identities, old harness). Per-turn only — not session-cumulative.
     pub pricing_identity: Option<buzz_core::agent_turn_metric::PricingIdentity>,
+}
+
+/// Per-turn usage carried by a standard ACP `session/prompt` response.
+/// Adapter input excludes cache reads and writes, so NIP-AM input must add
+/// those subsets with checked arithmetic.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct PromptResponseUsage {
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub total_tokens: u64,
+    pub cached_read_tokens: Option<u64>,
+    pub cached_write_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StandardAdapterKind {
+    Claude,
+    Codex,
+    OpenCode,
+}
+
+impl StandardAdapterKind {
+    pub(crate) fn reports_cumulative_cost(self) -> bool {
+        matches!(self, Self::Claude | Self::OpenCode)
+    }
+
+    fn reports_provider_total(self) -> bool {
+        matches!(self, Self::Codex)
+    }
+}
+
+#[derive(Debug, Default)]
+struct StandardSessionState {
+    published_seq: u64,
+    last_cost: Option<f64>,
+    cost_poisoned: bool,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct StandardUsageTracker {
+    sessions: HashMap<String, StandardSessionState>,
+    in_flight_session: Option<String>,
+    pending_cost: Option<(String, f64)>,
+    cost_invalid_observed: bool,
+    pending_prompt: Option<(String, PromptResponseUsage, StandardAdapterKind)>,
+}
+
+impl StandardUsageTracker {
+    /// Reset accounting for a freshly-created session generation.
+    pub(crate) fn seed_zero_baseline(&mut self, session_id: &str) {
+        if self.in_flight_session.as_deref() == Some(session_id) {
+            self.in_flight_session = None;
+            self.pending_cost = None;
+            self.cost_invalid_observed = false;
+            self.pending_prompt = None;
+        }
+        self.sessions.insert(
+            session_id.to_string(),
+            StandardSessionState {
+                published_seq: 0,
+                last_cost: Some(0.0),
+                cost_poisoned: false,
+            },
+        );
+    }
+
+    pub(crate) fn begin_turn(&mut self, session_id: &str) {
+        if self.cost_invalid_observed {
+            if let Some(previous_session) = self.in_flight_session.as_deref() {
+                if let Some(state) = self.sessions.get_mut(previous_session) {
+                    state.last_cost = None;
+                }
+            }
+        }
+        self.in_flight_session = Some(session_id.to_string());
+        self.pending_cost = None;
+        self.cost_invalid_observed = false;
+        self.pending_prompt = None;
+    }
+
+    /// Claude and OpenCode report raw session-cumulative cost in `usage_update`.
+    pub(crate) fn record_cost(&mut self, session_id: &str, cost: f64) {
+        if cost.is_finite()
+            && cost >= 0.0
+            && !self.cost_invalid_observed
+            && self.in_flight_session.as_deref() == Some(session_id)
+        {
+            self.pending_cost = Some((session_id.to_string(), cost));
+        }
+    }
+
+    /// Break cost continuity after a malformed, missing, or non-USD snapshot.
+    pub(crate) fn invalidate_cost(&mut self, session_id: &str) {
+        if self.in_flight_session.as_deref() == Some(session_id) {
+            self.pending_cost = None;
+            self.cost_invalid_observed = true;
+        } else if let Some(state) = self.sessions.get_mut(session_id) {
+            state.last_cost = None;
+        }
+    }
+
+    pub(crate) fn record_prompt_usage(
+        &mut self,
+        session_id: &str,
+        usage: PromptResponseUsage,
+        adapter: StandardAdapterKind,
+    ) {
+        if self.in_flight_session.as_deref() == Some(session_id) {
+            self.pending_prompt = Some((session_id.to_string(), usage, adapter));
+        }
+    }
+
+    pub(crate) fn take(&mut self, cumulative_cost_expected: bool) -> Option<TurnUsage> {
+        let in_flight_session = self.in_flight_session.take();
+        let prompt = self.pending_prompt.take();
+        let cost_invalid_observed = std::mem::replace(&mut self.cost_invalid_observed, false);
+        let pending_cost = self.pending_cost.take();
+        let cost = (!cost_invalid_observed).then_some(pending_cost).flatten();
+        let session_id = prompt
+            .as_ref()
+            .map(|(session_id, _, _)| session_id.clone())
+            .or_else(|| cost.as_ref().map(|(session_id, _)| session_id.clone()))
+            .or(in_flight_session)?;
+
+        if prompt.is_none() && cost.is_none() && !cumulative_cost_expected {
+            return None;
+        }
+
+        let (inclusive_input, output_tokens, total_tokens, cache_read, cache_write) = match prompt {
+            Some((_, usage, adapter)) => {
+                let inclusive_input = usage
+                    .input_tokens
+                    .checked_add(usage.cached_read_tokens.unwrap_or(0))
+                    .and_then(|input| input.checked_add(usage.cached_write_tokens.unwrap_or(0)));
+                let total_tokens = adapter
+                    .reports_provider_total()
+                    .then_some(usage.total_tokens);
+                (
+                    inclusive_input,
+                    inclusive_input.map(|_| usage.output_tokens),
+                    inclusive_input.and(total_tokens),
+                    inclusive_input.and(usage.cached_read_tokens),
+                    inclusive_input.and(usage.cached_write_tokens),
+                )
+            }
+            None => (None, None, None, None, None),
+        };
+
+        let state = self.sessions.entry(session_id.clone()).or_default();
+        let cumulative_cost = cost.map(|(_, cost)| cost);
+        if cumulative_cost_expected && cumulative_cost.is_none() {
+            // A cumulative adapter omitted a snapshot for this completed turn.
+            // The old baseline can no longer prove a delta across the gap. The
+            // next observed cumulative value becomes a baseline of its own.
+            state.last_cost = None;
+        }
+        let turn_cost = match (state.cost_poisoned, state.last_cost, cumulative_cost) {
+            (false, Some(previous), Some(current)) if current >= previous => {
+                let delta = current - previous;
+                delta.is_finite().then_some(delta)
+            }
+            _ => None,
+        };
+        if let Some(current) = cumulative_cost {
+            // A decrease means the cumulative series restarted or is corrupt.
+            // Keep exposing the raw value, but never derive another delta from
+            // this generation's discontinuous series.
+            if state.last_cost.is_some_and(|previous| current < previous) {
+                state.cost_poisoned = true;
+                state.last_cost = None;
+            } else if !state.cost_poisoned {
+                state.last_cost = Some(current);
+            }
+        }
+
+        // Input overflow invalidates the standard prompt counters. Emit only if
+        // another valid signal remains; NIP-AM forbids an all-null usage record.
+        if inclusive_input.is_none() && cumulative_cost.is_none() {
+            return None;
+        }
+
+        state.published_seq += 1;
+        Some(TurnUsage {
+            session_id,
+            turn_seq: state.published_seq,
+            // Standard prompt counters are per-turn already. A cost-only record
+            // is reliable only when a cumulative baseline proves its delta.
+            delta_reliable: inclusive_input.is_some() || turn_cost.is_some(),
+            turn_input_tokens: inclusive_input,
+            turn_output_tokens: output_tokens,
+            turn_total_tokens: total_tokens,
+            turn_cost_usd: turn_cost,
+            turn_cache_read_tokens: cache_read,
+            turn_cache_write_tokens: cache_write,
+            cumulative_input_tokens: None,
+            cumulative_output_tokens: None,
+            cumulative_total_tokens: None,
+            cumulative_cost_usd: cumulative_cost,
+            cumulative_cache_read_tokens: None,
+            cumulative_cache_write_tokens: None,
+            model: None,
+            pricing_identity: None,
+        })
+    }
+
+    pub(crate) fn remove_session(&mut self, session_id: &str) {
+        if self.in_flight_session.as_deref() == Some(session_id) {
+            debug_assert!(false, "cannot remove usage for an in-flight session");
+            return;
+        }
+        if self
+            .pending_prompt
+            .as_ref()
+            .is_some_and(|(pending_session, _, _)| pending_session == session_id)
+            || self
+                .pending_cost
+                .as_ref()
+                .is_some_and(|(pending_session, _)| pending_session == session_id)
+        {
+            debug_assert!(false, "cannot remove pending standard usage");
+            return;
+        }
+        self.sessions.remove(session_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_session(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id)
+    }
 }
 
 /// Tracks per-session cumulative usage state across turns.
@@ -310,6 +540,76 @@ pub(crate) struct UsageTracker {
 }
 
 impl UsageTracker {
+    /// Advance Goose's cumulative baseline after a standard ACP fallback turn.
+    ///
+    /// Standard prompt counters are per-turn, while the next Goose update is
+    /// session-cumulative. Add each exact standard delta to its known Goose
+    /// baseline so a later Goose turn does not count the fallback turn again.
+    /// Any field without both operands becomes unknown for one transition; the
+    /// next raw Goose snapshot can then establish a fresh baseline safely.
+    pub(crate) fn commit_standard_fallback(&mut self, usage: &TurnUsage) {
+        debug_assert!(self.in_flight_session.is_none());
+        debug_assert!(self.pending.is_none());
+
+        let previous = self.sessions.get(&usage.session_id);
+        let advance = |baseline: Option<u64>, delta: Option<u64>| {
+            baseline.and_then(|value| delta.and_then(|delta| value.checked_add(delta)))
+        };
+        let input_ever_poisoned = previous.is_some_and(|state| state.input_ever_poisoned);
+        let output_ever_poisoned = previous.is_some_and(|state| state.output_ever_poisoned);
+        let last_input = if input_ever_poisoned {
+            None
+        } else {
+            advance(
+                previous.and_then(|state| state.last_input),
+                usage.turn_input_tokens,
+            )
+        };
+        let last_output = if output_ever_poisoned {
+            None
+        } else {
+            advance(
+                previous.and_then(|state| state.last_output),
+                usage.turn_output_tokens,
+            )
+        };
+
+        // Standard cost notifications are already session-cumulative. Accept
+        // that snapshot only when the standard tracker proved its turn delta;
+        // a missing/decreased series must break continuity instead.
+        let last_cost = usage
+            .turn_cost_usd
+            .and(usage.cumulative_cost_usd)
+            .filter(|cost| cost.is_finite());
+        let last_total = advance(
+            previous.and_then(|state| state.last_total),
+            usage.turn_total_tokens,
+        );
+        let last_cached_input = advance(
+            previous.and_then(|state| state.last_cached_input),
+            usage.turn_cache_read_tokens,
+        );
+        let last_cache_write = advance(
+            previous.and_then(|state| state.last_cache_write),
+            usage.turn_cache_write_tokens,
+        );
+
+        self.sessions.insert(
+            usage.session_id.clone(),
+            SessionState {
+                published_seq: usage.turn_seq,
+                last_input,
+                last_output,
+                last_cost,
+                last_total,
+                last_cached_input,
+                last_cache_write,
+                input_ever_poisoned,
+                output_ever_poisoned,
+            },
+        );
+    }
+
     /// Mark the start of a new prompt turn for `session_id`.
     ///
     /// Clears any leftover `pending` record and records which session is

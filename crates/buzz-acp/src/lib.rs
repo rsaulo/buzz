@@ -2599,9 +2599,10 @@ async fn tokio_main() -> Result<()> {
                                 });
                             }
                             // Event is already queued. If mode requires it AND
-                            // the channel has an in-flight task, fire cancel —
-                            // OR take the non-cancelling (ACP steer) fork for Steer signals.
-                            if accepted && queue.is_channel_in_flight(buzz_event.channel_id) {
+                            // this exact conversation has an in-flight task,
+                            // fire cancel — OR take the non-cancelling (ACP
+                            // steer) fork for Steer signals.
+                            if should_signal_mid_turn(&queue, accepted, &steer_session_key) {
                                 // Author eligibility (owner ∪ allowlist ∪ siblings)
                                 // is already enforced by the inbound author gate
                                 // above, so the mid-turn signal fires for every
@@ -2624,8 +2625,8 @@ async fn tokio_main() -> Result<()> {
                                     // to the universal cancel+merge `Steer`
                                     // signal so the event still reaches the
                                     // agent.
-                                    let native_attempted = matches!(signal, ControlSignal::Steer)
-                                        && try_native_steer(
+                                    if matches!(signal, ControlSignal::Steer) {
+                                        let result = try_native_steer(
                                             &mut pool,
                                             &mut queue,
                                             &steer_session_key,
@@ -2633,7 +2634,12 @@ async fn tokio_main() -> Result<()> {
                                             prompt_tag_for_steer,
                                             &steer_ack_tx,
                                         );
-                                    if !native_attempted {
+                                        apply_native_steer_result(
+                                            &mut pool,
+                                            &steer_session_key,
+                                            result,
+                                        );
+                                    } else {
                                         signal_in_flight_task(
                                             &mut pool,
                                             &steer_session_key,
@@ -2895,10 +2901,11 @@ async fn tokio_main() -> Result<()> {
                 //
                 //   Err(PromptCompleted)
                 //     `SteerError::PromptCompleted` is returned synchronously
-                //     by `pool::send_steer` when no task is in flight (handled
-                //     in `try_native_steer`'s Err branch, which falls through
-                //     to cancel+merge). It is never routed through the ack
-                //     channel, so this variant never appears in `SteerAckEvent`.
+                //     by `pool::send_steer` when no task is in flight. It maps
+                //     to `NativeSteerResult::NoActiveTurn`, leaving the event
+                //     queued for normal dispatch without a fallback signal.
+                //     It is never routed through the ack channel, so this
+                //     variant never appears in `SteerAckEvent`.
                 //
                 //   Watcher Err (oneshot dropped)
                 //     Should not happen — the read loop drains
@@ -3088,6 +3095,7 @@ async fn tokio_main() -> Result<()> {
         pr.agent.acp.shutdown().await;
         tracing::debug!(agent = idx, "reaped late-arriving agent on shutdown");
     }
+    pool.shutdown_metric_tasks().await;
     // Explicitly shut down idle agents still sitting in their slots.
     for slot in pool.agents_mut().iter_mut() {
         if let Some(agent) = slot.take() {
@@ -3282,6 +3290,10 @@ fn signal_in_flight_task(
     false
 }
 
+fn should_signal_mid_turn(queue: &EventQueue, accepted: bool, key: &queue::SessionKey) -> bool {
+    accepted && queue.is_session_in_flight(key)
+}
+
 fn signal_steer_fallback_if_current(
     pool: &mut AgentPool,
     key: &queue::SessionKey,
@@ -3308,20 +3320,25 @@ fn signal_steer_fallback_if_current(
 /// - `multiple_event_handling` resolved to `ControlSignal::Steer`; this
 ///   function is the non-cancelling fork of that signal.
 ///
-/// Returns `true` if the native attempt was accepted by the read loop
-/// (capacity-1 mpsc `try_send` succeeded, event withheld synchronously,
-/// ack watcher spawned). On `true` the caller MUST NOT issue the
-/// universal cancel+merge `ControlSignal::Steer` fallback — the watcher
-/// will issue it from the ack arm if the native attempt fails.
+/// Returns [`NativeSteerResult::Accepted`] if the native attempt was accepted
+/// by the read loop (capacity-1 mpsc `try_send` succeeded, event withheld
+/// synchronously, ack watcher spawned). The watcher will issue fallback from
+/// the ack arm if delivery later fails.
 ///
-/// Returns `false` if `pool.send_steer` failed (no in-flight task,
-/// `steer_tx` already full from a prior in-flight steer, or read loop
-/// torn down). The caller MUST fall through to
-/// `signal_in_flight_task(channel_id, ControlSignal::Steer)` so the
-/// event still reaches the agent via the universal path.
+/// Returns [`NativeSteerResult::FallbackRequired`] only when the exact task was
+/// found but transport delivery failed. If the exact task no longer exists,
+/// returns [`NativeSteerResult::NoActiveTurn`] so normal queued dispatch handles
+/// the event without a control signal.
 ///
-/// The withheld event is NOT released here on `false` because no withhold
-/// was established: `mark_native_steer_pending` only runs after acceptance.
+/// No withheld event needs releasing on either failure result because
+/// `mark_native_steer_pending` only runs after acceptance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NativeSteerResult {
+    Accepted,
+    FallbackRequired,
+    NoActiveTurn,
+}
+
 fn try_native_steer(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
@@ -3329,7 +3346,7 @@ fn try_native_steer(
     event: nostr::Event,
     prompt_tag: String,
     steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
-) -> bool {
+) -> NativeSteerResult {
     let channel_id = session_key.channel_id;
     // Build the steer body: framing strings come from
     // `queue::native_steer_framing()` (Eva's drift-proof requirement —
@@ -3395,16 +3412,37 @@ fn try_native_steer(
                     ack,
                 });
             });
-            true
+            NativeSteerResult::Accepted
+        }
+        Err(pool::SteerError::PromptCompleted) => {
+            tracing::debug!(
+                session = %session_key,
+                event_id = %event_id_hex,
+                "turn completed before native steer; leaving event queued for normal dispatch"
+            );
+            NativeSteerResult::NoActiveTurn
         }
         Err(e) => {
             tracing::info!(
-                channel = %channel_id,
+                session = %session_key,
+                event_id = %event_id_hex,
                 error = ?e,
-                "non-cancelling steer not accepted — falling back to cancel+merge"
+                "non-cancelling steer delivery failed; cancel+merge fallback required"
             );
-            false
+            NativeSteerResult::FallbackRequired
         }
+    }
+}
+
+fn apply_native_steer_result(
+    pool: &mut AgentPool,
+    session_key: &queue::SessionKey,
+    result: NativeSteerResult,
+) -> bool {
+    if result == NativeSteerResult::FallbackRequired {
+        signal_in_flight_task(pool, session_key, ControlSignal::Steer)
+    } else {
+        false
     }
 }
 
@@ -3494,13 +3532,13 @@ fn dispatch_pending(
         };
 
         let result_tx = pool.result_tx();
+        let metric_tasks = pool.metric_tasks();
         let ctx_clone = Arc::clone(ctx);
         let agent_index = agent.index;
 
         // Mid-turn non-cancelling steer seam: install the per-turn steer
-        // receiver on the read loop so the main loop's mode-gate fork
-        // (see the `if accepted && queue.is_channel_in_flight(...)` block
-        // in the relay event branch of the main `select!` loop) can drive
+        // receiver on the read loop so the main loop's exact-session gate
+        // in the relay event branch of the main `select!` loop can drive
         // it via the matching sender stored in `TaskMeta.steer_tx`.
         // Installed for every prompt task: the read loop picks the steer
         // transport at write time from `active_run_id` and the agent's
@@ -3523,6 +3561,7 @@ fn dispatch_pending(
                 Some(batch),
                 None,
                 ctx_clone,
+                metric_tasks,
                 result_tx,
                 Some(control_rx),
                 task_turn_id,
@@ -4156,6 +4195,7 @@ fn dispatch_heartbeat(
         .clone()
         .unwrap_or_else(default_heartbeat_prompt);
     let result_tx = pool.result_tx();
+    let metric_tasks = pool.metric_tasks();
     let ctx_clone = Arc::clone(ctx);
     let agent_index = agent.index;
     let turn_id = Uuid::new_v4().to_string();
@@ -4167,6 +4207,7 @@ fn dispatch_heartbeat(
             None,
             Some(prompt_text),
             ctx_clone,
+            metric_tasks,
             result_tx,
             None,
             task_turn_id,
@@ -4339,6 +4380,7 @@ async fn shutdown_agent_pool(pool: &mut AgentPool) {
     while let Ok(mut result) = pool.result_rx_try_recv() {
         result.agent.acp.shutdown().await;
     }
+    pool.shutdown_metric_tasks().await;
     for slot in pool.agents_mut() {
         if let Some(mut agent) = slot.take() {
             agent.acp.shutdown().await;
@@ -5109,6 +5151,191 @@ mod owner_control_command_tests {
             &crate::queue::SessionKey::ambient(channel_id),
             ControlSignal::Rotate
         ));
+    }
+
+    fn push_thread_event(
+        queue: &mut EventQueue,
+        key: &crate::queue::SessionKey,
+        content: &str,
+    ) -> nostr::Event {
+        let mut builder = EventBuilder::new(Kind::Custom(9), content);
+        if let Some(root) = &key.root {
+            builder = builder.tags(vec![
+                Tag::parse(["e", root.as_str(), "", "root"]).expect("thread root tag")
+            ]);
+        }
+        let event = builder.sign_with_keys(&Keys::generate()).unwrap();
+        assert!(queue.push(QueuedEvent {
+            channel_id: key.channel_id,
+            event: event.clone(),
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+        }));
+        event
+    }
+
+    fn mark_session_in_flight(queue: &mut EventQueue, key: &crate::queue::SessionKey) {
+        push_thread_event(queue, key, "active turn");
+        let batch = queue.flush_next().expect("active turn dispatches");
+        assert_eq!(batch.session_key(), *key);
+    }
+
+    fn insert_active_task(
+        agent_pool: &mut AgentPool,
+        key: &crate::queue::SessionKey,
+        control_tx: Option<tokio::sync::oneshot::Sender<ControlSignal>>,
+        steer_tx: Option<mpsc::Sender<pool::SteerRequest>>,
+    ) {
+        let task_id = agent_pool.join_set.spawn(std::future::pending::<()>()).id();
+        agent_pool.task_map_mut().insert(
+            task_id,
+            pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(key.channel_id),
+                session_key: Some(key.clone()),
+                turn_id: "active-turn".into(),
+                recoverable_batch: None,
+                control_tx,
+                steer_tx,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+    }
+
+    #[test]
+    fn idle_thread_event_dispatches_normally_while_sibling_thread_is_active() {
+        let channel_id = Uuid::new_v4();
+        let key_a = crate::queue::SessionKey::thread(channel_id, "a".repeat(64));
+        let key_b = crate::queue::SessionKey::thread(channel_id, "b".repeat(64));
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+
+        mark_session_in_flight(&mut queue, &key_b);
+        push_thread_event(&mut queue, &key_a, "event for idle thread A");
+
+        assert!(!should_signal_mid_turn(&queue, true, &key_a));
+        let batch = queue
+            .flush_next()
+            .expect("idle thread A should use normal dispatch");
+        assert_eq!(batch.session_key(), key_a);
+    }
+
+    #[test]
+    fn sibling_thread_does_not_open_exact_session_steer_gate() {
+        let channel_id = Uuid::new_v4();
+        let key_a = crate::queue::SessionKey::thread(channel_id, "a".repeat(64));
+        let key_b = crate::queue::SessionKey::thread(channel_id, "b".repeat(64));
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+
+        mark_session_in_flight(&mut queue, &key_b);
+
+        assert!(queue.is_channel_in_flight(channel_id));
+        assert!(!queue.is_session_in_flight(&key_a));
+        assert!(!should_signal_mid_turn(&queue, true, &key_a));
+        assert!(should_signal_mid_turn(&queue, true, &key_b));
+    }
+
+    #[tokio::test]
+    async fn synchronous_prompt_completed_uses_normal_dispatch_without_control_signal() {
+        let channel_id = Uuid::new_v4();
+        let key_a = crate::queue::SessionKey::thread(channel_id, "a".repeat(64));
+        let key_b = crate::queue::SessionKey::thread(channel_id, "b".repeat(64));
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        mark_session_in_flight(&mut queue, &key_b);
+        let event = push_thread_event(&mut queue, &key_a, "event for completed A");
+
+        let mut pool = AgentPool::from_slots(vec![]);
+        let (control_tx, mut control_rx) = tokio::sync::oneshot::channel();
+        insert_active_task(&mut pool, &key_b, Some(control_tx), None);
+        let (steer_ack_tx, _steer_ack_rx) = mpsc::unbounded_channel();
+
+        let result = try_native_steer(
+            &mut pool,
+            &mut queue,
+            &key_a,
+            event,
+            "test".into(),
+            &steer_ack_tx,
+        );
+
+        assert_eq!(result, NativeSteerResult::NoActiveTurn);
+        assert!(!apply_native_steer_result(&mut pool, &key_a, result));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        let batch = queue
+            .flush_next()
+            .expect("completed A should dispatch from its normal queue");
+        assert_eq!(batch.session_key(), key_a);
+    }
+
+    #[tokio::test]
+    async fn exact_active_session_uses_native_steer_without_control_signal() {
+        let key = crate::queue::SessionKey::thread(Uuid::new_v4(), "a".repeat(64));
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        mark_session_in_flight(&mut queue, &key);
+        let event = push_thread_event(&mut queue, &key, "native steer event");
+
+        let mut pool = AgentPool::from_slots(vec![]);
+        let (control_tx, mut control_rx) = tokio::sync::oneshot::channel();
+        let (steer_tx, mut steer_rx) = mpsc::channel(1);
+        insert_active_task(&mut pool, &key, Some(control_tx), Some(steer_tx));
+        let (steer_ack_tx, mut steer_ack_rx) = mpsc::unbounded_channel();
+
+        let result = try_native_steer(
+            &mut pool,
+            &mut queue,
+            &key,
+            event,
+            "test".into(),
+            &steer_ack_tx,
+        );
+
+        assert_eq!(result, NativeSteerResult::Accepted);
+        assert!(!apply_native_steer_result(&mut pool, &key, result));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(queue.queued_event_count(&key), 0);
+        let request = steer_rx.recv().await.expect("native steer request");
+        request
+            .ack_tx
+            .send(pool::SteerAck::PromptCompletedNeutral)
+            .expect("ack native steer");
+        let ack = steer_ack_rx.recv().await.expect("steer watcher result");
+        assert_eq!(ack.session_key, key);
+        assert!(matches!(
+            ack.ack,
+            Ok(pool::SteerAck::PromptCompletedNeutral)
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_active_session_transport_failure_uses_cancel_merge_fallback() {
+        let key = crate::queue::SessionKey::thread(Uuid::new_v4(), "a".repeat(64));
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        mark_session_in_flight(&mut queue, &key);
+        let event = push_thread_event(&mut queue, &key, "fallback steer event");
+
+        let mut pool = AgentPool::from_slots(vec![]);
+        let (control_tx, control_rx) = tokio::sync::oneshot::channel();
+        insert_active_task(&mut pool, &key, Some(control_tx), None);
+        let (steer_ack_tx, _steer_ack_rx) = mpsc::unbounded_channel();
+
+        let result = try_native_steer(
+            &mut pool,
+            &mut queue,
+            &key,
+            event,
+            "test".into(),
+            &steer_ack_tx,
+        );
+
+        assert_eq!(result, NativeSteerResult::FallbackRequired);
+        assert!(apply_native_steer_result(&mut pool, &key, result));
+        assert_eq!(control_rx.await.unwrap(), ControlSignal::Steer);
+        assert_eq!(queue.queued_event_count(&key), 1);
     }
 }
 

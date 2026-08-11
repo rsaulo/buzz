@@ -7,6 +7,7 @@
 //!   ├── agents: Vec<Option<OwnedAgent>>   ← idle agents sit here
 //!   ├── join_set: JoinSet<()>             ← in-flight tasks
 //!   ├── task_map: HashMap<Id, TaskMeta>   ← panic recovery metadata
+//!   ├── metric_tasks: MetricTaskSet        ← owned bootstrap publications
 //!   └── result_tx/rx: mpsc channel        ← tasks return agents here
 //!
 //!   Dispatch:
@@ -55,6 +56,10 @@ use crate::workspace_index::WorkspaceIndex;
 const RECENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(60);
 /// A close must not stall prompt creation or the maintenance loop indefinitely.
 const SESSION_CLOSE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Relay publication remains bounded independently of prompt execution.
+const METRIC_PUBLISH_TIMEOUT: Duration = Duration::from_secs(3);
+/// Shutdown gives bounded publications one extra second to settle before abort.
+const METRIC_TASK_DRAIN_GRACE: Duration = Duration::from_secs(4);
 
 // FlushBatch and BatchEvent derive Clone (added in queue.rs) so we can store
 // a recoverable copy in TaskMeta for panic recovery in Queue mode.
@@ -507,6 +512,97 @@ impl OwnedAgent {
     }
 }
 
+struct MetricTaskState {
+    accepting: bool,
+    tasks: JoinSet<()>,
+}
+
+impl Drop for MetricTaskState {
+    fn drop(&mut self) {
+        if !self.tasks.is_empty() {
+            tracing::warn!(
+                target: "pool::metrics",
+                remaining = self.tasks.len(),
+                "NIP-AM: metric task owner dropped; explicitly cancelling remaining publications"
+            );
+        }
+    }
+}
+
+/// Pool-owned task set for nonblocking bootstrap metric publications.
+///
+/// Clones are handles to the same set. The pool closes and drains it during
+/// shutdown; publications that race after closure are explicitly rejected and
+/// logged instead of becoming detached runtime tasks.
+#[derive(Clone)]
+pub struct MetricTaskSet {
+    state: Arc<Mutex<MetricTaskState>>,
+}
+
+impl Default for MetricTaskSet {
+    fn default() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(MetricTaskState {
+                accepting: true,
+                tasks: JoinSet::new(),
+            })),
+        }
+    }
+}
+
+impl MetricTaskSet {
+    fn spawn<F>(&self, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        while let Some(result) = state.tasks.try_join_next() {
+            if let Err(error) = result {
+                tracing::warn!(target: "pool::metrics", "NIP-AM: metric task failed: {error}");
+            }
+        }
+        if !state.accepting {
+            tracing::warn!(
+                target: "pool::metrics",
+                "NIP-AM: metric publication explicitly cancelled because pool shutdown has begun"
+            );
+            return;
+        }
+        state.tasks.spawn(task);
+    }
+
+    async fn shutdown(&self) {
+        let mut tasks = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.accepting = false;
+            std::mem::replace(&mut state.tasks, JoinSet::new())
+        };
+
+        let drain = tokio::time::timeout(METRIC_TASK_DRAIN_GRACE, async {
+            while let Some(result) = tasks.join_next().await {
+                if let Err(error) = result {
+                    tracing::warn!(target: "pool::metrics", "NIP-AM: metric task failed: {error}");
+                }
+            }
+        })
+        .await;
+        if drain.is_err() {
+            tracing::warn!(
+                target: "pool::metrics",
+                remaining = tasks.len(),
+                "NIP-AM: metric drain exceeded grace period; explicitly cancelling remaining publications"
+            );
+            tasks.shutdown().await;
+        }
+    }
+}
+
 /// Pool of agents with take-and-return ownership semantics.
 ///
 /// Agents are either idle (sitting in `agents[i]`) or checked out
@@ -524,6 +620,7 @@ pub struct AgentPool {
     result_rx: mpsc::UnboundedReceiver<PromptResult>,
     pub join_set: JoinSet<()>,
     task_map: HashMap<tokio::task::Id, TaskMeta>,
+    metric_tasks: MetricTaskSet,
 }
 
 /// Result returned by a completed prompt task.
@@ -1261,6 +1358,7 @@ impl AgentPool {
             result_rx,
             join_set: JoinSet::new(),
             task_map: HashMap::new(),
+            metric_tasks: MetricTaskSet::default(),
         }
     }
 
@@ -1470,6 +1568,14 @@ impl AgentPool {
 
     pub fn result_tx(&self) -> mpsc::UnboundedSender<PromptResult> {
         self.result_tx.clone()
+    }
+
+    pub fn metric_tasks(&self) -> MetricTaskSet {
+        self.metric_tasks.clone()
+    }
+
+    pub async fn shutdown_metric_tasks(&self) {
+        self.metric_tasks.shutdown().await;
     }
 
     /// Split-borrow: returns mutable refs to `result_rx` and `join_set`
@@ -1717,16 +1823,16 @@ async fn close_or_retire_unusable_session(
     UnusableSessionCleanup::Deferred
 }
 
-/// Finish usage accounting and reclaim a newly-created channel session whose
-/// initial prompt failed. Returns `true` when the adapter process was replaced.
+/// Reclaim a newly-created channel session whose initial prompt failed.
+///
+/// The caller must publish or explicitly drain usage before entering this
+/// helper because session close removes the accounting generation.
+/// Returns `true` when the adapter process was replaced.
 async fn reclaim_failed_initial_message(
     agent: &mut OwnedAgent,
     key: &SessionKey,
     session_id: &str,
 ) -> bool {
-    // The initial prompt is a real usage turn even though it is not published.
-    // Settle it before session cleanup so removal never races in-flight state.
-    let _ = agent.acp.take_turn_usage();
     match close_or_retire_unusable_session(agent, session_id).await {
         UnusableSessionCleanup::Closed | UnusableSessionCleanup::Deferred => {
             agent.state.clear_session_state(key);
@@ -2282,11 +2388,13 @@ fn send_prompt_result(
 ///
 /// The agent is ALWAYS returned — even on panic the `JoinSet` detects the
 /// abort and the caller uses `task_map` to recover the agent index.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_prompt_task(
     mut agent: OwnedAgent,
     batch: Option<FlushBatch>,
     prompt_text: Option<String>,
     ctx: Arc<PromptContext>,
+    metric_tasks: MetricTaskSet,
     result_tx: mpsc::UnboundedSender<PromptResult>,
     control_rx: Option<tokio::sync::oneshot::Receiver<ControlSignal>>,
     turn_id: String,
@@ -2840,11 +2948,28 @@ pub async fn run_prompt_task(
                     if !agent.has_system_prompt_support() {
                         agent.state.mark_delivery_success(key, true, []);
                     }
-                    // The setup prompt is not emitted as an agent-turn metric,
-                    // but its cumulative usage becomes the next turn's baseline.
-                    let _ = agent.acp.take_turn_usage();
+                    let usage = agent.acp.take_turn_usage();
+                    spawn_agent_turn_metric(
+                        &metric_tasks,
+                        Arc::clone(&ctx),
+                        usage,
+                        observer_channel_id,
+                        session_id.clone(),
+                        format!("{turn_id}:initial"),
+                        Some(acp_stop_to_core(&stop_reason)),
+                    );
                 }
                 Err(AcpError::AgentExited) => {
+                    let usage = agent.acp.take_turn_usage();
+                    publish_agent_turn_metric(
+                        &ctx,
+                        usage,
+                        observer_channel_id,
+                        &session_id,
+                        &format!("{turn_id}:initial"),
+                        Some(buzz_core::agent_turn_metric::StopReason::Error),
+                    )
+                    .await;
                     agent.state.invalidate_all();
                     send_prompt_result(
                         &result_tx,
@@ -2862,13 +2987,23 @@ pub async fn run_prompt_task(
                         "initial_message idle timeout ({}s) for {key} — cancelling",
                         ctx.idle_timeout.as_secs()
                     );
-                    match agent
+                    let terminal_reason = match agent
                         .acp
                         .cancel_with_cleanup(&session_id, ctx.idle_timeout)
                         .await
                     {
-                        Ok(_) => {}
+                        Ok(stop_reason) => acp_stop_to_core(&stop_reason),
                         Err(AcpError::AgentExited) => {
+                            let usage = agent.acp.take_turn_usage();
+                            publish_agent_turn_metric(
+                                &ctx,
+                                usage,
+                                observer_channel_id,
+                                &session_id,
+                                &format!("{turn_id}:initial"),
+                                Some(buzz_core::agent_turn_metric::StopReason::Error),
+                            )
+                            .await;
                             agent.state.invalidate_all();
                             send_prompt_result(
                                 &result_tx,
@@ -2885,8 +3020,19 @@ pub async fn run_prompt_task(
                                 target: "pool::session",
                                 "cancel_with_cleanup failed during initial_message timeout: {e}"
                             );
+                            buzz_core::agent_turn_metric::StopReason::Error
                         }
-                    }
+                    };
+                    let usage = agent.acp.take_turn_usage();
+                    publish_agent_turn_metric(
+                        &ctx,
+                        usage,
+                        observer_channel_id,
+                        &session_id,
+                        &format!("{turn_id}:initial"),
+                        Some(terminal_reason),
+                    )
+                    .await;
                     let replace_process =
                         reclaim_failed_initial_message(&mut agent, key, &session_id).await;
                     send_prompt_result(
@@ -2910,6 +3056,16 @@ pub async fn run_prompt_task(
                         "hard timeout ({}s cap, silence {silence:?}, recently_active={recently_active}) during initial_message for {key} — agent process is unrecoverable",
                         ctx.max_turn_duration.as_secs()
                     );
+                    let usage = agent.acp.take_turn_usage();
+                    publish_agent_turn_metric(
+                        &ctx,
+                        usage,
+                        observer_channel_id,
+                        &session_id,
+                        &format!("{turn_id}:initial"),
+                        Some(buzz_core::agent_turn_metric::StopReason::Error),
+                    )
+                    .await;
                     agent.state.invalidate_all();
                     send_prompt_result(
                         &result_tx,
@@ -2926,6 +3082,16 @@ pub async fn run_prompt_task(
                         target: "pool::session",
                         "initial_message failed for {key}: {e} — invalidating session"
                     );
+                    let usage = agent.acp.take_turn_usage();
+                    publish_agent_turn_metric(
+                        &ctx,
+                        usage,
+                        observer_channel_id,
+                        &session_id,
+                        &format!("{turn_id}:initial"),
+                        Some(buzz_core::agent_turn_metric::StopReason::Error),
+                    )
+                    .await;
                     let replace_process =
                         reclaim_failed_initial_message(&mut agent, key, &session_id).await;
                     send_prompt_result(
@@ -4663,6 +4829,9 @@ fn log_stop_reason(source: &PromptSource, stop_reason: &StopReason) {
         StopReason::Refusal => {
             tracing::warn!(target: "pool::prompt", "turn refused for {label}");
         }
+        StopReason::Unknown(reason) => {
+            tracing::warn!(target: "pool::prompt", "turn returned unknown stop reason {reason:?} for {label}");
+        }
     }
 }
 
@@ -4897,6 +5066,7 @@ fn acp_stop_to_core(r: &StopReason) -> buzz_core::agent_turn_metric::StopReason 
         StopReason::MaxTokens => CoreStop::MaxTokens,
         StopReason::MaxTurnRequests => CoreStop::Unknown,
         StopReason::Refusal => CoreStop::Unknown,
+        StopReason::Unknown(_) => CoreStop::Unknown,
     }
 }
 
@@ -4965,8 +5135,8 @@ pub(crate) fn build_turn_metric_counts(
 
 /// Best-effort: build and publish a `kind:44200` NIP-AM agent turn metric event.
 ///
-/// Does nothing when `usage` is `None` (goose emitted no usage notification
-/// for this turn) or when `owner_pubkey` is unconfigured (no NIP-AO identity).
+/// Does nothing when `usage` is `None` (no supported source reported usage for
+/// this turn) or when `owner_pubkey` is unconfigured (no NIP-AO identity).
 /// Errors are logged at WARN and never surface to the caller — metric
 /// publishing must never fail a turn.
 async fn publish_agent_turn_metric(
@@ -5040,8 +5210,7 @@ async fn publish_agent_turn_metric(
             return;
         }
     };
-    const METRIC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
-    match tokio::time::timeout(METRIC_TIMEOUT, ctx.rest_client.submit_event(&event)).await {
+    match tokio::time::timeout(METRIC_PUBLISH_TIMEOUT, ctx.rest_client.submit_event(&event)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => tracing::warn!(
             target: "pool::metrics",
@@ -5056,6 +5225,25 @@ async fn publish_agent_turn_metric(
             "NIP-AM: publish timed out"
         ),
     }
+}
+
+/// Publish bootstrap-turn telemetry without holding up the queued user turn.
+///
+/// The spawned task owns all inputs and retains the same bounded timeout and
+/// best-effort logging as inline metric publication.
+fn spawn_agent_turn_metric(
+    metric_tasks: &MetricTaskSet,
+    ctx: Arc<PromptContext>,
+    usage: Option<crate::usage::TurnUsage>,
+    channel_id: Option<uuid::Uuid>,
+    session_id: String,
+    turn_id: String,
+    stop_reason: Option<buzz_core::agent_turn_metric::StopReason>,
+) {
+    metric_tasks.spawn(async move {
+        publish_agent_turn_metric(&ctx, usage, channel_id, &session_id, &turn_id, stop_reason)
+            .await;
+    });
 }
 
 const REACTION_SEEN: &str = "👀";
@@ -5554,6 +5742,619 @@ mod tests {
             "hello channel",
         );
         assert_eq!(composed, "hello channel");
+    }
+
+    #[cfg(unix)]
+    async fn spawn_metric_capture_server() -> (
+        String,
+        mpsc::UnboundedReceiver<nostr::Event>,
+        JoinHandle<()>,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind metric capture server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (event_tx, event_rx) = mpsc::unbounded_channel::<nostr::Event>();
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let header_end = loop {
+                    if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        break index + 4;
+                    }
+                    let read = socket.read(&mut chunk).await.expect("read request headers");
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                };
+                let (path, content_length) = {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let path = headers
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    (path, content_length)
+                };
+                while request.len() < header_end + content_length {
+                    let read = socket.read(&mut chunk).await.expect("read request body");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let response_body = if path == "/events" {
+                    let body = &request[header_end..header_end + content_length];
+                    let event: nostr::Event =
+                        serde_json::from_slice(body).expect("submitted event is valid");
+                    let _ = event_tx.send(event);
+                    "{}"
+                } else if path == "/count" {
+                    r#"{"count":0}"#
+                } else {
+                    "[]"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write capture response");
+            }
+        });
+        (base_url, event_rx, server)
+    }
+
+    #[cfg(unix)]
+    #[derive(Clone, Copy)]
+    enum InitialFailureCase {
+        Generic,
+        HardTimeout,
+        AgentExited,
+    }
+
+    struct MetricTaskDropSignal(Arc<AtomicBool>);
+
+    impl Drop for MetricTaskDropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[cfg(unix)]
+    async fn run_initial_failure_case(
+        case: InitialFailureCase,
+        with_usage: bool,
+    ) -> (
+        PromptOutcome,
+        Vec<buzz_core::agent_turn_metric::AgentTurnMetricPayload>,
+    ) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (base_url, mut event_rx, server) = spawn_metric_capture_server().await;
+        let behavior = match (case, with_usage) {
+            (InitialFailureCase::Generic, true) => {
+                r#"printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"stopReason":null,"usage":{"inputTokens":10,"outputTokens":2,"totalTokens":14,"cachedReadTokens":2}}}'"#
+            }
+            (InitialFailureCase::HardTimeout, true) => {
+                r#"printf '%s\n' '{"jsonrpc":"2.0","method":"_goose/unstable/session/update","params":{"sessionId":"failed-initial-session","update":{"sessionUpdate":"usage_update","accumulatedInputTokens":10,"accumulatedOutputTokens":2,"accumulatedCost":0.1}}}'
+sleep 5"#
+            }
+            (InitialFailureCase::AgentExited, true) => {
+                r#"printf '%s\n' '{"jsonrpc":"2.0","method":"_goose/unstable/session/update","params":{"sessionId":"failed-initial-session","update":{"sessionUpdate":"usage_update","accumulatedInputTokens":10,"accumulatedOutputTokens":2,"accumulatedCost":0.1}}}'
+exit 0"#
+            }
+            (InitialFailureCase::Generic, false) => {
+                r#"printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"stopReason":null}}'"#
+            }
+            (InitialFailureCase::HardTimeout, false) => "sleep 5",
+            (InitialFailureCase::AgentExited, false) => "exit 0",
+        };
+        let script = r#"#!/bin/sh
+count=0
+while IFS= read -r line; do
+  case "$count" in
+    0)
+      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"sessionId":"failed-initial-session"}}'
+      ;;
+    1)
+__TURN_BEHAVIOR__
+      ;;
+    *)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$count"
+      ;;
+  esac
+  count=$((count + 1))
+done
+"#
+        .replace("__TURN_BEHAVIOR__", behavior);
+        let adapter_dir = tempfile::tempdir().expect("create failure adapter dir");
+        let adapter_path = adapter_dir.path().join("opencode");
+        std::fs::write(&adapter_path, script).expect("write failure adapter");
+        let mut permissions = std::fs::metadata(&adapter_path)
+            .expect("failure adapter metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&adapter_path, permissions).expect("chmod failure adapter");
+
+        let acp = AcpClient::spawn(
+            adapter_path.to_str().expect("adapter path is UTF-8"),
+            &[],
+            &[],
+            false,
+            None,
+        )
+        .await
+        .expect("spawn failure adapter");
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "OpenCode".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+            session_close_supported: true,
+        };
+        let agent_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let mut ctx = make_prompt_context_with_owner(&agent_keys, owner_keys.public_key());
+        ctx.initial_message = Some("initialize the session".into());
+        ctx.harness_name = "opencode".into();
+        ctx.rest_client.base_url = base_url.clone();
+        ctx.idle_timeout = Duration::from_secs(2);
+        ctx.max_turn_duration = match case {
+            InitialFailureCase::HardTimeout => Duration::from_millis(100),
+            _ => Duration::from_secs(2),
+        };
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                ChannelInfo {
+                    name: "failure-accounting".into(),
+                    channel_type: "stream".into(),
+                },
+            )]),
+            RestClient {
+                http: reqwest::Client::new(),
+                base_url,
+                keys: agent_keys,
+                auth_tag_json: None,
+            },
+        );
+        let event = EventBuilder::new(Kind::Custom(9), "run after bootstrap")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let batch = FlushBatch {
+            channel_id,
+            root: None,
+            events: vec![crate::queue::BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let metric_tasks = MetricTaskSet::default();
+        run_prompt_task(
+            agent,
+            Some(batch),
+            None,
+            Arc::new(ctx),
+            metric_tasks.clone(),
+            result_tx,
+            None,
+            "failed-bootstrap-turn".into(),
+        )
+        .await;
+        metric_tasks.shutdown().await;
+        let mut result = result_rx.recv().await.expect("failure prompt result");
+        result.agent.acp.shutdown().await;
+        server.abort();
+
+        let mut metrics = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if event.kind == Kind::Custom(buzz_core::kind::KIND_AGENT_TURN_METRIC as u16) {
+                metrics.push(
+                    buzz_core::agent_turn_metric::decrypt_agent_turn_metric(&owner_keys, &event)
+                        .expect("decrypt failure metric"),
+                );
+            }
+        }
+        (result.outcome, metrics)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initial_generic_error_publishes_usage_before_reclaim() {
+        let (outcome, metrics) = run_initial_failure_case(InitialFailureCase::Generic, true).await;
+        assert!(matches!(
+            outcome,
+            PromptOutcome::Error(AcpError::Protocol(_))
+        ));
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(
+            metrics[0].turn_id.as_deref(),
+            Some("failed-bootstrap-turn:initial")
+        );
+        assert_eq!(
+            metrics[0].stop_reason,
+            Some(buzz_core::agent_turn_metric::StopReason::Error)
+        );
+        assert_eq!(metrics[0].turn.as_ref().unwrap().input_tokens, Some(12));
+        assert_eq!(metrics[0].turn.as_ref().unwrap().output_tokens, Some(2));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initial_hard_timeout_publishes_usage_before_cleanup() {
+        let (outcome, metrics) =
+            run_initial_failure_case(InitialFailureCase::HardTimeout, true).await;
+        assert!(matches!(
+            outcome,
+            PromptOutcome::Timeout(TimeoutKind::Hard { .. })
+        ));
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(
+            metrics[0].stop_reason,
+            Some(buzz_core::agent_turn_metric::StopReason::Error)
+        );
+        assert_eq!(metrics[0].turn.as_ref().unwrap().input_tokens, Some(10));
+        assert_eq!(metrics[0].turn.as_ref().unwrap().output_tokens, Some(2));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initial_agent_exit_publishes_usage_before_cleanup() {
+        let (outcome, metrics) =
+            run_initial_failure_case(InitialFailureCase::AgentExited, true).await;
+        assert!(matches!(outcome, PromptOutcome::AgentExited));
+        assert_eq!(metrics.len(), 1);
+        assert_eq!(
+            metrics[0].stop_reason,
+            Some(buzz_core::agent_turn_metric::StopReason::Error)
+        );
+        assert_eq!(metrics[0].turn.as_ref().unwrap().input_tokens, Some(10));
+        assert_eq!(metrics[0].turn.as_ref().unwrap().output_tokens, Some(2));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initial_failure_without_usage_publishes_no_metric() {
+        for case in [
+            InitialFailureCase::Generic,
+            InitialFailureCase::HardTimeout,
+            InitialFailureCase::AgentExited,
+        ] {
+            let (_, metrics) = run_initial_failure_case(case, false).await;
+            assert!(metrics.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initial_metric_is_nonblocking_and_drained_during_shutdown() {
+        use std::os::unix::fs::PermissionsExt;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind metric capture server");
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel::<nostr::Event>();
+        let (first_metric_tx, first_metric_rx) = tokio::sync::oneshot::channel();
+        let (release_first_metric_tx, release_first_metric_rx) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let mut first_metric_tx = Some(first_metric_tx);
+            let mut release_first_metric_rx = Some(release_first_metric_rx);
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let header_end = loop {
+                    if let Some(index) = request.windows(4).position(|window| window == b"\r\n\r\n")
+                    {
+                        break index + 4;
+                    }
+                    let read = socket.read(&mut chunk).await.expect("read request headers");
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                };
+                let (path, content_length) = {
+                    let headers = String::from_utf8_lossy(&request[..header_end]);
+                    let path = headers
+                        .lines()
+                        .next()
+                        .and_then(|line| line.split_whitespace().nth(1))
+                        .unwrap_or("/")
+                        .to_string();
+                    let content_length = headers
+                        .lines()
+                        .find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length")
+                                .then(|| value.trim().parse::<usize>().ok())
+                                .flatten()
+                        })
+                        .unwrap_or(0);
+                    (path, content_length)
+                };
+                while request.len() < header_end + content_length {
+                    let read = socket.read(&mut chunk).await.expect("read request body");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                }
+                let response_body = if path == "/events" {
+                    let body = &request[header_end..header_end + content_length];
+                    let event: nostr::Event =
+                        serde_json::from_slice(body).expect("submitted event is valid");
+                    let is_metric =
+                        event.kind == Kind::Custom(buzz_core::kind::KIND_AGENT_TURN_METRIC as u16);
+                    let _ = event_tx.send(event);
+                    if is_metric && first_metric_tx.is_some() {
+                        let first_metric_tx = first_metric_tx.take().expect("checked above");
+                        let _ = first_metric_tx.send(());
+                        if let Some(release) = release_first_metric_rx.take() {
+                            tokio::spawn(async move {
+                                let _ = release.await;
+                                let response = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}";
+                                socket
+                                    .write_all(response.as_bytes())
+                                    .await
+                                    .expect("write delayed metric response");
+                            });
+                            continue;
+                        }
+                    }
+                    "{}"
+                } else if path == "/count" {
+                    r#"{"count":0}"#
+                } else {
+                    "[]"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    response_body.len(),
+                    response_body
+                );
+                socket
+                    .write_all(response.as_bytes())
+                    .await
+                    .expect("write capture response");
+            }
+        });
+
+        let adapter_dir = tempfile::tempdir().expect("create adapter dir");
+        let adapter_path = adapter_dir.path().join("opencode");
+        let user_prompt_marker = adapter_dir.path().join("user-prompt-started");
+        let adapter_script =
+            r#"#!/bin/sh
+count=0
+while IFS= read -r line; do
+  case "$count" in
+    0)
+      printf '%s\n' '{"jsonrpc":"2.0","id":0,"result":{"sessionId":"metric-session"}}'
+      ;;
+    1)
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"metric-session","update":{"sessionUpdate":"usage_update","used":12,"size":200000,"cost":{"amount":0.1,"currency":"USD"}}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"stopReason":"future_terminal_reason","usage":{"inputTokens":10,"outputTokens":3,"totalTokens":15,"cachedReadTokens":2}}}'
+      ;;
+    2)
+      : > "__USER_PROMPT_MARKER__"
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"metric-session","update":{"sessionUpdate":"usage_update","used":24,"size":200000,"cost":{"amount":0.25,"currency":"USD"}}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn","usage":{"inputTokens":20,"outputTokens":4,"totalTokens":24}}}'
+      ;;
+  esac
+  count=$((count + 1))
+done
+"#
+            .replace(
+                "__USER_PROMPT_MARKER__",
+                &user_prompt_marker.to_string_lossy(),
+            );
+        std::fs::write(&adapter_path, adapter_script).expect("write fake OpenCode adapter");
+        let mut permissions = std::fs::metadata(&adapter_path)
+            .expect("adapter metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&adapter_path, permissions).expect("chmod fake adapter");
+
+        let acp = AcpClient::spawn(
+            adapter_path.to_str().expect("adapter path is UTF-8"),
+            &[],
+            &[],
+            false,
+            None,
+        )
+        .await
+        .expect("spawn fake OpenCode adapter");
+        let mut agent = OwnedAgent {
+            index: 0,
+            acp,
+            state: SessionState::default(),
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            agent_name: "OpenCode".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 1,
+            session_close_supported: true,
+        };
+
+        let agent_keys = Keys::generate();
+        let owner_keys = Keys::generate();
+        let channel_id = Uuid::new_v4();
+        let mut ctx = make_prompt_context_with_owner(&agent_keys, owner_keys.public_key());
+        ctx.initial_message = Some("initialize the session".into());
+        ctx.harness_name = "opencode".into();
+        ctx.rest_client.base_url = base_url.clone();
+        ctx.channel_info = ChannelInfoResolver::new(
+            HashMap::from([(
+                channel_id,
+                ChannelInfo {
+                    name: "accounting".into(),
+                    channel_type: "stream".into(),
+                },
+            )]),
+            RestClient {
+                http: reqwest::Client::new(),
+                base_url,
+                keys: agent_keys,
+                auth_tag_json: None,
+            },
+        );
+        let event = EventBuilder::new(Kind::Custom(9), "run the actual turn")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let batch = FlushBatch {
+            channel_id,
+            root: None,
+            events: vec![crate::queue::BatchEvent {
+                event,
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let metric_tasks = MetricTaskSet::default();
+        let shutdown_metric_tasks = metric_tasks.clone();
+
+        let prompt_task = tokio::spawn(run_prompt_task(
+            agent,
+            Some(batch),
+            None,
+            Arc::new(ctx),
+            metric_tasks,
+            result_tx,
+            None,
+            "published-turn".into(),
+        ));
+        tokio::time::timeout(Duration::from_secs(2), first_metric_rx)
+            .await
+            .expect("initial metric request")
+            .expect("metric server remained available");
+        let user_prompt_started = tokio::time::timeout(Duration::from_secs(1), async {
+            while !user_prompt_marker.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .is_ok();
+        assert!(
+            user_prompt_started,
+            "queued user prompt must start while initial metric publication is blocked"
+        );
+        let metric_shutdown = tokio::spawn(async move {
+            shutdown_metric_tasks.shutdown().await;
+        });
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(
+            !metric_shutdown.is_finished(),
+            "pool shutdown must own and drain an in-flight metric task"
+        );
+        let _ = release_first_metric_tx.send(());
+        tokio::time::timeout(Duration::from_secs(2), metric_shutdown)
+            .await
+            .expect("metric shutdown drain")
+            .expect("metric shutdown task");
+        prompt_task.await.expect("prompt task");
+        let result = result_rx.recv().await.expect("prompt result");
+        assert!(matches!(
+            result.outcome,
+            PromptOutcome::Ok(StopReason::EndTurn)
+        ));
+        agent = result.agent;
+        agent.acp.shutdown().await;
+        server.abort();
+
+        let mut metrics = Vec::new();
+        while let Ok(event) = event_rx.try_recv() {
+            if event.kind == Kind::Custom(buzz_core::kind::KIND_AGENT_TURN_METRIC as u16) {
+                metrics.push(
+                    buzz_core::agent_turn_metric::decrypt_agent_turn_metric(&owner_keys, &event)
+                        .expect("decrypt captured metric"),
+                );
+            }
+        }
+        metrics.sort_by_key(|metric| metric.turn_seq);
+        assert_eq!(metrics.len(), 2, "initial and user turns must both publish");
+
+        let initial = &metrics[0];
+        assert_eq!(initial.turn_id.as_deref(), Some("published-turn:initial"));
+        assert_eq!(initial.turn_seq, Some(1));
+        assert_eq!(initial.turn.as_ref().unwrap().input_tokens, Some(12));
+        assert_eq!(initial.turn.as_ref().unwrap().output_tokens, Some(3));
+        assert_eq!(initial.turn.as_ref().unwrap().total_tokens, None);
+        assert_eq!(initial.turn.as_ref().unwrap().cost_usd, Some(0.1));
+        assert_eq!(
+            initial.stop_reason,
+            Some(buzz_core::agent_turn_metric::StopReason::Unknown)
+        );
+
+        let user = &metrics[1];
+        assert_eq!(user.turn_id.as_deref(), Some("published-turn"));
+        assert_eq!(user.turn_seq, Some(2));
+        assert_eq!(user.turn.as_ref().unwrap().input_tokens, Some(20));
+        assert_eq!(user.turn.as_ref().unwrap().output_tokens, Some(4));
+        assert_eq!(user.turn.as_ref().unwrap().total_tokens, None);
+        let cost = user.turn.as_ref().unwrap().cost_usd.unwrap();
+        assert!((cost - 0.15).abs() < 1e-12);
+        assert_eq!(user.cumulative.as_ref().unwrap().cost_usd, Some(0.25));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn metric_task_set_cancels_a_task_that_exceeds_shutdown_grace() {
+        let metric_tasks = MetricTaskSet::default();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let dropped_in_task = Arc::clone(&dropped);
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        metric_tasks.spawn(async move {
+            let _drop_signal = MetricTaskDropSignal(dropped_in_task);
+            let _ = started_tx.send(());
+            std::future::pending::<()>().await;
+        });
+        started_rx.await.expect("metric task started");
+
+        let shutdown_tasks = metric_tasks.clone();
+        let shutdown = tokio::spawn(async move {
+            shutdown_tasks.shutdown().await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!shutdown.is_finished());
+        tokio::time::advance(METRIC_TASK_DRAIN_GRACE + Duration::from_millis(1)).await;
+        shutdown.await.expect("metric shutdown task");
+        assert!(
+            dropped.load(Ordering::SeqCst),
+            "hung metric task must be explicitly cancelled after drain grace"
+        );
     }
 
     #[test]
@@ -6763,6 +7564,7 @@ done"#
         ctx.base_prompt = Some("standing-once");
         let ctx = Arc::new(ctx);
         let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let metric_tasks = MetricTaskSet::default();
 
         for turn in 1..=3 {
             run_prompt_task(
@@ -6770,6 +7572,7 @@ done"#
                 None,
                 Some(format!("heartbeat-{turn}")),
                 Arc::clone(&ctx),
+                metric_tasks.clone(),
                 result_tx.clone(),
                 None,
                 format!("turn-{turn}"),
@@ -6877,6 +7680,7 @@ done"#
         ctx.base_prompt = Some("standing-once");
         let ctx = Arc::new(ctx);
         let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let metric_tasks = MetricTaskSet::default();
 
         for turn in 1..=3 {
             let event = EventBuilder::new(Kind::Custom(9), format!("channel-{turn}"))
@@ -6899,6 +7703,7 @@ done"#
                 Some(batch),
                 None,
                 Arc::clone(&ctx),
+                metric_tasks.clone(),
                 result_tx.clone(),
                 None,
                 format!("turn-{turn}"),
@@ -7085,6 +7890,7 @@ done"#
         );
         let ctx = Arc::new(ctx);
         let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let metric_tasks = MetricTaskSet::default();
 
         for (turn_id, batch) in [("merged-turn", merged_batch), ("next-turn", next_batch)] {
             run_prompt_task(
@@ -7092,6 +7898,7 @@ done"#
                 Some(batch),
                 None,
                 Arc::clone(&ctx),
+                metric_tasks.clone(),
                 result_tx.clone(),
                 None,
                 turn_id.into(),
@@ -7258,11 +8065,13 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             },
         );
         let (result_tx, mut result_rx) = mpsc::unbounded_channel();
+        let metric_tasks = MetricTaskSet::default();
         run_prompt_task(
             agent,
             Some(batch),
             None,
             Arc::new(ctx),
+            metric_tasks,
             result_tx,
             None,
             "next-turn".into(),
@@ -8809,6 +9618,10 @@ sleep 1
             CoreStop::Unknown
         );
         assert_eq!(acp_stop_to_core(&StopReason::Refusal), CoreStop::Unknown);
+        assert_eq!(
+            acp_stop_to_core(&StopReason::Unknown("future_reason".into())),
+            CoreStop::Unknown
+        );
     }
 
     /// `publish_agent_turn_metric` is a no-op when `usage` is `None`.
