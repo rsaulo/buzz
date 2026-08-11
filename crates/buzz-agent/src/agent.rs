@@ -38,6 +38,11 @@ const MAX_TOKENS_RECOVERY_MESSAGE: &str = "Your previous response exceeded the m
 /// finite so a persistently truncating model eventually surfaces `max_tokens`.
 const MAX_TOKENS_RECOVERIES_PER_RUN: u32 = 2;
 
+pub(crate) struct SteerMessage {
+    pub blocks: Vec<ContentBlock>,
+    pub delivered: tokio::sync::oneshot::Sender<()>,
+}
+
 /// Remove image blocks that the provider has explicitly rejected while keeping
 /// their surrounding tool result (and therefore the tool-call/result pairing)
 /// intact. Returns the number of images removed; zero means the provider error
@@ -155,7 +160,7 @@ pub struct RunCtx<'a> {
     /// LLM call): queued messages are appended to history as user turns so the
     /// model sees them on its next request, without restarting the turn. Fed by
     /// the `_goose/unstable/session/steer` handler.
-    pub steer: &'a mut mpsc::UnboundedReceiver<Vec<ContentBlock>>,
+    pub steer: &'a mut mpsc::UnboundedReceiver<SteerMessage>,
     pub history: &'a mut Vec<HistoryItem>,
     pub original_task: &'a mut Option<String>,
     pub handoff_count: &'a mut usize,
@@ -700,6 +705,11 @@ impl RunCtx<'_> {
                 let stop = map_stop(response.stop);
                 // Only gate genuine end_turn — don't override max_tokens/refusal.
                 if stop == StopReason::EndTurn {
+                    // A steer accepted while the final provider request was in
+                    // flight forces another round instead of being discarded.
+                    if self.drain_steers() > 0 {
+                        continue;
+                    }
                     if stop_rejections >= self.cfg.stop_max_rejections {
                         return Ok(stop);
                     }
@@ -762,11 +772,15 @@ impl RunCtx<'_> {
     /// steer whose blocks all fail to render (e.g. unsupported content) is
     /// skipped rather than aborting the turn — steering is best-effort
     /// augmentation, not a hard input contract like the initial prompt.
-    fn drain_steers(&mut self) {
-        while let Ok(blocks) = self.steer.try_recv() {
+    fn drain_steers(&mut self) -> usize {
+        let mut drained = 0;
+        while let Ok(message) = self.steer.try_recv() {
+            let SteerMessage { blocks, delivered } = message;
             match prompt_to_text(blocks) {
                 Ok(text) if !text.trim().is_empty() => {
                     self.history.push(HistoryItem::User(text));
+                    drained += 1;
+                    let _ = delivered.send(());
                 }
                 Ok(_) => {
                     tracing::debug!("dropping empty steer message");
@@ -776,6 +790,7 @@ impl RunCtx<'_> {
                 }
             }
         }
+        drained
     }
 
     /// Unified tool-call execution. Three phases:

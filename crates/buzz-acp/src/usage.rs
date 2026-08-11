@@ -31,7 +31,7 @@
 //! The `TurnUsage` produced after each turn is consumed by the
 //! `TurnCompletionGuard` in `pool.rs` to publish a kind 44200 relay event.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 /// Wire-format deserialization for `_goose/unstable/session/update` params.
 ///
@@ -183,8 +183,9 @@ struct SessionState {
 
 /// Per-turn usage record exposed to `TurnCompletionGuard` for NIP-AM publishing.
 ///
-/// `turn_*` fields are `None` when delta is unreliable (first turn or counter
-/// decrease). `cumulative_*` fields are always present when the agent reports them.
+/// `turn_*` fields are `None` when delta is unreliable. Input/output cumulative
+/// fields also become `None` permanently after an absent or decreasing snapshot,
+/// because the session prefix can no longer be proven.
 #[derive(Debug, Clone)]
 pub struct TurnUsage {
     /// Goose session id (maps to NIP-AM `sessionId`).
@@ -267,7 +268,7 @@ pub struct TurnUsage {
 ///    baseline so the next `record()` call measures from here.
 #[derive(Debug, Default)]
 pub(crate) struct UsageTracker {
-    /// One entry per goose `sessionId` ever seen in this process.
+    /// One entry per live goose `sessionId` seen in this process.
     sessions: HashMap<String, SessionState>,
     /// The session that currently has an in-flight `session/prompt`.
     /// `None` means no prompt is in flight; `record()` will still update
@@ -299,6 +300,13 @@ pub(crate) struct UsageTracker {
     /// Per-in-flight-turn fold accumulator for output-field absence.
     /// Symmetric contract to `input_absence_observed`.
     output_absence_observed: bool,
+    /// True while `session/new` is being read. Notifications observed in this
+    /// window belong to the new generation and must survive zero-baseline seed.
+    session_creation_in_progress: bool,
+    /// Buffered because the response's session ID is the only authority that
+    /// distinguishes the new generation from a sibling's trailing update.
+    session_creation_updates: HashMap<String, Vec<UsageUpdatePayload>>,
+    session_creation_baselines: HashSet<String>,
 }
 
 impl UsageTracker {
@@ -406,6 +414,13 @@ impl UsageTracker {
     ///    latched into this session's `*_ever_poisoned` state — the sticky-absence
     ///    contract has no cross-session exemption.
     pub(crate) fn record(&mut self, session_id: &str, payload: &UsageUpdatePayload) {
+        if self.session_creation_in_progress {
+            self.session_creation_updates
+                .entry(session_id.to_string())
+                .or_default()
+                .push(payload.clone());
+            return;
+        }
         let current_input = payload.accumulated_input_tokens;
         let current_output = payload.accumulated_output_tokens;
         let current_cost = payload.accumulated_cost;
@@ -438,10 +453,23 @@ impl UsageTracker {
             }
         }
 
-        let (delta_reliable, turn_input, turn_output, turn_cost, turn_seq) = match self
-            .sessions
-            .get(session_id)
-        {
+        let previous = self.sessions.get(session_id);
+        let input_decreased = previous.is_some_and(|state| {
+            matches!((current_input, state.last_input), (Some(current), Some(last)) if current < last)
+        });
+        let output_decreased = previous.is_some_and(|state| {
+            matches!((current_output, state.last_output), (Some(current), Some(last)) if current < last)
+        });
+        let input_poisoned = previous.is_some_and(|state| state.input_ever_poisoned)
+            || (is_in_flight && self.input_absence_observed)
+            || current_input.is_none()
+            || input_decreased;
+        let output_poisoned = previous.is_some_and(|state| state.output_ever_poisoned)
+            || (is_in_flight && self.output_absence_observed)
+            || current_output.is_none()
+            || output_decreased;
+
+        let (delta_reliable, turn_input, turn_output, turn_cost, turn_seq) = match previous {
             None => {
                 // First notification for this session — no baseline yet.
                 (false, None, None, None, 1u64)
@@ -463,12 +491,6 @@ impl UsageTracker {
                 //   2. The per-turn fold accumulator (captures absences seen
                 //      earlier in THIS turn before take() commits them).
                 //   3. Whether THIS notification is itself absent.
-                let this_input_absent = current_input.is_none();
-                let this_output_absent = current_output.is_none();
-                let input_poisoned =
-                    prev.input_ever_poisoned || self.input_absence_observed || this_input_absent;
-                let output_poisoned =
-                    prev.output_ever_poisoned || self.output_absence_observed || this_output_absent;
                 if input_poisoned || output_poisoned {
                     (false, None, None, None, seq)
                 } else {
@@ -587,8 +609,12 @@ impl UsageTracker {
                 turn_cost_usd: turn_cost,
                 turn_cache_read_tokens: turn_cache_read,
                 turn_cache_write_tokens: turn_cache_write,
-                cumulative_input_tokens: current_input,
-                cumulative_output_tokens: current_output,
+                cumulative_input_tokens: if input_poisoned { None } else { current_input },
+                cumulative_output_tokens: if output_poisoned {
+                    None
+                } else {
+                    current_output
+                },
                 cumulative_total_tokens: current_total,
                 cumulative_cost_usd: current_cost,
                 cumulative_cache_read_tokens: current_cached_input,
@@ -605,11 +631,8 @@ impl UsageTracker {
             // before the first `begin_turn`.
             //
             // Carry forward any existing sticky-poison flags (they only grow).
-            let existing = self.sessions.get(session_id);
-            let input_ever_poisoned =
-                existing.is_some_and(|s| s.input_ever_poisoned) || current_input.is_none();
-            let output_ever_poisoned =
-                existing.is_some_and(|s| s.output_ever_poisoned) || current_output.is_none();
+            let input_ever_poisoned = input_poisoned;
+            let output_ever_poisoned = output_poisoned;
             self.sessions.insert(
                 session_id.to_string(),
                 SessionState {
@@ -617,8 +640,16 @@ impl UsageTracker {
                         Some(s) => s.published_seq,
                         None => 0,
                     },
-                    last_input: current_input,
-                    last_output: current_output,
+                    last_input: if input_ever_poisoned {
+                        None
+                    } else {
+                        current_input
+                    },
+                    last_output: if output_ever_poisoned {
+                        None
+                    } else {
+                        current_output
+                    },
                     last_cost: current_cost,
                     last_total: current_total,
                     last_cached_input: current_cached_input,
@@ -634,14 +665,10 @@ impl UsageTracker {
             // But the sticky-absence contract has no cross-session exemption: if
             // this notification is absent, that observation must survive into X's
             // next in-flight turn even though the record is otherwise discarded.
-            let input_absent = current_input.is_none();
-            let output_absent = current_output.is_none();
-            if input_absent || output_absent {
+            if input_poisoned || output_poisoned {
                 let existing = self.sessions.get(session_id);
-                let input_ever_poisoned =
-                    existing.is_some_and(|s| s.input_ever_poisoned) || input_absent;
-                let output_ever_poisoned =
-                    existing.is_some_and(|s| s.output_ever_poisoned) || output_absent;
+                let input_ever_poisoned = input_poisoned;
+                let output_ever_poisoned = output_poisoned;
                 let (published_seq, last_input, last_output, last_cost, last_total, lci, lcw) =
                     match existing {
                         Some(s) => (
@@ -673,6 +700,37 @@ impl UsageTracker {
         }
     }
 
+    pub(crate) fn begin_session_creation(&mut self) {
+        // Session creation is only valid between turns. If a prior terminal
+        // path left accounting open, settle its baseline before buffering setup
+        // notifications for a different generation.
+        if self.in_flight_session.is_some() {
+            let _ = self.take();
+        }
+        self.session_creation_updates.clear();
+        self.session_creation_baselines.clear();
+        self.session_creation_in_progress = true;
+    }
+
+    pub(crate) fn end_session_creation(&mut self, keep_session_id: Option<&str>) {
+        self.session_creation_in_progress = false;
+        let buffered = std::mem::take(&mut self.session_creation_updates);
+        for (session_id, updates) in buffered {
+            let is_new_generation = Some(session_id.as_str()) == keep_session_id;
+            if is_new_generation {
+                // Fence textual ID reuse only after the response proves which
+                // ID belongs to the newly-created generation.
+                self.sessions.remove(&session_id);
+            }
+            for update in updates {
+                self.record(&session_id, &update);
+            }
+            if is_new_generation {
+                self.session_creation_baselines.insert(session_id);
+            }
+        }
+    }
+
     /// Seed a zero baseline for a session that buzz-acp just spawned.
     ///
     /// When buzz-acp creates a session itself via `session/new`, the session's
@@ -687,12 +745,20 @@ impl UsageTracker {
     /// genuinely unknown — that case correctly stays fail-closed with the
     /// existing no-baseline behavior.
     ///
-    /// No-op if a baseline for this session already exists (guards against
-    /// accidental double-seeding across session rotation).
+    /// Replaces any prior baseline for the textual ID. A successful
+    /// `session/new` is a new generation even if an adapter reuses an ID.
     pub(crate) fn seed_zero_baseline(&mut self, session_id: &str) {
-        self.sessions
-            .entry(session_id.to_string())
-            .or_insert(SessionState {
+        if self.session_creation_baselines.remove(session_id) {
+            if let Some(state) = self.sessions.get_mut(session_id) {
+                state.published_seq = 0;
+                self.session_creation_baselines.clear();
+                return;
+            }
+        }
+        self.session_creation_baselines.clear();
+        self.sessions.insert(
+            session_id.to_string(),
+            SessionState {
                 published_seq: 0,
                 last_input: Some(0),
                 last_output: Some(0),
@@ -709,7 +775,36 @@ impl UsageTracker {
                 // start clear and are set only if a subsequent snapshot is absent.
                 input_ever_poisoned: false,
                 output_ever_poisoned: false,
-            });
+            },
+        );
+    }
+
+    /// Forget all accounting state for a session that was closed successfully.
+    ///
+    /// Session IDs are generation fences. Retaining a closed generation would
+    /// leak memory and could let an accidentally reused ID inherit stale token
+    /// counters. The normal caller closes only idle sessions, but clearing the
+    /// matching transient state keeps this operation safe if that invariant
+    /// changes later.
+    pub(crate) fn remove_session(&mut self, session_id: &str) {
+        if self.in_flight_session.as_deref() == Some(session_id) {
+            debug_assert!(false, "cannot remove usage for an in-flight session");
+            return;
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|usage| usage.session_id == session_id)
+        {
+            debug_assert!(false, "pending usage must belong to the in-flight session");
+            return;
+        }
+        self.sessions.remove(session_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_session(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id)
     }
 
     /// Consume and return the most recently computed turn usage record, then
@@ -968,6 +1063,28 @@ mod tests {
         assert_eq!(a2.cumulative_output_tokens, Some(250));
     }
 
+    #[test]
+    fn in_flight_absence_does_not_poison_healthy_sibling() {
+        let mut tracker = UsageTracker::default();
+        tracker.seed_zero_baseline("sibling");
+        tracker.begin_turn("sibling");
+        tracker.record("sibling", &payload(100, 10, None));
+        let _ = tracker.take();
+
+        tracker.begin_turn("active");
+        tracker.record("active", &payload_opt(None, Some(5)));
+        tracker.record("sibling", &payload(150, 15, None));
+        let _ = tracker.take();
+
+        tracker.begin_turn("sibling");
+        tracker.record("sibling", &payload(200, 20, None));
+        let usage = tracker.take().expect("healthy sibling turn");
+        assert!(usage.delta_reliable);
+        assert_eq!(usage.turn_input_tokens, Some(100));
+        assert_eq!(usage.turn_output_tokens, Some(10));
+        assert_eq!(usage.cumulative_input_tokens, Some(200));
+    }
+
     // ── Delta computation: non-happy paths ─────────────────────────────────
 
     #[test]
@@ -1013,6 +1130,15 @@ mod tests {
         assert!(usage.turn_input_tokens.is_none(), "no negative delta");
         assert!(usage.turn_output_tokens.is_none(), "no negative delta");
         assert!(usage.turn_cost_usd.is_none());
+        assert!(usage.cumulative_input_tokens.is_none());
+        assert!(usage.cumulative_output_tokens.is_none());
+
+        tracker.begin_turn("sess-2");
+        tracker.record("sess-2", &payload(200, 75, Some(0.002)));
+        let next = tracker.take().expect("next poisoned turn");
+        assert!(!next.delta_reliable, "counter reset poison must not heal");
+        assert!(next.cumulative_input_tokens.is_none());
+        assert!(next.cumulative_output_tokens.is_none());
     }
 
     #[test]
@@ -2045,10 +2171,10 @@ mod tests {
         );
     }
 
-    /// seed_zero_baseline is a no-op when a baseline already exists — guards
-    /// against accidental double-seeding across session rotation.
+    /// A successful `session/new` starts a fresh generation even when an
+    /// adapter reuses the same textual session ID.
     #[test]
-    fn seed_zero_baseline_is_noop_when_baseline_already_exists() {
+    fn seed_zero_baseline_replaces_an_old_generation() {
         let mut tracker = UsageTracker::default();
         // Establish a real baseline via turn 1.
         tracker.seed_zero_baseline("sess-noop");
@@ -2056,21 +2182,125 @@ mod tests {
         tracker.record("sess-noop", &payload(1000, 200, None));
         let _ = tracker.take();
 
-        // A second seed call (e.g. a bug in pool.rs) must not reset the baseline.
+        // Simulate a new `session/new` returning the same textual ID.
         tracker.seed_zero_baseline("sess-noop");
 
-        // Turn 2 delta must still measure from the real baseline (1000/200), not zero.
+        // The reused ID starts at sequence 1 and measures from known zero.
         tracker.begin_turn("sess-noop");
         tracker.record("sess-noop", &payload(1500, 300, None));
         let usage = tracker.take().expect("pending");
 
         assert!(usage.delta_reliable);
-        assert_eq!(
-            usage.turn_input_tokens,
-            Some(500),
-            "baseline must not have been reset to zero by the second seed call"
-        );
-        assert_eq!(usage.turn_output_tokens, Some(100));
+        assert_eq!(usage.turn_seq, 1);
+        assert_eq!(usage.turn_input_tokens, Some(1500));
+        assert_eq!(usage.turn_output_tokens, Some(300));
+    }
+
+    #[test]
+    fn session_new_setup_snapshot_survives_generation_seed() {
+        let mut tracker = UsageTracker::default();
+        // A stale generation with the same textual ID must not influence the
+        // setup snapshot emitted by the replacement generation.
+        tracker.seed_zero_baseline("sess-reused");
+        tracker.begin_turn("sess-reused");
+        tracker.record("sess-reused", &payload(900, 90, None));
+        let _ = tracker.take();
+
+        tracker.begin_session_creation();
+        tracker.record("sess-reused", &payload(100, 10, None));
+        tracker.end_session_creation(Some("sess-reused"));
+        tracker.seed_zero_baseline("sess-reused");
+
+        tracker.begin_turn("sess-reused");
+        tracker.record("sess-reused", &payload(150, 15, None));
+        let usage = tracker.take().expect("first user turn");
+
+        assert!(usage.delta_reliable);
+        assert_eq!(usage.turn_seq, 1);
+        assert_eq!(usage.turn_input_tokens, Some(50));
+        assert_eq!(usage.turn_output_tokens, Some(5));
+    }
+
+    #[test]
+    fn session_new_window_preserves_live_sibling_baseline() {
+        let mut tracker = UsageTracker::default();
+        tracker.seed_zero_baseline("sibling");
+        tracker.begin_turn("sibling");
+        tracker.record("sibling", &payload(1_000, 100, None));
+        let _ = tracker.take();
+
+        tracker.begin_session_creation();
+        tracker.record("sibling", &payload(1_100, 110, None));
+        tracker.record("new-session", &payload(50, 5, None));
+        tracker.end_session_creation(Some("new-session"));
+        tracker.seed_zero_baseline("new-session");
+
+        tracker.begin_turn("sibling");
+        tracker.record("sibling", &payload(1_200, 120, None));
+        let sibling = tracker.take().expect("sibling turn");
+        assert!(sibling.delta_reliable);
+        assert_eq!(sibling.turn_seq, 2);
+        assert_eq!(sibling.turn_input_tokens, Some(100));
+        assert_eq!(sibling.turn_output_tokens, Some(10));
+
+        tracker.begin_turn("new-session");
+        tracker.record("new-session", &payload(75, 8, None));
+        let new_session = tracker.take().expect("new session turn");
+        assert!(new_session.delta_reliable);
+        assert_eq!(new_session.turn_seq, 1);
+        assert_eq!(new_session.turn_input_tokens, Some(25));
+        assert_eq!(new_session.turn_output_tokens, Some(3));
+    }
+
+    #[test]
+    fn session_creation_settles_stale_turn_before_replaying_setup_snapshot() {
+        let mut tracker = UsageTracker::default();
+        tracker.seed_zero_baseline("previous");
+        tracker.begin_turn("previous");
+        tracker.record("previous", &payload(100, 10, None));
+        // Deliberately omit take(): begin_session_creation must settle it.
+
+        tracker.begin_session_creation();
+        tracker.record("new-session", &payload(20, 2, None));
+        tracker.end_session_creation(Some("new-session"));
+        tracker.seed_zero_baseline("new-session");
+
+        tracker.begin_turn("new-session");
+        tracker.record("new-session", &payload(30, 3, None));
+        let usage = tracker.take().expect("new session turn");
+        assert!(usage.delta_reliable);
+        assert_eq!(usage.turn_input_tokens, Some(10));
+        assert_eq!(usage.turn_output_tokens, Some(1));
+    }
+
+    #[test]
+    fn remove_session_clears_only_the_closed_generation() {
+        let mut tracker = UsageTracker::default();
+        tracker.seed_zero_baseline("sess-closed");
+        tracker.seed_zero_baseline("sess-live");
+        tracker.begin_turn("sess-closed");
+        tracker.record("sess-closed", &payload(1000, 200, None));
+        let _ = tracker.take();
+
+        tracker.remove_session("sess-closed");
+
+        assert!(!tracker.sessions.contains_key("sess-closed"));
+        assert!(tracker.sessions.contains_key("sess-live"));
+        assert!(tracker.in_flight_session.is_none());
+        assert!(tracker.pending.is_none());
+        assert!(tracker.pending_identity.is_none());
+        assert!(!tracker.input_absence_observed);
+        assert!(!tracker.output_absence_observed);
+
+        // Reusing the textual ID after close must start a fresh generation,
+        // never inherit the previous cumulative baseline.
+        tracker.seed_zero_baseline("sess-closed");
+        tracker.begin_turn("sess-closed");
+        tracker.record("sess-closed", &payload(7, 3, None));
+        let usage = tracker.take().expect("new generation usage");
+        assert_eq!(usage.turn_seq, 1);
+        assert_eq!(usage.turn_input_tokens, Some(7));
+        assert_eq!(usage.turn_output_tokens, Some(3));
     }
 
     // ── PricingIdentity wire threading ──────────────────────────────────────
@@ -2592,6 +2822,7 @@ mod tests {
             !t3.delta_reliable,
             "turn after absent→present must stay unreliable (sticky poison)"
         );
+        assert!(t3.cumulative_input_tokens.is_none());
         assert!(
             t3.turn_input_tokens.is_none(),
             "turn_input_tokens must be None after sticky poison"
@@ -2609,6 +2840,7 @@ mod tests {
             !t4.delta_reliable,
             "delta_reliable stays false for the remainder of the session"
         );
+        assert!(t4.cumulative_input_tokens.is_none());
     }
 
     /// Symmetric to the input test: once ACP has observed an absent *output*
@@ -2654,6 +2886,7 @@ mod tests {
             !t3.delta_reliable,
             "output absent→present must stay unreliable (sticky poison)"
         );
+        assert!(t3.cumulative_output_tokens.is_none());
         assert!(t3.turn_input_tokens.is_none());
         assert!(t3.turn_output_tokens.is_none());
 
@@ -2665,6 +2898,7 @@ mod tests {
             !t4.delta_reliable,
             "delta_reliable stays false for the remainder of the session"
         );
+        assert!(t4.cumulative_output_tokens.is_none());
     }
 
     /// Convenience helper: build a payload with optional input and output.

@@ -51,6 +51,16 @@ pub struct QueuedEvent {
     pub prompt_tag: String,
 }
 
+impl QueuedEvent {
+    /// The conversation this event belongs to.
+    pub fn session_key(&self) -> SessionKey {
+        match event_thread_root(&self.event) {
+            Some(root) => SessionKey::thread(self.channel_id, root),
+            None => SessionKey::ambient(self.channel_id),
+        }
+    }
+}
+
 /// A single event inside a [`FlushBatch`].
 #[derive(Debug, Clone)]
 pub struct BatchEvent {
@@ -72,10 +82,68 @@ pub enum CancelReason {
     Steer,
 }
 
+/// Identity of a single conversation, which is the unit an ACP session maps to.
+///
+/// `root` is the NIP-10 root event ID of a thread. `None` is the channel's
+/// **ambient** conversation: top-level messages that belong to no thread.
+///
+/// Keeping an ambient session is deliberate. Treating every top-level message as
+/// a new thread would mint one session per message in a conversational channel —
+/// the cost of a session with none of the isolation. It also mirrors Slack, where
+/// the channel holds a conversation of its own alongside its threads.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct SessionKey {
+    pub channel_id: Uuid,
+    pub root: Option<String>,
+}
+
+impl SessionKey {
+    /// The channel's ambient conversation (messages outside any thread).
+    pub fn ambient(channel_id: Uuid) -> Self {
+        Self {
+            channel_id,
+            root: None,
+        }
+    }
+
+    /// The conversation of one thread, identified by its root event ID.
+    pub fn thread(channel_id: Uuid, root: impl Into<String>) -> Self {
+        Self {
+            channel_id,
+            root: Some(root.into()),
+        }
+    }
+}
+
+impl std::fmt::Display for SessionKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.root {
+            // Truncated to stay readable in logs; 12 hex chars is far past the
+            // collision horizon for threads live at the same instant.
+            Some(root) => write!(f, "{}#{}", self.channel_id, &root[..root.len().min(12)]),
+            None => write!(f, "{}#ambient", self.channel_id),
+        }
+    }
+}
+
+/// The thread a single event belongs to, as a session root.
+///
+/// `None` for top-level messages — they belong to the channel's ambient session.
+pub fn event_thread_root(event: &Event) -> Option<String> {
+    parse_thread_tags(event).root_event_id
+}
+
 /// A batch of events to prompt the agent with.
+///
+/// Every batch is **homogeneous in thread**: all its events share one
+/// [`SessionKey`]. A batch becomes exactly one prompt, and a prompt goes to
+/// exactly one session, so a batch spanning threads would have no session to
+/// route to. [`EventQueue::flush_next`] enforces this.
 #[derive(Debug, Clone)]
 pub struct FlushBatch {
     pub channel_id: Uuid,
+    /// Thread root shared by every event in this batch; `None` for ambient.
+    pub root: Option<String>,
     pub events: Vec<BatchEvent>,
     /// Events from a cancelled batch that triggered this re-prompt.
     /// Empty for normal (non-cancel) batches. When non-empty, `format_prompt()`
@@ -89,6 +157,16 @@ pub struct FlushBatch {
     pub cancel_reason: Option<CancelReason>,
 }
 
+impl FlushBatch {
+    /// The session this batch must be prompted into.
+    pub fn session_key(&self) -> SessionKey {
+        match &self.root {
+            Some(root) => SessionKey::thread(self.channel_id, root),
+            None => SessionKey::ambient(self.channel_id),
+        }
+    }
+}
+
 /// Per-channel event queue with per-channel in-flight enforcement.
 ///
 /// # State Machine
@@ -96,7 +174,7 @@ pub struct FlushBatch {
 /// ```text
 /// State:
 ///   queues:               Map<channel_id, VecDeque<QueuedEvent>>  (capped at MAX_PENDING_PER_CHANNEL)
-///   in_flight_channels:   HashSet<Uuid>
+///   in_flight_sessions:   HashSet<Uuid>
 ///   in_flight_deadlines:  Map<channel_id, Instant>                (auto-expire after in_flight_deadline)
 ///   retry_after:          Map<channel_id, Instant>
 ///   retry_counts:         Map<channel_id, u32>                    (dead-letter after MAX_RETRIES)
@@ -104,7 +182,7 @@ pub struct FlushBatch {
 ///
 /// Transitions:
 ///   push(event):
-///     if dedup_mode == Drop AND in_flight_channels.contains(event.channel_id):
+///     if dedup_mode == Drop AND in_flight_sessions.contains(event.channel_id):
 ///       debug log + discard
 ///     else if queues[channel].len() >= MAX_PENDING_PER_CHANNEL:
 ///       drop oldest (pop_front), warn, push_back new event
@@ -114,17 +192,17 @@ pub struct FlushBatch {
 ///   flush_next() → Option<FlushBatch>:
 ///     expire any stuck in-flight entries past their deadline
 ///     candidates = channels where queue non-empty
-///                  AND NOT in in_flight_channels
+///                  AND NOT in in_flight_sessions
 ///                  AND (no retry_after OR retry_after[c] <= now)
 ///     if candidates empty: return None
 ///     channel = pick candidate with oldest head event (min received_at)
 ///     events = drain up to MAX_BATCH_EVENTS from queues[channel]
-///     in_flight_channels.insert(channel)
+///     in_flight_sessions.insert(channel)
 ///     in_flight_deadlines.insert(channel, now + in_flight_deadline)
 ///     return Some(FlushBatch { channel, events })
 ///
 ///   mark_complete(channel_id):
-///     in_flight_channels.remove(channel_id)
+///     in_flight_sessions.remove(channel_id)
 ///     in_flight_deadlines.remove(channel_id)
 ///     retry_counts.remove(channel_id)
 ///     clean up expired retry_after entry if present
@@ -135,24 +213,27 @@ pub struct FlushBatch {
 ///     else: push_front with original received_at, set exponential backoff retry_after with jitter
 /// ```
 pub struct EventQueue {
-    queues: HashMap<Uuid, VecDeque<QueuedEvent>>,
-    in_flight_channels: HashSet<Uuid>,
-    /// Per-channel deadline for auto-expiring stuck in-flight entries.
-    in_flight_deadlines: HashMap<Uuid, Instant>,
+    queues: HashMap<SessionKey, VecDeque<QueuedEvent>>,
+    in_flight_sessions: HashSet<SessionKey>,
+    /// Per-conversation deadline for auto-expiring stuck in-flight entries.
+    in_flight_deadlines: HashMap<SessionKey, Instant>,
     /// Number of events in each in-flight batch (for expiry logging).
-    in_flight_batch_sizes: HashMap<Uuid, usize>,
-    retry_after: HashMap<Uuid, Instant>,
-    /// Per-channel retry attempt counter for exponential backoff / dead-lettering.
-    retry_counts: HashMap<Uuid, u32>,
+    in_flight_batch_sizes: HashMap<SessionKey, usize>,
+    /// Turn generation bound by the dispatcher after a batch is claimed.
+    /// A late completion may clear state only when this ID still matches.
+    in_flight_turn_ids: HashMap<SessionKey, String>,
+    retry_after: HashMap<SessionKey, Instant>,
+    /// Per-conversation retry attempt counter for backoff / dead-lettering.
+    retry_counts: HashMap<SessionKey, u32>,
     dedup_mode: DedupMode,
     /// Events from cancelled batches, keyed by channel. Merged into the next
     /// `FlushBatch` for that channel as `cancelled_events` so `format_prompt()`
     /// can produce annotated "[Previous request — interrupted]" sections.
-    cancelled_batches: HashMap<Uuid, Vec<BatchEvent>>,
+    cancelled_batches: HashMap<SessionKey, Vec<BatchEvent>>,
     /// Why each channel's cancelled batch was cancelled (steer vs interrupt).
     /// Set by `requeue_as_cancelled`, consumed by `flush_next` to set
     /// `FlushBatch::cancel_reason`. Keyed by channel, cleared on flush.
-    cancel_reasons: HashMap<Uuid, CancelReason>,
+    cancel_reasons: HashMap<SessionKey, CancelReason>,
     /// Events withheld from `queues` while a goose-native steer is in flight
     /// for that event. Invisible to `flush_next` / `has_flushable_work` /
     /// `drain` (the events have been moved out of `queues`), so the queue's
@@ -163,7 +244,7 @@ pub struct EventQueue {
     /// at line 453). Bulk recovery on in-flight deadline expiry is performed
     /// by `flush_next` / `has_flushable_work` (recover, not log-and-drop —
     /// the events were never delivered to the agent).
-    withheld_native_steer: HashMap<Uuid, Vec<QueuedEvent>>,
+    withheld_native_steer: HashMap<SessionKey, Vec<QueuedEvent>>,
     /// Duration after which an in-flight channel is auto-expired as orphaned.
     /// Must be strictly greater than `max_turn_duration` so a turn running to
     /// the hard cap returns via `mark_complete` before the backstop fires.
@@ -179,9 +260,10 @@ impl EventQueue {
     pub fn new(dedup_mode: DedupMode) -> Self {
         Self {
             queues: HashMap::new(),
-            in_flight_channels: HashSet::new(),
+            in_flight_sessions: HashSet::new(),
             in_flight_deadlines: HashMap::new(),
             in_flight_batch_sizes: HashMap::new(),
+            in_flight_turn_ids: HashMap::new(),
             retry_after: HashMap::new(),
             retry_counts: HashMap::new(),
             dedup_mode,
@@ -207,13 +289,13 @@ impl EventQueue {
     /// moves backward. If the channel is not in-flight (already completed
     /// via `mark_complete`), this is a no-op: a late ack never resurrects
     /// a deadline.
-    pub fn extend_in_flight_deadline(&mut self, channel_id: Uuid, max_turn_secs: u64) {
-        if let Some(current) = self.in_flight_deadlines.get_mut(&channel_id) {
+    pub fn extend_in_flight_deadline(&mut self, key: &SessionKey, max_turn_secs: u64) {
+        if let Some(current) = self.in_flight_deadlines.get_mut(key) {
             let extended = Instant::now()
                 + Duration::from_secs(max_turn_secs + IN_FLIGHT_DEADLINE_BUFFER_SECS);
             if extended > *current {
                 tracing::info!(
-                    %channel_id,
+                    session = %key,
                     "extending in-flight deadline by {max_turn_secs}s + {IN_FLIGHT_DEADLINE_BUFFER_SECS}s buffer"
                 );
                 *current = extended;
@@ -228,21 +310,20 @@ impl EventQueue {
     ///
     /// Returns `true` if the event was accepted, `false` if dropped.
     pub fn push(&mut self, event: QueuedEvent) -> bool {
-        if matches!(self.dedup_mode, DedupMode::Drop)
-            && self.in_flight_channels.contains(&event.channel_id)
-        {
+        let key = event.session_key();
+        if matches!(self.dedup_mode, DedupMode::Drop) && self.in_flight_sessions.contains(&key) {
             tracing::debug!(
-                channel_id = %event.channel_id,
-                "dropping event for in-flight channel (drop mode)"
+                session = %key,
+                "dropping event for in-flight conversation (drop mode)"
             );
             return false;
         }
-        let queue = self.queues.entry(event.channel_id).or_default();
-        // Enforce per-channel depth cap: drop oldest to make room.
+        let queue = self.queues.entry(key.clone()).or_default();
+        // Enforce per-conversation depth cap: drop oldest to make room.
         if queue.len() >= MAX_PENDING_PER_CHANNEL {
             queue.pop_front();
             tracing::warn!(
-                channel_id = %event.channel_id,
+                session = %key,
                 limit = MAX_PENDING_PER_CHANNEL,
                 "queue depth cap reached — dropped oldest event"
             );
@@ -256,72 +337,95 @@ impl EventQueue {
     /// Returns `None` if all non-in-flight, non-throttled queues are empty.
     /// Otherwise picks the channel with the oldest pending event (FIFO fairness
     /// across channels), drains ALL events for that channel into a single batch,
-    /// inserts into `in_flight_channels`, and returns the batch.
+    /// inserts into `in_flight_sessions`, and returns the batch.
     pub fn flush_next(&mut self) -> Option<FlushBatch> {
+        self.flush_next_excluding(&HashSet::new())
+    }
+
+    /// Flush the oldest eligible conversation not present in `excluded`.
+    /// Dispatch uses this to skip a conversation whose owning agent is busy
+    /// while still filling idle agents with unrelated work.
+    pub fn flush_next_excluding(&mut self, excluded: &HashSet<SessionKey>) -> Option<FlushBatch> {
         let now = Instant::now();
 
         // Auto-expire any stuck in-flight entries that missed mark_complete.
-        let expired: Vec<Uuid> = self
+        let expired: Vec<SessionKey> = self
             .in_flight_deadlines
             .iter()
             .filter(|(_, deadline)| now >= **deadline)
-            .map(|(id, _)| *id)
+            .map(|(key, _)| key.clone())
             .collect();
-        for id in expired {
-            let lost_events = self.in_flight_batch_sizes.remove(&id).unwrap_or(0);
+        for key in expired {
+            if let Some(turn_id) = self.in_flight_turn_ids.get(&key) {
+                tracing::error!(
+                    session = %key,
+                    turn_id,
+                    deadline_secs = self.in_flight_deadline.as_secs(),
+                    "BUG: bound turn exceeded the queue backstop; preserving serialization"
+                );
+                self.in_flight_deadlines
+                    .insert(key, now + self.in_flight_deadline);
+                continue;
+            }
+            let lost_events = self.in_flight_batch_sizes.remove(&key).unwrap_or(0);
             tracing::error!(
-                channel_id = %id,
+                session = %key,
                 lost_events,
                 deadline_secs = self.in_flight_deadline.as_secs(),
-                "BUG: in-flight channel expired without mark_complete — \
+                "BUG: in-flight conversation expired without mark_complete — \
                  auto-releasing; {lost_events} dispatched event(s) orphaned"
             );
-            self.in_flight_channels.remove(&id);
-            self.in_flight_deadlines.remove(&id);
+            self.in_flight_sessions.remove(&key);
+            self.in_flight_deadlines.remove(&key);
+            self.in_flight_turn_ids.remove(&key);
             // Recover any withheld goose-native steer events for the expired
-            // channel back to the queue front so normal dispatch delivers
+            // conversation back to the queue front so normal dispatch delivers
             // them. Unlike the in-flight batch above (already delivered to a
             // now-hung prompt — nothing to recover), these events were never
             // delivered to the agent.
-            self.recover_withheld_for_expired_channel(id);
+            self.recover_withheld_for_expired_session(&key);
         }
 
-        // Find the channel whose head event has the oldest received_at,
-        // excluding in-flight channels and throttled channels.
-        let channel_id = self
+        // Find the conversation whose head event has the oldest received_at,
+        // excluding in-flight and throttled ones. Two threads of the same
+        // channel are independent here — that is the point of this phase.
+        let session_key = self
             .queues
             .iter()
-            .filter(|(id, q)| {
+            .filter(|(key, q)| {
                 !q.is_empty()
-                    && !self.in_flight_channels.contains(id)
-                    && self.retry_after.get(id).is_none_or(|&t| t <= now)
+                    && !self.in_flight_sessions.contains(key)
+                    && !excluded.contains(key)
+                    && self.retry_after.get(key).is_none_or(|&t| t <= now)
             })
             .min_by_key(|(_, q)| q.front().unwrap().received_at)
-            .map(|(id, _)| *id);
+            .map(|(key, _)| key.clone());
 
-        // Fallback: if no queued events are ready but a channel has cancelled
-        // events waiting (e.g., explicit !cancel with no new @mention), flush
-        // those as a regular batch (re-dispatch unchanged).
-        let channel_id = match channel_id {
-            Some(id) => id,
+        // Fallback: if no queued events are ready but a conversation has
+        // cancelled events waiting (e.g., explicit !cancel with no new
+        // @mention), flush those as a regular batch (re-dispatch unchanged).
+        let session_key = match session_key {
+            Some(key) => key,
             None => {
-                let cancelled_id = self
+                let cancelled_key = self
                     .cancelled_batches
                     .keys()
-                    .find(|id| !self.in_flight_channels.contains(id))
-                    .copied();
-                match cancelled_id {
-                    Some(id) => {
+                    .find(|key| !self.in_flight_sessions.contains(key) && !excluded.contains(key))
+                    .cloned();
+                match cancelled_key {
+                    Some(key) => {
                         // Move cancelled events into the regular events slot.
                         // No new events to merge — re-dispatch the original batch.
-                        let cancelled = self.cancelled_batches.remove(&id).unwrap_or_default();
-                        let cancel_reason = self.cancel_reasons.remove(&id);
-                        self.in_flight_channels.insert(id);
+                        let cancelled = self.cancelled_batches.remove(&key).unwrap_or_default();
+                        let cancel_reason = self.cancel_reasons.remove(&key);
+                        self.in_flight_sessions.insert(key.clone());
                         self.in_flight_deadlines
-                            .insert(id, now + self.in_flight_deadline);
-                        self.in_flight_batch_sizes.insert(id, cancelled.len());
+                            .insert(key.clone(), now + self.in_flight_deadline);
+                        self.in_flight_batch_sizes
+                            .insert(key.clone(), cancelled.len());
                         return Some(FlushBatch {
-                            channel_id: id,
+                            channel_id: key.channel_id,
+                            root: key.root,
                             events: cancelled,
                             cancelled_events: vec![],
                             cancel_reason,
@@ -333,7 +437,10 @@ impl EventQueue {
         };
 
         // Drain up to MAX_BATCH_EVENTS; leave any remainder in the queue.
-        let queue = self.queues.entry(channel_id).or_default();
+        //
+        // No thread filtering is needed here: the queue is keyed by
+        // conversation, so everything in it already belongs to one session.
+        let queue = self.queues.entry(session_key.clone()).or_default();
         let drain_count = MAX_BATCH_EVENTS.min(queue.len());
         let mut events: Vec<BatchEvent> = queue
             .drain(..drain_count)
@@ -350,29 +457,31 @@ impl EventQueue {
         events.sort_by_key(|be| be.event.created_at);
 
         // Remove the queue entry if now empty.
-        if self.queues.get(&channel_id).is_some_and(|q| q.is_empty()) {
-            self.queues.remove(&channel_id);
+        if self.queues.get(&session_key).is_some_and(|q| q.is_empty()) {
+            self.queues.remove(&session_key);
         }
 
-        self.in_flight_channels.insert(channel_id);
+        self.in_flight_sessions.insert(session_key.clone());
         self.in_flight_deadlines
-            .insert(channel_id, now + self.in_flight_deadline);
-        self.in_flight_batch_sizes.insert(channel_id, events.len());
+            .insert(session_key.clone(), now + self.in_flight_deadline);
+        self.in_flight_batch_sizes
+            .insert(session_key.clone(), events.len());
 
         // Merge any cancelled events stored by requeue_as_cancelled().
         let cancelled_events = self
             .cancelled_batches
-            .remove(&channel_id)
+            .remove(&session_key)
             .unwrap_or_default();
         let cancel_reason = if cancelled_events.is_empty() {
-            self.cancel_reasons.remove(&channel_id);
+            self.cancel_reasons.remove(&session_key);
             None
         } else {
-            self.cancel_reasons.remove(&channel_id)
+            self.cancel_reasons.remove(&session_key)
         };
 
         Some(FlushBatch {
-            channel_id,
+            channel_id: session_key.channel_id,
+            root: session_key.root,
             events,
             cancelled_events,
             cancel_reason,
@@ -381,7 +490,7 @@ impl EventQueue {
 
     /// Mark the prompt for `channel_id` as complete.
     ///
-    /// Removes the channel from `in_flight_channels` and `in_flight_deadlines`.
+    /// Removes the channel from `in_flight_sessions` and `in_flight_deadlines`.
     ///
     /// If the channel was NOT requeued (no active `retry_after` throttle), the
     /// retry counter is reset — the channel is healthy and the next failure
@@ -389,24 +498,57 @@ impl EventQueue {
     /// so the backoff sequence continues on the next attempt.
     ///
     /// Also cleans up any already-expired `retry_after` entry.
-    pub fn mark_complete(&mut self, channel_id: Uuid) {
-        self.in_flight_channels.remove(&channel_id);
-        self.in_flight_deadlines.remove(&channel_id);
-        self.in_flight_batch_sizes.remove(&channel_id);
+    pub fn mark_complete(&mut self, key: &SessionKey) {
+        self.in_flight_sessions.remove(key);
+        self.in_flight_deadlines.remove(key);
+        self.in_flight_batch_sizes.remove(key);
+        self.in_flight_turn_ids.remove(key);
         let now = Instant::now();
-        match self.retry_after.get(&channel_id) {
-            // Active throttle → channel was requeued; keep retry_counts intact.
+        match self.retry_after.get(key) {
+            // Active throttle → it was requeued; keep retry_counts intact.
             Some(&deadline) if deadline > now => {}
             // Expired or absent throttle → successful completion; reset counter
             // and clean up the stale retry_after entry.
             Some(_) => {
-                self.retry_after.remove(&channel_id);
-                self.retry_counts.remove(&channel_id);
+                self.retry_after.remove(key);
+                self.retry_counts.remove(key);
             }
             None => {
-                self.retry_counts.remove(&channel_id);
+                self.retry_counts.remove(key);
             }
         }
+    }
+
+    /// Release a batch that was flushed but never assigned to an agent.
+    /// Unlike `mark_complete`, this must not reset retry/dead-letter history:
+    /// no processing attempt occurred.
+    pub fn release_unclaimed(&mut self, key: &SessionKey) {
+        self.in_flight_sessions.remove(key);
+        self.in_flight_deadlines.remove(key);
+        self.in_flight_batch_sizes.remove(key);
+        self.in_flight_turn_ids.remove(key);
+    }
+
+    /// Bind the dispatched turn generation to the current in-flight batch.
+    pub fn bind_in_flight_turn(&mut self, key: &SessionKey, turn_id: String) {
+        debug_assert!(self.in_flight_sessions.contains(key));
+        self.in_flight_turn_ids.insert(key.clone(), turn_id);
+    }
+
+    /// Complete a turn only if it still owns this conversation's in-flight slot.
+    /// Returns `false` for a late result from an expired/replaced generation.
+    pub fn mark_complete_turn(&mut self, key: &SessionKey, turn_id: &str) -> bool {
+        if self.in_flight_turn_ids.get(key).map(String::as_str) != Some(turn_id) {
+            tracing::warn!(
+                session = %key,
+                turn_id,
+                current_turn_id = ?self.in_flight_turn_ids.get(key),
+                "ignoring stale turn completion"
+            );
+            return false;
+        }
+        self.mark_complete(key);
+        true
     }
 
     /// Re-queue a batch of events that failed to process.
@@ -424,12 +566,13 @@ impl EventQueue {
     /// failure notice can be posted to the channel. Returns `None` when the
     /// batch was requeued for another attempt.
     ///
-    /// Note: does NOT remove from `in_flight_channels` — caller must call
+    /// Note: does NOT remove from `in_flight_sessions` — caller must call
     /// `mark_complete` separately.
     pub fn requeue(&mut self, batch: FlushBatch) -> Option<FlushBatch> {
         let channel_id = batch.channel_id;
+        let key = batch.session_key();
         let attempt = {
-            let count = self.retry_counts.entry(channel_id).or_insert(0);
+            let count = self.retry_counts.entry(key.clone()).or_insert(0);
             *count += 1;
             *count
         };
@@ -443,10 +586,10 @@ impl EventQueue {
                 MAX_RETRIES,
                 batch.events.len(),
             );
-            self.retry_counts.remove(&channel_id);
-            // Also clear retry_after so fresh traffic on this channel isn't
+            self.retry_counts.remove(&key);
+            // Also clear retry_after so fresh traffic in this conversation isn't
             // throttled by stale backoff from the discarded poison batch.
-            self.retry_after.remove(&channel_id);
+            self.retry_after.remove(&key);
             return Some(batch);
         }
 
@@ -472,7 +615,7 @@ impl EventQueue {
             "requeueing failed batch with backoff"
         );
 
-        let queue = self.queues.entry(channel_id).or_default();
+        let queue = self.queues.entry(key.clone()).or_default();
         // Push to front in reverse order so original order is preserved.
         for be in batch.events.into_iter().rev() {
             queue.push_front(QueuedEvent {
@@ -493,7 +636,7 @@ impl EventQueue {
                 "requeue overflow — dropped oldest event to enforce cap"
             );
         }
-        self.retry_after.insert(channel_id, Instant::now() + delay);
+        self.retry_after.insert(key.clone(), Instant::now() + delay);
         None
     }
 
@@ -503,13 +646,45 @@ impl EventQueue {
     /// retry without penalizing the channel's position in the fairness queue
     /// and without imposing a retry throttle.
     ///
-    /// Does NOT set `retry_after`. Does NOT remove from `in_flight_channels` —
+    /// Does NOT set `retry_after`. Does NOT remove from `in_flight_sessions` —
     /// caller must call `mark_complete` separately.
     pub fn requeue_preserve_timestamps(&mut self, batch: FlushBatch) {
-        let channel_id = batch.channel_id;
-        let queue = self.queues.entry(channel_id).or_default();
+        let key = batch.session_key();
+        let FlushBatch {
+            channel_id,
+            events,
+            cancelled_events,
+            cancel_reason,
+            ..
+        } = batch;
+
+        // A cancelled-only fallback stores its events in `events`; a merged
+        // regular batch stores prior interrupted work in `cancelled_events`.
+        // Restore both shapes without losing their framing metadata.
+        let cancelled_only = cancel_reason.is_some() && cancelled_events.is_empty();
+        if cancelled_only {
+            let entry = self.cancelled_batches.entry(key.clone()).or_default();
+            let mut restored = events;
+            restored.append(entry);
+            *entry = restored;
+            if let Some(reason) = cancel_reason {
+                self.cancel_reasons.entry(key).or_insert(reason);
+            }
+            return;
+        }
+        if !cancelled_events.is_empty() {
+            let entry = self.cancelled_batches.entry(key.clone()).or_default();
+            let mut restored = cancelled_events;
+            restored.append(entry);
+            *entry = restored;
+            if let Some(reason) = cancel_reason {
+                self.cancel_reasons.entry(key.clone()).or_insert(reason);
+            }
+        }
+
+        let queue = self.queues.entry(key).or_default();
         // Push to front in reverse order so original order is preserved.
-        for be in batch.events.into_iter().rev() {
+        for be in events.into_iter().rev() {
             queue.push_front(QueuedEvent {
                 channel_id,
                 event: be.event,
@@ -540,11 +715,12 @@ impl EventQueue {
     /// the generic queue — they are stored separately and merged by
     /// `flush_next()`. No retry throttle, no backoff.
     pub fn requeue_as_cancelled(&mut self, batch: FlushBatch, reason: CancelReason) {
-        let entry = self.cancelled_batches.entry(batch.channel_id).or_default();
+        let key = batch.session_key();
+        let entry = self.cancelled_batches.entry(key.clone()).or_default();
         // Preserve any already-cancelled events from a prior cancel (double-cancel).
         entry.extend(batch.cancelled_events);
         entry.extend(batch.events);
-        self.cancel_reasons.insert(batch.channel_id, reason);
+        self.cancel_reasons.insert(key.clone(), reason);
     }
 
     /// Returns `true` if any channel has pending events that are not in-flight
@@ -557,48 +733,60 @@ impl EventQueue {
         let now = Instant::now();
 
         // Auto-expire stuck in-flight entries (same logic as flush_next).
-        let expired: Vec<Uuid> = self
+        let expired: Vec<SessionKey> = self
             .in_flight_deadlines
             .iter()
             .filter(|(_, deadline)| now >= **deadline)
-            .map(|(id, _)| *id)
+            .map(|(key, _)| key.clone())
             .collect();
-        for id in expired {
-            let lost_events = self.in_flight_batch_sizes.remove(&id).unwrap_or(0);
+        for key in expired {
+            if let Some(turn_id) = self.in_flight_turn_ids.get(&key) {
+                tracing::error!(
+                    session = %key,
+                    turn_id,
+                    deadline_secs = self.in_flight_deadline.as_secs(),
+                    "BUG: bound turn exceeded the queue backstop; preserving serialization"
+                );
+                self.in_flight_deadlines
+                    .insert(key, now + self.in_flight_deadline);
+                continue;
+            }
+            let lost_events = self.in_flight_batch_sizes.remove(&key).unwrap_or(0);
             tracing::error!(
-                channel_id = %id,
+                session = %key,
                 lost_events,
                 deadline_secs = self.in_flight_deadline.as_secs(),
-                "BUG: in-flight channel expired without mark_complete — \
+                "BUG: in-flight conversation expired without mark_complete — \
                  auto-releasing; {lost_events} dispatched event(s) orphaned"
             );
-            self.in_flight_channels.remove(&id);
-            self.in_flight_deadlines.remove(&id);
+            self.in_flight_sessions.remove(&key);
+            self.in_flight_deadlines.remove(&key);
+            self.in_flight_turn_ids.remove(&key);
             // Symmetric with the flush_next expiry block: recover withheld
-            // goose-native steer events for the expired channel so they are
-            // not permanently orphaned in the side table.
-            self.recover_withheld_for_expired_channel(id);
+            // goose-native steer events for the expired conversation so they
+            // are not permanently orphaned in the side table.
+            self.recover_withheld_for_expired_session(&key);
         }
 
-        self.queues.iter().any(|(id, q)| {
+        self.queues.iter().any(|(key, q)| {
             !q.is_empty()
-                && !self.in_flight_channels.contains(id)
-                && self.retry_after.get(id).is_none_or(|&t| t <= now)
+                && !self.in_flight_sessions.contains(key)
+                && self.retry_after.get(key).is_none_or(|&t| t <= now)
         }) || self
             .cancelled_batches
             .keys()
-            .any(|id| !self.in_flight_channels.contains(id))
+            .any(|key| !self.in_flight_sessions.contains(key))
     }
 
-    /// Number of channels with pending events.
-    pub fn pending_channels(&self) -> usize {
+    /// Number of conversations with pending events.
+    pub fn pending_conversations(&self) -> usize {
         self.queues.len()
     }
 
-    /// Number of queued events for a specific channel. Test-only.
+    /// Number of queued events for a specific conversation. Test-only.
     #[cfg(test)]
-    pub fn queued_event_count(&self, channel_id: &Uuid) -> usize {
-        self.queues.get(channel_id).map_or(0, |q| q.len())
+    pub fn queued_event_count(&self, key: &SessionKey) -> usize {
+        self.queues.get(key).map_or(0, |q| q.len())
     }
 
     /// Force a channel's retry-attempt counter to `count`, simulating `count`
@@ -607,8 +795,8 @@ impl EventQueue {
     /// Test-only — lets integration tests outside this module exercise
     /// `requeue()`'s dead-letter threshold directly.
     #[cfg(test)]
-    pub fn set_retry_count_for_test(&mut self, channel_id: Uuid, count: u32) {
-        self.retry_counts.insert(channel_id, count);
+    pub fn set_retry_count_for_test(&mut self, key: &SessionKey, count: u32) {
+        self.retry_counts.insert(key.clone(), count);
     }
 
     /// Drop all queued (non-in-flight) events for a channel.
@@ -623,32 +811,55 @@ impl EventQueue {
     /// Returns the event IDs of dropped events so the caller can clean up
     /// any reactions (👀) that were added at queue-push time.
     pub fn drain_channel(&mut self, channel_id: Uuid) -> Vec<String> {
-        let ids = self
+        // Channel-level on purpose: losing access to a channel invalidates
+        // every conversation inside it, ambient and threads alike.
+        let keys: Vec<SessionKey> = self
             .queues
-            .remove(&channel_id)
-            .map(|q| q.into_iter().map(|e| e.event.id.to_hex()).collect())
-            .unwrap_or_default();
-        self.retry_after.remove(&channel_id);
-        self.retry_counts.remove(&channel_id);
-        self.cancelled_batches.remove(&channel_id);
-        self.cancel_reasons.remove(&channel_id);
-        self.withheld_native_steer.remove(&channel_id);
-        // Preserve in_flight_channels AND in_flight_deadlines: the in-flight
+            .keys()
+            .chain(self.cancelled_batches.keys())
+            .chain(self.withheld_native_steer.keys())
+            .filter(|key| key.channel_id == channel_id)
+            .cloned()
+            .collect();
+        let mut ids: Vec<String> = Vec::new();
+        for key in keys {
+            if let Some(q) = self.queues.remove(&key) {
+                ids.extend(q.into_iter().map(|e| e.event.id.to_hex()));
+            }
+            self.retry_after.remove(&key);
+            self.retry_counts.remove(&key);
+            self.cancelled_batches.remove(&key);
+            self.cancel_reasons.remove(&key);
+            self.withheld_native_steer.remove(&key);
+        }
+        // Preserve in_flight_sessions AND in_flight_deadlines: the in-flight
         // task will eventually complete (calling mark_complete) or the deadline
         // will expire (auto-cleaning the channel). Removing deadlines without
-        // removing in_flight_channels would disable auto-expiry and leave a
+        // removing in_flight_sessions would disable auto-expiry and leave a
         // wedged task permanently blocking the channel.
         ids
     }
 
-    /// Whether a prompt is currently in-flight for the given channel.
+    /// Whether a prompt is currently in-flight for any conversation in the
+    /// given channel.
     pub fn is_channel_in_flight(&self, channel_id: Uuid) -> bool {
-        self.in_flight_channels.contains(&channel_id)
+        self.in_flight_sessions
+            .iter()
+            .any(|key| key.channel_id == channel_id)
+    }
+
+    /// Whether a prompt is currently in-flight for one specific conversation.
+    ///
+    /// Test-only for now: production paths that care about in-flight state go
+    /// through `flush_next`/`mark_complete`, which own the set directly.
+    #[cfg(test)]
+    pub fn is_session_in_flight(&self, key: &SessionKey) -> bool {
+        self.in_flight_sessions.contains(key)
     }
 
     /// Whether any channel currently has a turn in flight.
     pub fn has_in_flight(&self) -> bool {
-        !self.in_flight_channels.is_empty()
+        !self.in_flight_sessions.is_empty()
     }
 
     // ── Goose-native steer withhold (side table) ──────────────────────────
@@ -657,7 +868,7 @@ impl EventQueue {
     // for a specific queued event, that event is moved out of `queues` into
     // `withheld_native_steer` so `flush_next` / `has_flushable_work` / the
     // contiguous drain at line 285 cannot see it — closing the race window
-    // between `mark_complete` (which clears `in_flight_channels`) and the
+    // between `mark_complete` (which clears `in_flight_sessions`) and the
     // ack arriving on the main loop. On `Success` the event is consumed
     // (`remove_event`); on `Err` / `PromptCompletedNeutral` it is released
     // back to the queue front (`release_native_steer`), preserving its
@@ -675,8 +886,8 @@ impl EventQueue {
     /// after `pool.send_steer` returns `Ok(())` and before any watcher task
     /// is spawned, so the withhold is established before `mark_complete` /
     /// any subsequent `flush_next` tick can run.
-    pub fn mark_native_steer_pending(&mut self, channel_id: Uuid, event_id: &str) -> bool {
-        let Some(q) = self.queues.get_mut(&channel_id) else {
+    pub fn mark_native_steer_pending(&mut self, key: &SessionKey, event_id: &str) -> bool {
+        let Some(q) = self.queues.get_mut(key) else {
             return false;
         };
         let Some(pos) = q.iter().position(|qe| qe.event.id.to_hex() == event_id) else {
@@ -686,10 +897,10 @@ impl EventQueue {
             .remove(pos)
             .expect("position came from iter so remove must succeed");
         if q.is_empty() {
-            self.queues.remove(&channel_id);
+            self.queues.remove(key);
         }
         self.withheld_native_steer
-            .entry(channel_id)
+            .entry(key.clone())
             .or_default()
             .push(qe);
         true
@@ -705,8 +916,8 @@ impl EventQueue {
     ///
     /// Push-to-front matches the discipline of `requeue_preserve_timestamps`
     /// at line 453, preserving fairness across channels.
-    pub fn release_native_steer(&mut self, channel_id: Uuid, event_id: &str) {
-        let Some(entries) = self.withheld_native_steer.get_mut(&channel_id) else {
+    pub fn release_native_steer(&mut self, key: &SessionKey, event_id: &str) {
+        let Some(entries) = self.withheld_native_steer.get_mut(key) else {
             return;
         };
         let Some(pos) = entries
@@ -717,17 +928,17 @@ impl EventQueue {
         };
         let qe = entries.remove(pos);
         if entries.is_empty() {
-            self.withheld_native_steer.remove(&channel_id);
+            self.withheld_native_steer.remove(key);
         }
         // Push to FRONT so original `received_at` keeps the event at the head
-        // of the channel's queue. Per-channel cap is enforced below in case
+        // of the conversation's queue. The depth cap is enforced below in case
         // a flood of events arrived during the ack window.
-        let queue = self.queues.entry(channel_id).or_default();
+        let queue = self.queues.entry(key.clone()).or_default();
         queue.push_front(qe);
         while queue.len() > MAX_PENDING_PER_CHANNEL {
             queue.pop_back();
             tracing::warn!(
-                channel_id = %channel_id,
+                session = %key,
                 limit = MAX_PENDING_PER_CHANNEL,
                 "release_native_steer overflow — dropped newest event to enforce cap"
             );
@@ -740,17 +951,17 @@ impl EventQueue {
     /// Called on `SteerAck::Success` — the agent received the steer, so the
     /// event has been "delivered" via the non-cancelling path and must not
     /// be redelivered via normal dispatch. Idempotent across both stores.
-    pub fn remove_event(&mut self, channel_id: Uuid, event_id: &str) {
-        if let Some(entries) = self.withheld_native_steer.get_mut(&channel_id) {
+    pub fn remove_event(&mut self, key: &SessionKey, event_id: &str) {
+        if let Some(entries) = self.withheld_native_steer.get_mut(key) {
             entries.retain(|qe| qe.event.id.to_hex() != event_id);
             if entries.is_empty() {
-                self.withheld_native_steer.remove(&channel_id);
+                self.withheld_native_steer.remove(key);
             }
         }
-        if let Some(q) = self.queues.get_mut(&channel_id) {
+        if let Some(q) = self.queues.get_mut(key) {
             q.retain(|qe| qe.event.id.to_hex() != event_id);
             if q.is_empty() {
-                self.queues.remove(&channel_id);
+                self.queues.remove(key);
             }
         }
     }
@@ -768,25 +979,25 @@ impl EventQueue {
     /// Iterates the stored entries in reverse so per-entry `push_front`
     /// composes to original-FIFO order at the queue front (same discipline
     /// as `requeue_preserve_timestamps` at line 453).
-    fn recover_withheld_for_expired_channel(&mut self, channel_id: Uuid) {
-        let Some(entries) = self.withheld_native_steer.remove(&channel_id) else {
+    fn recover_withheld_for_expired_session(&mut self, key: &SessionKey) {
+        let Some(entries) = self.withheld_native_steer.remove(key) else {
             return;
         };
         let n = entries.len();
-        let queue = self.queues.entry(channel_id).or_default();
+        let queue = self.queues.entry(key.clone()).or_default();
         for qe in entries.into_iter().rev() {
             queue.push_front(qe);
         }
         while queue.len() > MAX_PENDING_PER_CHANNEL {
             queue.pop_back();
             tracing::warn!(
-                channel_id = %channel_id,
+                session = %key,
                 limit = MAX_PENDING_PER_CHANNEL,
                 "withheld-steer recovery overflow — dropped newest event to enforce cap"
             );
         }
         tracing::warn!(
-            channel_id = %channel_id,
+            session = %key,
             recovered = n,
             "in-flight expiry recovered withheld steer event(s) — \
              steer ack never arrived; normal dispatch will deliver"
@@ -818,7 +1029,7 @@ impl EventQueue {
         self.retry_counts.retain(|ch, _| {
             self.retry_after.contains_key(ch)
                 || self.queues.get(ch).is_some_and(|q| !q.is_empty())
-                || self.in_flight_channels.contains(ch)
+                || self.in_flight_sessions.contains(ch)
         });
     }
 }
@@ -1379,6 +1590,14 @@ pub struct FormatPromptArgs<'a> {
     pub has_system_prompt_support: bool,
     /// Base prompt content for legacy agents (protocol_version < 2).
     pub base_prompt: Option<&'a str>,
+    /// Absolute working directory selected for this session.
+    ///
+    /// Legacy agents receive its `[Workspace]` anchor in the user message;
+    /// modern agents receive the same section through `session/new`.
+    pub cwd: Option<&'a str>,
+    /// Whether `cwd` is the channel's repository, the harness root/nest, or an
+    /// operator-pinned directory whose layout is unknown.
+    pub workspace_kind: WorkspaceKind,
     /// System prompt content for legacy agents (protocol_version < 2).
     pub system_prompt: Option<&'a str>,
     /// Team instructions for legacy agents, rendered after `[System]`.
@@ -1397,8 +1616,8 @@ pub struct FormatPromptArgs<'a> {
     pub standing_context_sent: bool,
 }
 
-/// The prompt sections that do not change for the life of a session: base
-/// prompt, persona, team instructions, core memory, and channel canvas.
+/// The prompt sections that do not change for the life of a session: workspace,
+/// base prompt, persona, team instructions, core memory, and channel canvas.
 ///
 /// Protocol-v2 agents receive all of this through the system role at
 /// `session/new`, once. Legacy agents (`protocol_version < 2`) have no system
@@ -1411,6 +1630,8 @@ pub struct FormatPromptArgs<'a> {
 /// this one type so their section set and ordering cannot drift apart.
 #[derive(Default)]
 pub(crate) struct StandingContext<'a> {
+    pub cwd: Option<&'a str>,
+    pub workspace_kind: WorkspaceKind,
     pub base_prompt: Option<&'a str>,
     pub system_prompt: Option<&'a str>,
     pub team_instructions: Option<&'a str>,
@@ -1421,8 +1642,14 @@ pub(crate) struct StandingContext<'a> {
 impl StandingContext<'_> {
     /// Render the sections in the order legacy agents have always seen them.
     pub(crate) fn sections(&self) -> Vec<String> {
-        let mut sections = Vec::with_capacity(5);
+        let mut sections = Vec::with_capacity(6);
         if let Some(bp) = self.base_prompt {
+            if let Some(workspace) = self
+                .cwd
+                .and_then(|cwd| workspace_section(cwd, self.workspace_kind))
+            {
+                sections.push(workspace);
+            }
             sections.push(base_section(bp));
         }
         if let Some(sp) = self.system_prompt {
@@ -1445,6 +1672,18 @@ impl StandingContext<'_> {
     }
 }
 
+/// Meaning of the working directory rendered in a `[Workspace]` section.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceKind {
+    /// Harness root/nest.
+    #[default]
+    Root,
+    /// Repository selected from the channel-to-workspace index.
+    Repository,
+    /// Operator-pinned `AGENT_CWD`, whose directory layout is unknown.
+    Pinned,
+}
+
 /// Format the `[Base]` section for the base prompt.
 ///
 /// Single source of truth for the `[Base]` framing so the format is defined in
@@ -1454,12 +1693,44 @@ pub(crate) fn base_section(base_prompt: &str) -> String {
     format!("[Base]\n{}", base_prompt.trim_end())
 }
 
+/// Render the `[Workspace]` grounding section, or `None` when `cwd` is unusable.
+///
+/// Skips relative paths and the `/` fallback (`std::env::current_dir()` used to
+/// resolve to `/` on failure): a `/`-rooted workspace line would actively
+/// encourage the `$HOME`-wide scan this section exists to prevent.
+pub(crate) fn workspace_section(cwd: &str, kind: WorkspaceKind) -> Option<String> {
+    if cwd == "/" || !cwd.starts_with('/') {
+        return None;
+    }
+
+    Some(match kind {
+        WorkspaceKind::Root => format!(
+            "[Workspace]\nYour absolute working directory is `{cwd}`. All workspace \
+             files — `AGENTS.md`, `RESEARCH/`, `PLANS/`, `GUIDES/`, `WORK_LOGS/`, \
+             `OUTBOX/` — and any repositories you clone (under `{cwd}/REPOS/`) live \
+             here. This is where you already are; do not search `$HOME` or other \
+             directories for them."
+        ),
+        WorkspaceKind::Repository => format!(
+            "[Workspace]\nYour absolute working directory is `{cwd}`. This is the \
+             repository for this channel and is where you already are. Work with the \
+             repository files here; do not search `$HOME` or other directories for \
+             another workspace."
+        ),
+        WorkspaceKind::Pinned => format!(
+            "[Workspace]\nYour absolute working directory is `{cwd}`. This is where \
+             you already are; do not search `$HOME` or other directories for a \
+             different working directory."
+        ),
+    })
+}
+
 /// Format a [`FlushBatch`] into the per-section prompt blocks for the agent.
 ///
 /// Produces a stable prompt with these sections (in order):
 /// 0. [`StandingContext`] — `[Base]`, `[System]`, `[Team Instructions]`,
-///    `[Agent Memory — core]`, `[Channel Canvas]`. Legacy agents only, and only
-///    on the session's first message (see `standing_context_sent`)
+///    `[Workspace]`, `[Agent Memory — core]`, `[Channel Canvas]`. Legacy agents
+///    only, and only on the session's first message (see `standing_context_sent`)
 /// 1. `[Context]` — scope, channel name, and contextual hints for the agent
 /// 2. `[Thread Context]` or `[Conversation Context]` — if fetched
 /// 3. `[Event]` / `[Buzz events]` — the triggering event(s)
@@ -1495,13 +1766,15 @@ pub fn format_prompt(batch: &FlushBatch, args: &FormatPromptArgs<'_>) -> Vec<Str
     let mut sections: Vec<String> = Vec::with_capacity(7);
 
     // Standing context — base prompt, persona, team instructions, core memory
-    // and canvas. Modern agents received all of it via the system role in
+    // workspace, and canvas. Modern agents received all of it via the system role in
     // session/new. Legacy agents get it here, in the session's first message
     // only; `standing_context_sent` means an earlier message in this session
     // already carried it.
     if !args.has_system_prompt_support && !args.standing_context_sent {
         sections.extend(
             StandingContext {
+                cwd: args.cwd,
+                workspace_kind: args.workspace_kind,
                 base_prompt: args.base_prompt,
                 system_prompt: args.system_prompt,
                 team_instructions: args.team_instructions,
@@ -1741,7 +2014,7 @@ mod tests {
     }
 
     fn any_in_flight(q: &EventQueue) -> bool {
-        !q.in_flight_channels.is_empty()
+        !q.in_flight_sessions.is_empty()
     }
 
     #[test]
@@ -1801,7 +2074,7 @@ mod tests {
         assert!(q.flush_next().is_none());
 
         // Complete the in-flight prompt.
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
         assert!(!any_in_flight(&q));
 
         // Now flush should succeed.
@@ -1879,6 +2152,31 @@ mod tests {
     }
 
     #[test]
+    fn flush_excluding_busy_affinity_skips_only_that_conversation() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let blocked = Uuid::new_v4();
+        let available = Uuid::new_v4();
+        let blocked_key = SessionKey::ambient(blocked);
+
+        q.push(make_queued_at(
+            blocked,
+            "blocked oldest",
+            Duration::from_secs(2),
+        ));
+        q.push(make_queued_at(
+            available,
+            "available newer",
+            Duration::from_secs(1),
+        ));
+
+        let batch = q
+            .flush_next_excluding(&HashSet::from([blocked_key.clone()]))
+            .expect("unrelated conversation remains dispatchable");
+        assert_eq!(batch.channel_id, available);
+        assert_eq!(q.queued_event_count(&blocked_key), 1);
+    }
+
+    #[test]
     fn test_multi_channel_interleave() {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch_a = Uuid::new_v4();
@@ -1897,7 +2195,7 @@ mod tests {
         assert_eq!(pending_count(&q), 1);
         assert_eq!(q.queues.len(), 1);
 
-        q.mark_complete(ch_a);
+        q.mark_complete(&SessionKey::ambient(ch_a));
 
         // Second flush picks B.
         let batch_b = q.flush_next().expect("second flush");
@@ -1924,6 +2222,7 @@ mod tests {
 
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "@mention".into(),
@@ -1954,6 +2253,7 @@ mod tests {
         let ch = Uuid::new_v4();
         FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event: make_event("the new message"),
                 prompt_tag: "@mention".into(),
@@ -2048,7 +2348,7 @@ mod tests {
         // The mode gate fires Steer → cancel → requeue as cancelled, carrying
         // the steer reason (exactly the lib.rs requeue path).
         q.requeue_as_cancelled(batch, CancelReason::Steer);
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
 
         // The re-prompt the agent actually receives.
         let merged = q.flush_next().unwrap();
@@ -2085,6 +2385,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![
                 BatchEvent {
                     event: make_event("new one"),
@@ -2142,6 +2443,7 @@ mod tests {
 
         let batch = FlushBatch {
             channel_id: ch,
+            root: Some(thread_b.clone()),
             events: vec![BatchEvent {
                 event: steering,
                 prompt_tag: "@mention".into(),
@@ -2190,10 +2492,10 @@ mod tests {
 
         // Simulate failure — requeue the batch.
         queue.requeue(batch);
-        queue.mark_complete(ch);
+        queue.mark_complete(&SessionKey::ambient(ch));
 
         // retry_after is set, so manually clear it for this test.
-        queue.retry_after.remove(&ch);
+        queue.retry_after.remove(&SessionKey::ambient(ch));
 
         // Should be able to flush again and get the same events in order.
         let batch2 = queue.flush_next().unwrap();
@@ -2218,7 +2520,7 @@ mod tests {
 
         // Requeue ch_a (simulating failure) and complete.
         queue.requeue(batch_a);
-        queue.mark_complete(ch_a);
+        queue.mark_complete(&SessionKey::ambient(ch_a));
 
         // After requeue, ch_a has retry_after set (5s), so ch_b goes first.
         let next_batch = queue.flush_next().unwrap();
@@ -2234,6 +2536,7 @@ mod tests {
 
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![
                 BatchEvent {
                     event: e1,
@@ -2274,6 +2577,7 @@ mod tests {
 
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -2297,6 +2601,7 @@ mod tests {
         let event = make_event("hi");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -2329,6 +2634,7 @@ mod tests {
         let event = make_event("hi");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -2359,6 +2665,7 @@ mod tests {
         let event = make_event("hi");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -2386,6 +2693,7 @@ mod tests {
 
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -2410,6 +2718,7 @@ mod tests {
 
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -2425,6 +2734,8 @@ mod tests {
             &FormatPromptArgs {
                 has_system_prompt_support: false,
                 base_prompt: Some("test base prompt"),
+                cwd: Some("/Users/me/git/channel-repo"),
+                workspace_kind: WorkspaceKind::Repository,
                 system_prompt: Some("test system prompt"),
                 agent_core: Some(core),
                 ..Default::default()
@@ -2432,7 +2743,13 @@ mod tests {
         )
         .join("\n\n");
 
-        // Both sections must be present
+        // All legacy framing sections must be present.
+        assert!(
+            prompt.contains(
+                "[Workspace]\nYour absolute working directory is `/Users/me/git/channel-repo`."
+            ),
+            "missing [Workspace] section"
+        );
         assert!(
             prompt.contains("[Base]\ntest base prompt"),
             "missing [Base] section"
@@ -2442,12 +2759,17 @@ mod tests {
             "missing [System] section"
         );
 
-        // [Base] and [System] must appear BEFORE [Agent Memory] and [Context]
+        // [Workspace], [Base], and [System] must appear before memory/context.
+        let workspace_pos = prompt.find("[Workspace]").unwrap();
         let base_pos = prompt.find("[Base]").unwrap();
         let system_pos = prompt.find("[System]").unwrap();
         let core_pos = prompt.find("[Agent Memory").unwrap();
         let context_pos = prompt.find("[Context]").unwrap();
 
+        assert!(
+            workspace_pos < base_pos,
+            "[Workspace] should come before [Base]"
+        );
         assert!(base_pos < system_pos, "[Base] should come before [System]");
         assert!(
             system_pos < core_pos,
@@ -2468,6 +2790,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event: make_event("hello"),
                 prompt_tag: "test".into(),
@@ -2481,6 +2804,8 @@ mod tests {
         let args = |sent| FormatPromptArgs {
             has_system_prompt_support: false,
             base_prompt: Some("test base prompt"),
+            cwd: Some("/Users/me/git/channel-repo"),
+            workspace_kind: WorkspaceKind::Repository,
             system_prompt: Some("test system prompt"),
             team_instructions: Some("ship small"),
             agent_core: Some(core),
@@ -2493,6 +2818,7 @@ mod tests {
         let later = format_prompt(&batch, &args(true)).join("\n\n");
 
         for section in [
+            "[Workspace]",
             "[Base]",
             "[System]",
             "[Team Instructions]",
@@ -2514,12 +2840,102 @@ mod tests {
     }
 
     #[test]
+    fn test_format_prompt_legacy_channels_use_their_resolved_repository_cwds() {
+        fn prompt_for(channel_id: Uuid, cwd: &str) -> String {
+            let batch = FlushBatch {
+                channel_id,
+                root: None,
+                events: vec![BatchEvent {
+                    event: make_event("hello"),
+                    prompt_tag: "test".into(),
+                    received_at: Instant::now(),
+                }],
+                cancelled_events: vec![],
+                cancel_reason: None,
+            };
+            format_prompt(
+                &batch,
+                &FormatPromptArgs {
+                    base_prompt: Some("base"),
+                    cwd: Some(cwd),
+                    workspace_kind: WorkspaceKind::Repository,
+                    ..Default::default()
+                },
+            )
+            .join("\n\n")
+        }
+
+        let first = prompt_for(Uuid::new_v4(), "/Users/me/git/first");
+        let second = prompt_for(Uuid::new_v4(), "/Users/me/git/second");
+
+        assert!(first.contains("`/Users/me/git/first`"));
+        assert!(!first.contains("`/Users/me/git/second`"));
+        assert!(second.contains("`/Users/me/git/second`"));
+        assert!(!second.contains("`/Users/me/git/first`"));
+    }
+
+    #[test]
+    fn test_format_prompt_legacy_persona_only_omits_workspace() {
+        let batch = FlushBatch {
+            channel_id: Uuid::new_v4(),
+            root: None,
+            events: vec![BatchEvent {
+                event: make_event("hello"),
+                prompt_tag: "test".into(),
+                received_at: Instant::now(),
+            }],
+            cancelled_events: vec![],
+            cancel_reason: None,
+        };
+        let prompt = format_prompt(
+            &batch,
+            &FormatPromptArgs {
+                system_prompt: Some("persona only"),
+                cwd: Some("/Users/me/git/channel-repo"),
+                workspace_kind: WorkspaceKind::Repository,
+                ..Default::default()
+            },
+        )
+        .join("\n\n");
+
+        assert!(!prompt.contains("[Workspace]"));
+        assert!(prompt.starts_with("[System]\npersona only"));
+    }
+
+    #[test]
+    fn test_workspace_sections_are_distinct_and_pinned_makes_no_layout_claims() {
+        let root = workspace_section("/Users/me/.buzz", WorkspaceKind::Root).unwrap();
+        let repository =
+            workspace_section("/Users/me/git/channel-repo", WorkspaceKind::Repository).unwrap();
+        let pinned = workspace_section("/Users/me/git/pinned", WorkspaceKind::Pinned).unwrap();
+
+        assert!(root.contains("repositories you clone (under `/Users/me/.buzz/REPOS/`)"));
+        assert!(repository.contains("This is the repository for this channel"));
+        assert!(!repository.contains("REPOS/"));
+        for nest_entry in [
+            "AGENTS.md",
+            "RESEARCH/",
+            "PLANS/",
+            "GUIDES/",
+            "WORK_LOGS/",
+            "OUTBOX/",
+            "REPOS/",
+        ] {
+            assert!(!pinned.contains(nest_entry));
+        }
+        assert_ne!(root, repository);
+        assert_ne!(root, pinned);
+        assert_ne!(repository, pinned);
+    }
+
+    #[test]
     fn test_format_prompt_modern_agent_suppresses_base_and_system() {
         let ch = Uuid::new_v4();
         let event = make_event("hello");
 
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -2558,6 +2974,7 @@ mod tests {
         let event = make_event("hello");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -2624,7 +3041,7 @@ mod tests {
         q.push(make_queued(ch, "dropped"));
         assert_eq!(pending_count(&q), 0, "event should be dropped");
 
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
         // Nothing to flush.
         assert!(q.flush_next().is_none());
     }
@@ -2643,7 +3060,7 @@ mod tests {
         q.push(make_queued(ch_b, "B-event"));
         assert_eq!(pending_count(&q), 1);
 
-        q.mark_complete(ch_a);
+        q.mark_complete(&SessionKey::ambient(ch_a));
         let batch_b = q.flush_next().expect("flush B");
         assert_eq!(batch_b.channel_id, ch_b);
     }
@@ -2667,14 +3084,14 @@ mod tests {
         assert_eq!(batch_b.channel_id, ch_b);
 
         // Both in-flight.
-        assert_eq!(q.in_flight_channels.len(), 2);
+        assert_eq!(q.in_flight_sessions.len(), 2);
 
         // Complete A only.
-        q.mark_complete(ch_a);
+        q.mark_complete(&SessionKey::ambient(ch_a));
         assert!(any_in_flight(&q)); // B still in-flight.
 
         // Complete B.
-        q.mark_complete(ch_b);
+        q.mark_complete(&SessionKey::ambient(ch_b));
         assert!(!any_in_flight(&q));
     }
 
@@ -2718,8 +3135,8 @@ mod tests {
         q.push(make_queued(ch_b, "B-dropped"));
         assert_eq!(pending_count(&q), 0);
 
-        q.mark_complete(ch_a);
-        q.mark_complete(ch_b);
+        q.mark_complete(&SessionKey::ambient(ch_a));
+        q.mark_complete(&SessionKey::ambient(ch_b));
     }
 
     #[test]
@@ -2749,9 +3166,9 @@ mod tests {
         // All in-flight.
         assert!(q.flush_next().is_none());
 
-        q.mark_complete(ch_a);
-        q.mark_complete(ch_b);
-        q.mark_complete(ch_c);
+        q.mark_complete(&SessionKey::ambient(ch_a));
+        q.mark_complete(&SessionKey::ambient(ch_b));
+        q.mark_complete(&SessionKey::ambient(ch_c));
     }
 
     #[test]
@@ -2766,18 +3183,18 @@ mod tests {
         let _batch_a = q.flush_next().expect("flush A");
         let _batch_b = q.flush_next().expect("flush B");
 
-        assert_eq!(q.in_flight_channels.len(), 2);
+        assert_eq!(q.in_flight_sessions.len(), 2);
 
         // Complete only A.
-        q.mark_complete(ch_a);
-        assert_eq!(q.in_flight_channels.len(), 1);
-        assert!(q.in_flight_channels.contains(&ch_b));
-        assert!(!q.in_flight_channels.contains(&ch_a));
+        q.mark_complete(&SessionKey::ambient(ch_a));
+        assert_eq!(q.in_flight_sessions.len(), 1);
+        assert!(q.in_flight_sessions.contains(&SessionKey::ambient(ch_b)));
+        assert!(!q.in_flight_sessions.contains(&SessionKey::ambient(ch_a)));
 
         // B still in-flight.
         assert!(any_in_flight(&q));
 
-        q.mark_complete(ch_b);
+        q.mark_complete(&SessionKey::ambient(ch_b));
         assert!(!any_in_flight(&q));
     }
 
@@ -2799,7 +3216,7 @@ mod tests {
 
         // requeue_preserve_timestamps should keep the original timestamp.
         q.requeue_preserve_timestamps(batch);
-        q.mark_complete(ch);
+        q.release_unclaimed(&SessionKey::ambient(ch));
 
         // No retry_after set — should be immediately flushable.
         let batch2 = q.flush_next().expect("flush after requeue_preserve");
@@ -2815,11 +3232,49 @@ mod tests {
         let batch = q.flush_next().expect("flush");
 
         q.requeue_preserve_timestamps(batch);
-        q.mark_complete(ch);
+        q.release_unclaimed(&SessionKey::ambient(ch));
 
         // No retry_after — channel should be immediately flushable.
-        assert!(!q.retry_after.contains_key(&ch));
+        assert!(!q.retry_after.contains_key(&SessionKey::ambient(ch)));
         assert!(q.flush_next().is_some());
+    }
+
+    #[test]
+    fn requeue_unclaimed_preserves_cancelled_context_and_reason() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let key = SessionKey::ambient(ch);
+
+        q.push(make_queued(ch, "interrupted"));
+        let interrupted = q.flush_next().expect("interrupted batch");
+        q.requeue_as_cancelled(interrupted, CancelReason::Steer);
+        q.mark_complete(&key);
+        q.push(make_queued(ch, "new event"));
+
+        let merged = q.flush_next().expect("merged batch");
+        assert_eq!(merged.cancelled_events.len(), 1);
+        q.requeue_preserve_timestamps(merged);
+        q.release_unclaimed(&key);
+
+        let retried = q.flush_next().expect("retried merged batch");
+        assert_eq!(retried.events.len(), 1);
+        assert_eq!(retried.cancelled_events.len(), 1);
+        assert_eq!(retried.cancel_reason, Some(CancelReason::Steer));
+    }
+
+    #[test]
+    fn release_unclaimed_preserves_retry_counter() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let key = SessionKey::ambient(ch);
+        q.push(make_queued(ch, "retrying"));
+        q.retry_counts.insert(key.clone(), 4);
+
+        let batch = q.flush_next().expect("batch");
+        q.requeue_preserve_timestamps(batch);
+        q.release_unclaimed(&key);
+
+        assert_eq!(q.retry_counts.get(&key), Some(&4));
     }
 
     #[test]
@@ -2882,7 +3337,7 @@ mod tests {
 
         // Requeue — older events go to front, overflow trims from back (newest).
         q.requeue_preserve_timestamps(batch);
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
 
         // The requeued events should be at the front of the queue.
         let batch2 = q.flush_next().expect("should flush after requeue");
@@ -2909,22 +3364,24 @@ mod tests {
         assert!(!q.has_flushable_work());
 
         // Complete — no pending events, no flushable work.
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
         assert!(!q.has_flushable_work());
 
         // Requeue with retry_after — throttled, no flushable work.
         q.push(make_queued(ch, "msg2"));
         let batch2 = q.flush_next().expect("flush2");
         q.requeue(batch2);
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
         assert!(
             !q.has_flushable_work(),
             "throttled channel should not be flushable"
         );
 
         // Manually expire the retry_after to simulate time passing.
-        q.retry_after
-            .insert(ch, Instant::now() - Duration::from_secs(1));
+        q.retry_after.insert(
+            SessionKey::ambient(ch),
+            Instant::now() - Duration::from_secs(1),
+        );
         assert!(
             q.has_flushable_work(),
             "expired throttle should be flushable"
@@ -2938,27 +3395,31 @@ mod tests {
 
         q.push(make_queued(ch, "poison"));
         for attempt in 1..=MAX_RETRIES {
-            q.retry_after
-                .insert(ch, Instant::now() - Duration::from_secs(1));
+            q.retry_after.insert(
+                SessionKey::ambient(ch),
+                Instant::now() - Duration::from_secs(1),
+            );
             let batch = q.flush_next().expect("flush");
             assert!(
                 q.requeue(batch).is_none(),
                 "attempt {attempt} should requeue, not dead-letter"
             );
-            q.mark_complete(ch);
+            q.mark_complete(&SessionKey::ambient(ch));
         }
 
         // The MAX_RETRIES+1'th failure dead-letters: batch is returned.
-        q.retry_after
-            .insert(ch, Instant::now() - Duration::from_secs(1));
+        q.retry_after.insert(
+            SessionKey::ambient(ch),
+            Instant::now() - Duration::from_secs(1),
+        );
         let batch = q.flush_next().expect("flush");
         let dead = q.requeue(batch).expect("should dead-letter");
         assert_eq!(dead.channel_id, ch);
         assert_eq!(dead.events.len(), 1);
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
         // Retry state is cleared so fresh traffic isn't throttled.
-        assert!(!q.retry_counts.contains_key(&ch));
-        assert!(!q.retry_after.contains_key(&ch));
+        assert!(!q.retry_counts.contains_key(&SessionKey::ambient(ch)));
+        assert!(!q.retry_after.contains_key(&SessionKey::ambient(ch)));
     }
 
     #[test]
@@ -2972,7 +3433,7 @@ mod tests {
 
         // Requeue sets retry_after.
         q.requeue(batch);
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
 
         // Channel is throttled — flush_next should return None (no other channels).
         assert!(q.flush_next().is_none());
@@ -2983,9 +3444,11 @@ mod tests {
         assert_eq!(batch2.channel_id, ch2);
 
         // After retry_after expires, ch should be flushable again.
-        q.retry_after
-            .insert(ch, Instant::now() - Duration::from_secs(1));
-        q.mark_complete(ch2);
+        q.retry_after.insert(
+            SessionKey::ambient(ch),
+            Instant::now() - Duration::from_secs(1),
+        );
+        q.mark_complete(&SessionKey::ambient(ch2));
         let batch3 = q
             .flush_next()
             .expect("ch should be flushable after throttle expires");
@@ -3006,6 +3469,133 @@ mod tests {
             .tags(nostr_tags)
             .sign_with_keys(&keys)
             .unwrap()
+    }
+
+    // ── thread-homogeneous batches (per-thread sessions, phase 1) ────────────
+
+    /// A 64-hex root event ID, distinct per `seed`.
+    fn root_id(seed: char) -> String {
+        std::iter::repeat_n(seed, 64).collect()
+    }
+
+    /// Build a QueuedEvent that is a reply inside the thread rooted at `root`.
+    fn make_queued_in_thread(channel_id: Uuid, content: &str, root: &str) -> QueuedEvent {
+        QueuedEvent {
+            channel_id,
+            event: make_event_with_tags(
+                content,
+                vec![vec![
+                    "e".into(),
+                    root.to_string(),
+                    String::new(),
+                    "root".into(),
+                ]],
+            ),
+            received_at: Instant::now(),
+            prompt_tag: "test".into(),
+        }
+    }
+
+    /// One channel carrying two threads and a top-level message must flush as
+    /// three batches, each homogeneous in thread — never one mixed batch. A
+    /// batch becomes one prompt into one session, so a mixed batch would have
+    /// no session to route to.
+    #[test]
+    fn test_flush_splits_one_channel_into_one_batch_per_thread() {
+        let ch = Uuid::new_v4();
+        let root_a = root_id('a');
+        let root_b = root_id('b');
+        let mut q = EventQueue::new(DedupMode::Queue);
+
+        // Interleaved on purpose: arrival order must not merge the threads.
+        assert!(q.push(make_queued_in_thread(ch, "a1", &root_a)));
+        assert!(q.push(make_queued_in_thread(ch, "b1", &root_b)));
+        assert!(q.push(make_queued_in_thread(ch, "a2", &root_a)));
+        assert!(q.push(make_queued(ch, "top-level")));
+
+        // Head event is in thread A, so thread A flushes first — and takes both
+        // of its events, skipping over the interleaved thread-B event.
+        let first = q.flush_next().expect("thread A should flush");
+        assert_eq!(first.session_key(), SessionKey::thread(ch, &root_a));
+        assert_eq!(first.events.len(), 2);
+        assert_eq!(first.events[0].event.content, "a1");
+        assert_eq!(first.events[1].event.content, "a2");
+
+        // No mark_complete between these: threads of one channel are
+        // independently dispatchable, so B and ambient must flush while A is
+        // still in flight.
+        let second = q.flush_next().expect("thread B flushes while A is running");
+        assert_eq!(second.session_key(), SessionKey::thread(ch, &root_b));
+        assert_eq!(second.events.len(), 1);
+        assert_eq!(second.events[0].event.content, "b1");
+
+        // The top-level message belongs to the channel's ambient session.
+        let third = q.flush_next().expect("ambient message should flush too");
+        assert_eq!(third.session_key(), SessionKey::ambient(ch));
+        assert_eq!(third.events.len(), 1);
+        assert_eq!(third.events[0].event.content, "top-level");
+
+        assert!(q.flush_next().is_none(), "queue should be drained");
+        q.mark_complete(&first.session_key());
+        q.mark_complete(&second.session_key());
+        q.mark_complete(&third.session_key());
+        assert!(!q.has_in_flight());
+    }
+
+    /// The concurrency claim of this phase, stated as a test: turns in
+    /// different threads of one channel run side by side, while turns in the
+    /// same thread still queue behind each other.
+    #[test]
+    fn test_threads_of_one_channel_dispatch_concurrently_but_a_thread_serializes() {
+        let ch = Uuid::new_v4();
+        let root_a = root_id('a');
+        let root_b = root_id('b');
+        let mut q = EventQueue::new(DedupMode::Queue);
+
+        assert!(q.push(make_queued_in_thread(ch, "a1", &root_a)));
+        assert!(q.push(make_queued_in_thread(ch, "b1", &root_b)));
+
+        let a = q.flush_next().expect("thread A dispatches");
+        let b = q
+            .flush_next()
+            .expect("thread B dispatches without waiting for A");
+        assert_eq!(a.session_key(), SessionKey::thread(ch, &root_a));
+        assert_eq!(b.session_key(), SessionKey::thread(ch, &root_b));
+        assert!(q.is_session_in_flight(&a.session_key()));
+        assert!(q.is_session_in_flight(&b.session_key()));
+        assert!(q.is_channel_in_flight(ch));
+
+        // A second message in thread A must NOT dispatch while A is running.
+        assert!(q.push(make_queued_in_thread(ch, "a2", &root_a)));
+        assert!(
+            q.flush_next().is_none(),
+            "the same thread still serializes behind its own in-flight turn"
+        );
+
+        // Once A completes, its backlog flows — and only its backlog.
+        q.mark_complete(&a.session_key());
+        let a2 = q.flush_next().expect("thread A resumes after completing");
+        assert_eq!(a2.session_key(), SessionKey::thread(ch, &root_a));
+        assert_eq!(a2.events[0].event.content, "a2");
+    }
+
+    /// The same thread in two different channels is two conversations: the
+    /// channel remains part of the identity.
+    #[test]
+    fn test_session_key_is_scoped_by_channel_as_well_as_thread() {
+        let ch_a = Uuid::new_v4();
+        let ch_b = Uuid::new_v4();
+        let root = root_id('c');
+
+        assert_ne!(
+            SessionKey::thread(ch_a, &root),
+            SessionKey::thread(ch_b, &root)
+        );
+        assert_ne!(SessionKey::thread(ch_a, &root), SessionKey::ambient(ch_a));
+        assert_eq!(
+            SessionKey::thread(ch_a, &root),
+            SessionKey::thread(ch_a, &root)
+        );
     }
 
     #[test]
@@ -3076,6 +3666,7 @@ mod tests {
         let event = make_event("hello");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -3107,6 +3698,7 @@ mod tests {
         let event = make_event("hey");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "dm".into(),
@@ -3145,6 +3737,7 @@ mod tests {
         );
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "@mention".into(),
@@ -3173,6 +3766,7 @@ mod tests {
         );
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "@mention".into(),
@@ -3219,6 +3813,7 @@ mod tests {
         let event = make_event("ok do that");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "dm".into(),
@@ -3269,6 +3864,7 @@ mod tests {
         let author_hex = event.pubkey.to_hex();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "@mention".into(),
@@ -3477,6 +4073,7 @@ mod tests {
         );
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "dm".into(),
@@ -3543,6 +4140,7 @@ mod tests {
         );
         let batch = FlushBatch {
             channel_id: ch,
+            root: Some("root123".into()),
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -3576,6 +4174,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event: make_event("follow up"),
                 prompt_tag: "dm".into(),
@@ -3624,6 +4223,7 @@ mod tests {
         let event = make_event("hey there");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "dm".into(),
@@ -3664,6 +4264,7 @@ mod tests {
         let event_id = event.id.to_hex();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -3688,6 +4289,7 @@ mod tests {
         let npub = event.pubkey.to_bech32().unwrap();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -3711,6 +4313,7 @@ mod tests {
         let event = make_event_with_tags("hello", vec![vec!["h".into(), ch.to_string()]]);
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -3763,7 +4366,7 @@ mod tests {
         q.push(make_queued(ch, "msg"));
         let batch = q.flush_next().unwrap();
         q.requeue(batch); // sets retry_after
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
 
         // Channel is throttled — verify drain clears it.
         assert!(!q.has_flushable_work());
@@ -3807,26 +4410,28 @@ mod tests {
         q.push(make_queued(ch, "msg1"));
         let batch = q.flush_next().unwrap();
         q.requeue(batch);
-        q.mark_complete(ch);
-        assert!(q.retry_after.contains_key(&ch));
-        assert!(q.retry_counts.contains_key(&ch));
+        q.mark_complete(&SessionKey::ambient(ch));
+        assert!(q.retry_after.contains_key(&SessionKey::ambient(ch)));
+        assert!(q.retry_counts.contains_key(&SessionKey::ambient(ch)));
 
         // The requeued event is back in the queue. Flush it again so the
         // queue is empty (simulating a successful retry dispatch).
         // We need to wait for retry_after to expire first.
-        q.retry_after
-            .insert(ch, Instant::now() - Duration::from_secs(1));
+        q.retry_after.insert(
+            SessionKey::ambient(ch),
+            Instant::now() - Duration::from_secs(1),
+        );
         let _batch2 = q.flush_next().unwrap();
         // Now mark_complete with no active throttle — clears retry_counts.
-        q.mark_complete(ch);
-        assert!(!q.retry_counts.contains_key(&ch));
+        q.mark_complete(&SessionKey::ambient(ch));
+        assert!(!q.retry_counts.contains_key(&SessionKey::ambient(ch)));
 
         // Re-create the orphan scenario: manually insert stale retry_counts
         // with no queue, no throttle, and no in-flight.
-        q.retry_counts.insert(ch, 3);
+        q.retry_counts.insert(SessionKey::ambient(ch), 3);
         q.compact_expired_state();
         assert!(
-            !q.retry_counts.contains_key(&ch),
+            !q.retry_counts.contains_key(&SessionKey::ambient(ch)),
             "orphaned retry_counts should be removed"
         );
     }
@@ -3840,21 +4445,26 @@ mod tests {
         q.push(make_queued(ch, "msg1"));
         let batch = q.flush_next().unwrap();
         q.requeue(batch);
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
 
         // Expire the throttle so the requeued event can be flushed.
-        q.retry_after
-            .insert(ch, Instant::now() - Duration::from_secs(1));
+        q.retry_after.insert(
+            SessionKey::ambient(ch),
+            Instant::now() - Duration::from_secs(1),
+        );
         let _batch2 = q.flush_next().unwrap();
         // Channel is now in-flight with empty queue and expired throttle.
-        assert!(q.in_flight_channels.contains(&ch));
-        assert!(q.queues.get(&ch).is_none_or(|q| q.is_empty()));
+        assert!(q.in_flight_sessions.contains(&SessionKey::ambient(ch)));
+        assert!(q
+            .queues
+            .get(&SessionKey::ambient(ch))
+            .is_none_or(|q| q.is_empty()));
 
         // compact must NOT remove retry_counts — the in-flight attempt
         // may fail and requeue, which needs the existing count.
         q.compact_expired_state();
         assert!(
-            q.retry_counts.contains_key(&ch),
+            q.retry_counts.contains_key(&SessionKey::ambient(ch)),
             "retry_counts must survive while channel is in-flight"
         );
     }
@@ -3866,11 +4476,11 @@ mod tests {
 
         // Manually set up: retry_counts exists, queue is non-empty, no throttle.
         q.push(make_queued(ch, "msg1"));
-        q.retry_counts.insert(ch, 2);
+        q.retry_counts.insert(SessionKey::ambient(ch), 2);
 
         q.compact_expired_state();
         assert!(
-            q.retry_counts.contains_key(&ch),
+            q.retry_counts.contains_key(&SessionKey::ambient(ch)),
             "retry_counts should survive when queue is non-empty"
         );
     }
@@ -3891,7 +4501,7 @@ mod tests {
 
         // Cancel the original batch and release the channel.
         q.requeue_as_cancelled(batch, CancelReason::Interrupt);
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
 
         // flush_next should merge: events=[new-1], cancelled_events=[old-1, old-2].
         let next = q.flush_next().unwrap();
@@ -3913,27 +4523,27 @@ mod tests {
         let batch = q.flush_next().unwrap();
         q.push(make_queued(ch, "new"));
         q.requeue_as_cancelled(batch, CancelReason::Steer);
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
         let merged = q.flush_next().unwrap();
         assert_eq!(
             merged.cancel_reason,
             Some(CancelReason::Steer),
             "steer reason should reach the merged batch"
         );
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
 
         // Fallback path (no new event): reason still rides through.
         q.push(make_queued(ch, "only"));
         let batch = q.flush_next().unwrap();
         q.requeue_as_cancelled(batch, CancelReason::Interrupt);
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
         let fallback = q.flush_next().unwrap();
         assert_eq!(
             fallback.cancel_reason,
             Some(CancelReason::Interrupt),
             "interrupt reason should reach the re-dispatched batch"
         );
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
 
         // A normal (non-cancel) flush carries no reason.
         q.push(make_queued(ch, "plain"));
@@ -3949,12 +4559,12 @@ mod tests {
         let batch1 = q.flush_next().unwrap();
         q.push(make_queued(ch, "new-1"));
         q.requeue_as_cancelled(batch1, CancelReason::Interrupt);
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
         let batch2 = q.flush_next().unwrap();
         // Second cancel with a different reason — the latest reason wins.
         q.requeue_as_cancelled(batch2, CancelReason::Steer);
         q.push(make_queued(ch, "new-2"));
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
         let batch3 = q.flush_next().unwrap();
         assert_eq!(batch3.cancel_reason, Some(CancelReason::Steer));
     }
@@ -3972,7 +4582,7 @@ mod tests {
 
         // Cancel the batch (no new events pushed) and release the channel.
         q.requeue_as_cancelled(batch, CancelReason::Interrupt);
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
 
         // Fallback path: cancelled events become regular events, cancelled_events is empty.
         let next = q.flush_next().unwrap();
@@ -3996,7 +4606,7 @@ mod tests {
         q.push(make_queued(ch, "msg"));
         let batch = q.flush_next().unwrap();
         q.requeue_as_cancelled(batch, CancelReason::Interrupt);
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
 
         // Channel has only cancelled events — should still be considered flushable.
         assert!(
@@ -4014,7 +4624,7 @@ mod tests {
         q.push(make_queued(ch, "msg"));
         let batch = q.flush_next().unwrap();
         q.requeue_as_cancelled(batch, CancelReason::Interrupt);
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
 
         // drain_channel should clear cancelled_batches for the channel.
         q.drain_channel(ch);
@@ -4042,7 +4652,7 @@ mod tests {
 
         // First cancel: store 2 cancelled events.
         q.requeue_as_cancelled(batch1, CancelReason::Interrupt);
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
 
         // Second flush: events=[new-1], cancelled_events=[orig-1, orig-2].
         let batch2 = q.flush_next().unwrap();
@@ -4055,7 +4665,7 @@ mod tests {
 
         // Push 1 more new event and release channel.
         q.push(make_queued(ch, "new-2"));
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
 
         // Third flush: events=[new-2], cancelled_events=[orig-1, orig-2, new-1].
         let batch3 = q.flush_next().unwrap();
@@ -4077,6 +4687,7 @@ mod tests {
         );
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "@mention".into(),
@@ -4119,6 +4730,7 @@ mod tests {
         let event_id = event.id.to_hex();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "@mention".into(),
@@ -4153,6 +4765,7 @@ mod tests {
         let event_id = event.id.to_hex();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -4182,6 +4795,7 @@ mod tests {
         let event = make_event("hey there");
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -4224,6 +4838,7 @@ mod tests {
         let event_id = event.id.to_hex();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "@mention".into(),
@@ -4260,6 +4875,7 @@ mod tests {
         );
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "@mention".into(),
@@ -4295,6 +4911,7 @@ mod tests {
         );
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![
                 BatchEvent {
                     event: plain,
@@ -4332,6 +4949,7 @@ mod tests {
         let plain_id = plain.id.to_hex();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![
                 BatchEvent {
                     event: threaded,
@@ -4365,6 +4983,7 @@ mod tests {
     fn make_single_batch(content: &str) -> FlushBatch {
         FlushBatch {
             channel_id: Uuid::new_v4(),
+            root: None,
             events: vec![BatchEvent {
                 event: make_event(content),
                 prompt_tag: "test".into(),
@@ -4488,7 +5107,7 @@ mod tests {
         let event_id = qe.event.id.to_hex();
         q.push(qe);
 
-        assert!(q.mark_native_steer_pending(ch, &event_id));
+        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &event_id));
 
         assert!(
             q.flush_next().is_none(),
@@ -4499,7 +5118,12 @@ mod tests {
             "withheld-only channel must not register as flushable work"
         );
         assert_eq!(pending_count(&q), 0);
-        assert_eq!(q.withheld_native_steer.get(&ch).map(|v| v.len()), Some(1));
+        assert_eq!(
+            q.withheld_native_steer
+                .get(&SessionKey::ambient(ch))
+                .map(|v| v.len()),
+            Some(1)
+        );
     }
 
     /// Earlier events on the same channel must flush normally during the
@@ -4525,7 +5149,7 @@ mod tests {
         q.push(e3);
 
         // Steer in flight for e3 — withhold it from normal dispatch.
-        assert!(q.mark_native_steer_pending(ch, &e3_id));
+        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &e3_id));
 
         // Earlier events flush as a normal batch; e3 is invisible.
         let batch = q
@@ -4537,10 +5161,10 @@ mod tests {
         assert_eq!(batch.events[1].event.id.to_hex(), e2_id);
 
         // Earlier batch completes; channel is no longer in flight.
-        q.mark_complete(ch);
+        q.mark_complete(&SessionKey::ambient(ch));
 
         // Ack arrives as Err or PromptCompletedNeutral → release e3.
-        q.release_native_steer(ch, &e3_id);
+        q.release_native_steer(&SessionKey::ambient(ch), &e3_id);
 
         let next = q.flush_next().expect("released e3 should now flush");
         assert_eq!(next.channel_id, ch);
@@ -4567,17 +5191,20 @@ mod tests {
 
         // Simulate a prompt in flight for `ch`, then withhold the queued
         // event for an in-flight goose-native steer.
-        q.in_flight_channels.insert(ch);
-        q.in_flight_deadlines.insert(ch, Instant::now());
-        q.in_flight_batch_sizes.insert(ch, 1);
-        assert!(q.mark_native_steer_pending(ch, &event_id));
+        q.in_flight_sessions.insert(SessionKey::ambient(ch));
+        q.in_flight_deadlines
+            .insert(SessionKey::ambient(ch), Instant::now());
+        q.in_flight_batch_sizes.insert(SessionKey::ambient(ch), 1);
+        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &event_id));
 
         // Force the in-flight deadline to be in the past, simulating the
         // steer ack never arriving and the read loop hanging long enough
         // for `in_flight_deadline` to elapse. Same expiry-simulation
         // trick used by `test_retry_throttle_blocks_requeue_channel`.
-        q.in_flight_deadlines
-            .insert(ch, Instant::now() - Duration::from_secs(1));
+        q.in_flight_deadlines.insert(
+            SessionKey::ambient(ch),
+            Instant::now() - Duration::from_secs(1),
+        );
 
         // `has_flushable_work` runs the expiry block first; it must recover
         // the withheld event so the channel registers as flushable.
@@ -4625,24 +5252,31 @@ mod tests {
         // tests. What matters here is that the bulk-recovery path
         // (reverse iter + push_front) composes to original FIFO at the
         // queue front.
-        assert!(q.mark_native_steer_pending(ch, &e1_id));
-        assert!(q.mark_native_steer_pending(ch, &e2_id));
-        assert!(q.mark_native_steer_pending(ch, &e3_id));
+        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &e1_id));
+        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &e2_id));
+        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &e3_id));
         assert_eq!(pending_count(&q), 0);
-        assert_eq!(q.withheld_native_steer.get(&ch).map(|v| v.len()), Some(3));
+        assert_eq!(
+            q.withheld_native_steer
+                .get(&SessionKey::ambient(ch))
+                .map(|v| v.len()),
+            Some(3)
+        );
 
         // Trigger expiry → bulk-release path.
-        q.in_flight_channels.insert(ch);
-        q.in_flight_deadlines
-            .insert(ch, Instant::now() - Duration::from_secs(1));
-        q.in_flight_batch_sizes.insert(ch, 3);
+        q.in_flight_sessions.insert(SessionKey::ambient(ch));
+        q.in_flight_deadlines.insert(
+            SessionKey::ambient(ch),
+            Instant::now() - Duration::from_secs(1),
+        );
+        q.in_flight_batch_sizes.insert(SessionKey::ambient(ch), 3);
         assert!(q.has_flushable_work());
 
         // After recovery, the queue front-to-back order must match the
         // original FIFO: e1, e2, e3.
         let recovered: Vec<String> = q
             .queues
-            .get(&ch)
+            .get(&SessionKey::ambient(ch))
             .expect("queue restored")
             .iter()
             .map(|qe| qe.event.id.to_hex())
@@ -4659,6 +5293,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
@@ -4688,6 +5323,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
@@ -4716,6 +5352,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let batch = FlushBatch {
             channel_id: ch,
+            root: None,
             events: vec![BatchEvent {
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
@@ -4764,11 +5401,12 @@ mod tests {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
         let old_deadline = Instant::now() + Duration::from_secs(100);
-        q.in_flight_channels.insert(ch);
-        q.in_flight_deadlines.insert(ch, old_deadline);
+        q.in_flight_sessions.insert(SessionKey::ambient(ch));
+        q.in_flight_deadlines
+            .insert(SessionKey::ambient(ch), old_deadline);
 
-        q.extend_in_flight_deadline(ch, 7200);
-        let new = *q.in_flight_deadlines.get(&ch).unwrap();
+        q.extend_in_flight_deadline(&SessionKey::ambient(ch), 7200);
+        let new = *q.in_flight_deadlines.get(&SessionKey::ambient(ch)).unwrap();
         assert!(
             new > old_deadline,
             "extended deadline must be past the original"
@@ -4780,11 +5418,12 @@ mod tests {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
         let far_future = Instant::now() + Duration::from_secs(999_999);
-        q.in_flight_channels.insert(ch);
-        q.in_flight_deadlines.insert(ch, far_future);
+        q.in_flight_sessions.insert(SessionKey::ambient(ch));
+        q.in_flight_deadlines
+            .insert(SessionKey::ambient(ch), far_future);
 
-        q.extend_in_flight_deadline(ch, 7200);
-        let after = *q.in_flight_deadlines.get(&ch).unwrap();
+        q.extend_in_flight_deadline(&SessionKey::ambient(ch), 7200);
+        let after = *q.in_flight_deadlines.get(&SessionKey::ambient(ch)).unwrap();
         assert_eq!(after, far_future, "deadline must never move backward");
     }
 
@@ -4792,19 +5431,44 @@ mod tests {
     fn extend_in_flight_deadline_noop_after_mark_complete() {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
-        q.in_flight_channels.insert(ch);
-        q.in_flight_deadlines
-            .insert(ch, Instant::now() + Duration::from_secs(100));
-        q.in_flight_batch_sizes.insert(ch, 1);
+        q.in_flight_sessions.insert(SessionKey::ambient(ch));
+        q.in_flight_deadlines.insert(
+            SessionKey::ambient(ch),
+            Instant::now() + Duration::from_secs(100),
+        );
+        q.in_flight_batch_sizes.insert(SessionKey::ambient(ch), 1);
 
-        q.mark_complete(ch);
-        assert!(!q.in_flight_deadlines.contains_key(&ch));
+        q.mark_complete(&SessionKey::ambient(ch));
+        assert!(!q.in_flight_deadlines.contains_key(&SessionKey::ambient(ch)));
 
-        q.extend_in_flight_deadline(ch, 7200);
+        q.extend_in_flight_deadline(&SessionKey::ambient(ch), 7200);
         assert!(
-            !q.in_flight_deadlines.contains_key(&ch),
+            !q.in_flight_deadlines.contains_key(&SessionKey::ambient(ch)),
             "extend after mark_complete must not resurrect a deadline"
         );
+    }
+
+    #[test]
+    fn stale_completion_cannot_clear_a_replacement_turn() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let key = SessionKey::ambient(Uuid::new_v4());
+        q.in_flight_sessions.insert(key.clone());
+        q.bind_in_flight_turn(&key, "turn-a".into());
+
+        // Simulate the backstop expiring A and dispatching replacement B.
+        q.mark_complete(&key);
+        q.in_flight_sessions.insert(key.clone());
+        q.bind_in_flight_turn(&key, "turn-b".into());
+
+        assert!(!q.mark_complete_turn(&key, "turn-a"));
+        assert!(q.in_flight_sessions.contains(&key));
+        assert_eq!(
+            q.in_flight_turn_ids.get(&key).map(String::as_str),
+            Some("turn-b")
+        );
+
+        assert!(q.mark_complete_turn(&key, "turn-b"));
+        assert!(!q.in_flight_sessions.contains(&key));
     }
 
     #[test]
@@ -4812,17 +5476,18 @@ mod tests {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
         let extended = Instant::now() + Duration::from_secs(9999);
-        q.in_flight_channels.insert(ch);
-        q.in_flight_deadlines.insert(ch, extended);
+        q.in_flight_sessions.insert(SessionKey::ambient(ch));
+        q.in_flight_deadlines
+            .insert(SessionKey::ambient(ch), extended);
 
         q.compact_expired_state();
 
         assert!(
-            q.in_flight_deadlines.contains_key(&ch),
+            q.in_flight_deadlines.contains_key(&SessionKey::ambient(ch)),
             "compaction must not touch in-flight deadlines"
         );
         assert_eq!(
-            *q.in_flight_deadlines.get(&ch).unwrap(),
+            *q.in_flight_deadlines.get(&SessionKey::ambient(ch)).unwrap(),
             extended,
             "compaction must leave extended deadline intact"
         );
@@ -4841,9 +5506,10 @@ mod tests {
 
         // Insert the channel as in-flight with a deadline already in the past
         // (Instant::now() — by the time flush_next runs, now >= deadline).
-        q.in_flight_channels.insert(ch);
-        q.in_flight_deadlines.insert(ch, Instant::now());
-        q.in_flight_batch_sizes.insert(ch, 1);
+        q.in_flight_sessions.insert(SessionKey::ambient(ch));
+        q.in_flight_deadlines
+            .insert(SessionKey::ambient(ch), Instant::now());
+        q.in_flight_batch_sizes.insert(SessionKey::ambient(ch), 1);
 
         // Also push an event so flush_next has something to do after expiry.
         q.push(make_queued(ch, "after-expiry"));
@@ -4855,6 +5521,25 @@ mod tests {
             .expect("channel should be dispatchable after auto-expiry");
         assert_eq!(batch.channel_id, ch);
         assert_eq!(batch.events[0].event.content, "after-expiry");
+    }
+
+    #[test]
+    fn expired_bound_turn_preserves_same_conversation_serialization() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let key = SessionKey::ambient(ch);
+        q.in_flight_sessions.insert(key.clone());
+        q.in_flight_deadlines.insert(key.clone(), Instant::now());
+        q.in_flight_batch_sizes.insert(key.clone(), 1);
+        q.bind_in_flight_turn(&key, "still-running".into());
+        q.push(make_queued(ch, "must-wait"));
+
+        assert!(q.flush_next().is_none());
+        assert!(q.in_flight_sessions.contains(&key));
+        assert_eq!(
+            q.in_flight_turn_ids.get(&key).map(String::as_str),
+            Some("still-running")
+        );
     }
 
     /// F2 case 2.2 — `flush_next` path.
@@ -4869,10 +5554,12 @@ mod tests {
         let ch = Uuid::new_v4();
 
         // Put the channel in-flight with an extended deadline far in the future.
-        q.in_flight_channels.insert(ch);
-        q.in_flight_deadlines
-            .insert(ch, Instant::now() + Duration::from_secs(9999));
-        q.in_flight_batch_sizes.insert(ch, 1);
+        q.in_flight_sessions.insert(SessionKey::ambient(ch));
+        q.in_flight_deadlines.insert(
+            SessionKey::ambient(ch),
+            Instant::now() + Duration::from_secs(9999),
+        );
+        q.in_flight_batch_sizes.insert(SessionKey::ambient(ch), 1);
 
         // Push an event for another channel so flush_next has work to do.
         let ch2 = Uuid::new_v4();
@@ -4886,11 +5573,11 @@ mod tests {
 
         // ch must still be in-flight — the extended deadline did not expire.
         assert!(
-            q.in_flight_channels.contains(&ch),
+            q.in_flight_sessions.contains(&SessionKey::ambient(ch)),
             "ch must remain in-flight after flush_next with an extended deadline"
         );
         assert!(
-            q.in_flight_deadlines.contains_key(&ch),
+            q.in_flight_deadlines.contains_key(&SessionKey::ambient(ch)),
             "in-flight deadline for ch must not be removed by flush_next"
         );
     }
@@ -4907,10 +5594,12 @@ mod tests {
         let ch = Uuid::new_v4();
 
         // In-flight channel with extended (far-future) deadline.
-        q.in_flight_channels.insert(ch);
-        q.in_flight_deadlines
-            .insert(ch, Instant::now() + Duration::from_secs(9999));
-        q.in_flight_batch_sizes.insert(ch, 1);
+        q.in_flight_sessions.insert(SessionKey::ambient(ch));
+        q.in_flight_deadlines.insert(
+            SessionKey::ambient(ch),
+            Instant::now() + Duration::from_secs(9999),
+        );
+        q.in_flight_batch_sizes.insert(SessionKey::ambient(ch), 1);
 
         // No other channels — nothing flushable.
         assert!(
@@ -4918,7 +5607,7 @@ mod tests {
             "has_flushable_work must return false when the only channel is in-flight with extended deadline"
         );
         assert!(
-            q.in_flight_channels.contains(&ch),
+            q.in_flight_sessions.contains(&SessionKey::ambient(ch)),
             "ch must remain in-flight after has_flushable_work with extended deadline"
         );
 
@@ -4931,7 +5620,7 @@ mod tests {
         );
         // ch still in-flight and not expired.
         assert!(
-            q.in_flight_channels.contains(&ch),
+            q.in_flight_sessions.contains(&SessionKey::ambient(ch)),
             "ch must still be in-flight after has_flushable_work finds ch2 work"
         );
     }
@@ -4946,15 +5635,17 @@ mod tests {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
 
-        q.in_flight_channels.insert(ch);
-        q.in_flight_deadlines
-            .insert(ch, Instant::now() + Duration::from_secs(100));
+        q.in_flight_sessions.insert(SessionKey::ambient(ch));
+        q.in_flight_deadlines.insert(
+            SessionKey::ambient(ch),
+            Instant::now() + Duration::from_secs(100),
+        );
 
-        q.extend_in_flight_deadline(ch, 7200);
-        let after_first = *q.in_flight_deadlines.get(&ch).unwrap();
+        q.extend_in_flight_deadline(&SessionKey::ambient(ch), 7200);
+        let after_first = *q.in_flight_deadlines.get(&SessionKey::ambient(ch)).unwrap();
 
-        q.extend_in_flight_deadline(ch, 7200);
-        let after_second = *q.in_flight_deadlines.get(&ch).unwrap();
+        q.extend_in_flight_deadline(&SessionKey::ambient(ch), 7200);
+        let after_second = *q.in_flight_deadlines.get(&SessionKey::ambient(ch)).unwrap();
 
         assert!(
             after_second >= after_first,

@@ -119,6 +119,68 @@ All configuration is via environment variables (or CLI flags — every env var h
 
 **Legacy env vars:** `BUZZ_ACP_PRIVATE_KEY`, `BUZZ_ACP_API_TOKEN`, and `BUZZ_ACP_TURN_TIMEOUT` (replaced by `BUZZ_ACP_IDLE_TIMEOUT`) are still accepted as fallbacks.
 
+### Fork: workspace routing and managed-agent isolation
+
+This fork resolves the ACP `NewSessionRequest.cwd` per channel and keeps the
+managed subprocess environment separate from the Desktop owner's personal
+agent configuration.
+
+| Option or contract | Default | Behavior |
+|--------------------|---------|----------|
+| `AGENT_CWD` | unset | Pins every channel session to one existing absolute directory. It has precedence over the workspace index and does not change the cwd of the `buzz-acp` process or agent subprocess. An invalid non-empty value stops startup instead of falling back. |
+| `<repo>/.buzz/workspace.json` | absent | Declares which Buzz channel UUIDs belong to that local repository. The repository directory becomes `NewSessionRequest.cwd` for those channels. |
+| `BUZZ_ACP_REPOS_ROOTS` | `$HOME/.buzz/REPOS` | Colon-separated absolute roots whose direct repository children are scanned for workspace declarations. Invalid declarations and channel conflicts are rejected and logged rather than selected by scan order. |
+| `--unindexed-channel-policy` / `BUZZ_ACP_UNINDEXED_CHANNEL_POLICY` | `refuse` | Policy for a known non-DM channel absent from the index: `refuse` or `root`. `root` is an explicit opt-in to use the harness process cwd. |
+| `--claude-isolate-user-config` / `BUZZ_ACP_CLAUDE_ISOLATE_USER_CONFIG` | `true` | For Claude ACP sessions, sends `settingSources: ["project","local"]`, excluding user-scoped settings, hooks, MCP servers, and personal instructions. Set to `false` to restore the adapter's user-inclusive default. |
+| `BUZZ_LOCAL_AGENT` (child env) | `1` | Marks every spawned ACP runtime as a Buzz-managed agent. Repository hooks and plugins should use this signal to distinguish a Buzz agent session from the human's terminal session in the same repository. The harness only supplies the default when the inherited environment has not already defined it, so an operator can override it. |
+| `HINDSIGHT_BANK_ID`, `HINDSIGHT_DYNAMIC_BANK_ID` (child env) | removed | Both selectors are removed after inherited, runtime-default, and persona env layers are merged. Repository-local Hindsight configuration therefore owns project bank selection and neither parent nor persona env can force one bank across workspaces. |
+| `BUZZ_AGENT_THINKING_EFFORT` | unset | Shared reasoning axis: `none|minimal|low|medium|high|xhigh|max`. Unset/empty preserves the adapter default; an invalid value stops startup. See harness translations below. |
+
+#### External-harness reasoning effort
+
+The fork deliberately reuses `BUZZ_AGENT_THINKING_EFFORT`, the native
+`buzz-agent` variable, instead of adding an ACP-specific alias. If Desktop
+eventually exposes its effort dropdown to BYOH agents, the same value will flow
+through without another bridge.
+
+| Harness | Translation |
+|---------|-------------|
+| `claude-agent-acp` | Sends `_meta.claudeCode.options` on `session/new`. Adaptive models receive `thinking.type=adaptive` plus distinct `effort` values (`high`, `xhigh`, and `max` remain distinct); legacy Claude 3 / Opus 4.5 models receive `thinking.type=enabled` with `budgetTokens`. A trailing context-window suffix (for example, `[1m]`) is ignored during family classification. Unversioned aliases such as `opus`, `sonnet`, and `haiku` cannot safely determine adaptive versus manual thinking, so they omit both fields; select **Custom model...** and use a canonical ID such as `claude-opus-5[1m]`. Claude rejects `none` and `minimal`. `_meta` is used instead of `MAX_THINKING_TOKENS` because the token-budget variable collapses `high`, `xhigh`, and `max` to the same 32,768-token budget. |
+| `codex-acp` | Deep-merges `model_reasoning_effort` into existing `CODEX_CONFIG` JSON, preserving persona/operator keys. Codex lacks endpoint values `none` and `max`, so they saturate to `minimal` and `xhigh`, respectively. |
+| `buzz-agent` | Inherits the variable unchanged; its native provider translation remains authoritative. |
+| `opencode` | Not supported in this phase. `OPENCODE_CONFIG` is a path, not inline JSON; when effort is configured, startup fails rather than silently ignoring it or creating/modifying a user config file. Configure `agent.build.variant` in the existing opencode config instead. |
+
+Workspace declaration example:
+
+```json
+{
+  "channels": [
+    "3580ca9b-47b4-4af9-b22a-1068778f26c6",
+    "b99a4669-0687-4a73-856a-9df80e536796"
+  ]
+}
+```
+
+The cwd decision is deterministic and follows this order:
+
+| Situation | Decision |
+|-----------|----------|
+| `AGENT_CWD` is set | `Pinned` — use `AGENT_CWD`. |
+| Channel is declared by an indexed repository | `Workspace` — use that repository. |
+| Channel is a DM | `RootMode` — use the harness process cwd. |
+| Known non-DM channel is not indexed and policy is `refuse` | `Refused` (default). |
+| Known non-DM channel is not indexed and policy is `root` | `RootMode` — use the harness process cwd. |
+| Channel type is indeterminate and channel is not indexed | `Refused`, regardless of the knob. |
+
+The relay's kind `30621` project signal is diagnostic only. It is queried
+after an unindexed channel has already been refused, to enrich the refusal log
+and notice with a project name or `d` tag when available. A failed, empty, or
+timed-out query cannot change the decision and is never on a session-creation
+path. Claude subprocesses also default
+`CLAUDE_CODE_DISABLE_CLAUDE_MDS=1` and
+`CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`; project and local settings remain available
+through the resolved session cwd without modifying `~/.claude`.
+
 ### Parallel Agents & Heartbeat
 
 | Flag | Env Var | Default | Description |

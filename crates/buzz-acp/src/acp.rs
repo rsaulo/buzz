@@ -20,6 +20,15 @@ use crate::usage::{TurnUsage, UsageTracker};
 /// Lines exceeding this limit are rejected to prevent OOM from rogue agents.
 const MAX_LINE_SIZE: usize = 10_000_000; // 10 MB
 
+/// Bank selectors that must never cross the harness/agent process boundary.
+/// Repository-local Hindsight configuration owns bank selection so one
+/// long-lived harness can safely serve sessions from multiple projects.
+const REMOVED_HINDSIGHT_BANK_ENV: [&str; 2] = ["HINDSIGHT_BANK_ID", "HINDSIGHT_DYNAMIC_BANK_ID"];
+
+/// Marker inherited by every managed ACP runtime so repository-local hooks and
+/// plugins can distinguish Buzz agents from a human terminal session.
+const BUZZ_LOCAL_AGENT_ENV: &str = "BUZZ_LOCAL_AGENT";
+
 /// An MCP server configuration passed to `session/new`.
 ///
 /// Corresponds to the `McpServerStdio` variant in the ACP schema.
@@ -103,6 +112,13 @@ pub enum AcpError {
 
     #[error("Protocol error: {0}")]
     Protocol(String),
+
+    /// A local policy refused to start the session — the harness never wrote to
+    /// the agent, so the stdio pipe is intact and the agent must **not** be
+    /// respawned. Retrying can only succeed after the operator changes
+    /// configuration (e.g. declaring the channel in `.buzz/workspace.json`).
+    #[error("Session refused: {0}")]
+    SessionRefused(String),
 
     #[error("Agent reported error (code {code}): {message}")]
     AgentError { code: i64, message: String },
@@ -240,10 +256,10 @@ fn deep_merge(
 
 /// Build the merged `CODEX_CONFIG` environment-variable value for a Codex agent spawn.
 ///
-/// Returns `Some(json_string)` when `has_generated_codex_config` is true (Buzz injected a
-/// `CODEX_CONFIG` entry via `codex_network_env()`), `None` otherwise.
+/// Returns `Some(json_string)` when Buzz generated a network overlay or a
+/// reasoning effort is present, `None` otherwise.
 ///
-/// # Merge contract (when `has_generated_codex_config` is true)
+/// # Merge contract
 ///
 /// 1. **Persona base** — the first `CODEX_CONFIG` value in `extra_env` is taken as
 ///    the base object (all keys preserved, recursively).  When there is no persona entry,
@@ -254,7 +270,8 @@ fn deep_merge(
 ///    deep-merged into the result (parent wins on colliding keys at every nesting level;
 ///    unrelated keys from either side survive).
 /// 4. **Forced overlay** — `sandbox_workspace_write.network_access = true` is applied
-///    last so relay access is guaranteed regardless of operator / persona config.
+///    when `has_generated_codex_config` is true; `model_reasoning_effort` is applied
+///    last when requested. Both explicit Buzz values win over stale config.
 ///
 /// When `has_generated_codex_config` is false, the function returns `None` and the
 /// caller handles any persona-supplied `CODEX_CONFIG` with ordinary operator-wins
@@ -262,17 +279,18 @@ fn deep_merge(
 ///
 /// # Errors
 ///
-/// Returns `Err(AcpError::Protocol)` when `has_generated_codex_config` is true and any
+/// Returns `Err(AcpError::Protocol)` when merging is active and any
 /// `CODEX_CONFIG` value is not valid JSON or is not a JSON object, or when
 /// `sandbox_workspace_write` is present but not an object after all merges.
 pub(crate) fn build_codex_config_env(
     extra_env: &[(String, String)],
     parent_codex_config: Option<&str>,
     has_generated_codex_config: bool,
+    reasoning_effort: Option<&str>,
 ) -> Result<Option<String>, AcpError> {
     // Without an explicit Buzz-generated overlay signal, skip the merge entirely.
     // Any persona CODEX_CONFIG is handled by the caller with operator-wins semantics.
-    if !has_generated_codex_config {
+    if !has_generated_codex_config && reasoning_effort.is_none() {
         return Ok(None);
     }
 
@@ -283,7 +301,7 @@ pub(crate) fn build_codex_config_env(
         .map(|(_, v)| v.as_str())
         .collect();
 
-    if codex_entries.is_empty() {
+    if codex_entries.is_empty() && reasoning_effort.is_none() {
         // has_generated_codex_config is true but no entry in extra_env — shouldn't
         // happen in practice, but treat as no-op rather than panic.
         return Ok(None);
@@ -311,7 +329,11 @@ pub(crate) fn build_codex_config_env(
     }
 
     // Start from first entry, deep-merge remaining entries.
-    let mut base = parsed_entries.remove(0);
+    let mut base = if parsed_entries.is_empty() {
+        serde_json::Map::new()
+    } else {
+        parsed_entries.remove(0)
+    };
     for overlay in parsed_entries {
         deep_merge(&mut base, overlay);
     }
@@ -335,21 +357,34 @@ pub(crate) fn build_codex_config_env(
         }
     }
 
-    // Force sandbox_workspace_write.network_access = true (our invariant, always wins).
-    let sws_entry = base
-        .entry("sandbox_workspace_write")
-        .or_insert_with(|| serde_json::json!({}));
-    match sws_entry {
-        serde_json::Value::Object(sws_obj) => {
-            sws_obj.insert("network_access".to_string(), serde_json::Value::Bool(true));
+    if has_generated_codex_config {
+        // Force sandbox_workspace_write.network_access = true only when the
+        // relay-network overlay was generated (reasoning alone must not widen
+        // the sandbox).
+        let sws_entry = base
+            .entry("sandbox_workspace_write")
+            .or_insert_with(|| serde_json::json!({}));
+        match sws_entry {
+            serde_json::Value::Object(sws_obj) => {
+                sws_obj.insert("network_access".to_string(), serde_json::Value::Bool(true));
+            }
+            other => {
+                return Err(AcpError::Protocol(format!(
+                    "CODEX_CONFIG sandbox_workspace_write is not an object (got {}); \
+                     cannot set network_access=true",
+                    other
+                )));
+            }
         }
-        other => {
-            return Err(AcpError::Protocol(format!(
-                "CODEX_CONFIG sandbox_workspace_write is not an object (got {}); \
-                 cannot set network_access=true",
-                other
-            )));
-        }
+    }
+
+    // The explicit shared effort selector wins over any stale persona/parent
+    // value while preserving every unrelated CODEX_CONFIG key.
+    if let Some(effort) = reasoning_effort {
+        base.insert(
+            "model_reasoning_effort".to_string(),
+            serde_json::Value::String(effort.to_string()),
+        );
     }
 
     Ok(Some(serde_json::Value::Object(base).to_string()))
@@ -446,6 +481,8 @@ impl AcpClient {
     /// injected a `CODEX_CONFIG` entry into `extra_env`.  The spawn path uses it to
     /// trigger the recursive merge + forced `network_access=true` in
     /// `build_codex_config_env`.  Pass `false` for test spawns and non-Codex agents.
+    /// `codex_reasoning_effort` activates the same merge without widening the
+    /// network sandbox.
     ///
     /// After spawning, call [`initialize`](Self::initialize) before any other method.
     pub async fn spawn(
@@ -453,6 +490,7 @@ impl AcpClient {
         args: &[String],
         extra_env: &[(String, String)],
         has_generated_codex_config: bool,
+        codex_reasoning_effort: Option<&str>,
     ) -> Result<Self, AcpError> {
         use std::process::Stdio;
 
@@ -475,8 +513,8 @@ impl AcpClient {
         //     recursively and force network_access=true.
         //   • has_generated_codex_config=false: return None; any persona-supplied
         //     CODEX_CONFIG falls through to the normal operator-wins loop below.
-        let has_codex_config = extra_env.iter().any(|(k, _)| k == "CODEX_CONFIG");
-        let parent_codex_config = if has_generated_codex_config && has_codex_config {
+        let codex_merge_requested = has_generated_codex_config || codex_reasoning_effort.is_some();
+        let parent_codex_config = if codex_merge_requested {
             std::env::var("CODEX_CONFIG").ok()
         } else {
             None
@@ -485,6 +523,7 @@ impl AcpClient {
             extra_env,
             parent_codex_config.as_deref(),
             has_generated_codex_config,
+            codex_reasoning_effort,
         )?;
         // When the merge path was not taken (None returned), any persona CODEX_CONFIG
         // entry falls through to the standard operator-wins treatment below.
@@ -494,6 +533,9 @@ impl AcpClient {
         // Applied first so both persona `extra_env` (below, via `Command::env`
         // key replacement) and inherited parent env (via the parent-presence
         // check) override them.
+        if std::env::var_os(BUZZ_LOCAL_AGENT_ENV).is_none() {
+            cmd.env(BUZZ_LOCAL_AGENT_ENV, "1");
+        }
         for &(key, value) in crate::config::default_agent_env(command) {
             if std::env::var_os(key).is_none() {
                 cmd.env(key, value);
@@ -511,6 +553,27 @@ impl AcpClient {
         }
         if let Some(merged) = codex_config_value {
             cmd.env("CODEX_CONFIG", merged);
+        }
+
+        // Command inherits the parent environment by default, and ordinary
+        // `env` entries above only replace individual inherited keys. Remove
+        // Hindsight bank selectors after every merge layer so neither parent
+        // env nor persona env can override repository-local bank selection.
+        let removed_hindsight_bank_env = REMOVED_HINDSIGHT_BANK_ENV
+            .iter()
+            .copied()
+            .filter(|key| {
+                std::env::var_os(key).is_some() || extra_env.iter().any(|(name, _)| name == *key)
+            })
+            .collect::<Vec<_>>();
+        for key in REMOVED_HINDSIGHT_BANK_ENV {
+            cmd.env_remove(key);
+        }
+        if !removed_hindsight_bank_env.is_empty() {
+            tracing::info!(
+                variables = ?removed_hindsight_bank_env,
+                "removed Hindsight bank overrides from agent subprocess environment"
+            );
         }
 
         // Spawn the agent in its own process group so SIGKILL doesn't propagate
@@ -628,10 +691,13 @@ impl AcpClient {
     /// - `Some(SystemPromptTransport::ClaudeMeta(text))` — `_meta.systemPrompt`
     ///   as `{"append": text}`, keeping claude-agent-acp's native preset intact.
     ///
-    /// `session_title` rides in `_meta.sessionTitle` when `Some`; `_meta` is
-    /// omitted entirely otherwise, since adapters may distinguish an absent
-    /// member from a null one. When both `ClaudeMeta` and `session_title` are
-    /// present the two `_meta` members are merged into a single object.
+    /// `session_title` rides in `_meta.sessionTitle` when `Some`.
+    /// `isolate_claude_user_config` adds
+    /// `_meta.claudeCode.options.settingSources: ["project", "local"]`, which
+    /// claude-agent-acp merges over its user-inclusive default. `_meta` is
+    /// omitted when none of these options apply. Multiple `_meta` members are
+    /// merged into a single object. `claude_thinking_options` is merged into
+    /// `_meta.claudeCode.options` without replacing `settingSources`.
     ///
     /// Callers use [`extract_model_config_options`] and [`extract_model_state`]
     /// to pull model info from the raw result.
@@ -641,6 +707,8 @@ impl AcpClient {
         mcp_servers: Vec<McpServer>,
         system_prompt: Option<SystemPromptTransport<'_>>,
         session_title: Option<&str>,
+        isolate_claude_user_config: bool,
+        claude_thinking_options: Option<&serde_json::Value>,
     ) -> Result<SessionNewResponse, AcpError> {
         let mut params = serde_json::json!({
             "cwd": cwd,
@@ -660,11 +728,33 @@ impl AcpClient {
             // Merge — _meta may already carry systemPrompt from ClaudeMeta above.
             params["_meta"]["sessionTitle"] = serde_json::Value::String(title.to_owned());
         }
-        let result = self.send_request("session/new", params).await?;
-        let session_id = result["sessionId"]
-            .as_str()
-            .ok_or_else(|| AcpError::Protocol("session/new response missing sessionId".into()))?
-            .to_owned();
+        if isolate_claude_user_config {
+            params["_meta"]["claudeCode"]["options"]["settingSources"] =
+                serde_json::json!(["project", "local"]);
+        }
+        if let Some(options) = claude_thinking_options {
+            let options = options.as_object().ok_or_else(|| {
+                AcpError::Protocol("Claude thinking options must be a JSON object".into())
+            })?;
+            for (key, value) in options {
+                params["_meta"]["claudeCode"]["options"][key] = value.clone();
+            }
+        }
+        self.goose_usage.begin_session_creation();
+        let result = match self.send_request("session/new", params).await {
+            Ok(result) => result,
+            Err(error) => {
+                self.goose_usage.end_session_creation(None);
+                return Err(error);
+            }
+        };
+        let Some(session_id) = result["sessionId"].as_str().map(str::to_owned) else {
+            self.goose_usage.end_session_creation(None);
+            return Err(AcpError::Protocol(
+                "session/new response missing sessionId".into(),
+            ));
+        };
+        self.goose_usage.end_session_creation(Some(&session_id));
         tracing::info!(target: "acp::session", "session created: {session_id}");
         Ok(SessionNewResponse {
             session_id,
@@ -682,9 +772,18 @@ impl AcpClient {
         mcp_servers: Vec<McpServer>,
         system_prompt: Option<SystemPromptTransport<'_>>,
         session_title: Option<&str>,
+        isolate_claude_user_config: bool,
+        claude_thinking_options: Option<&serde_json::Value>,
     ) -> Result<String, AcpError> {
         Ok(self
-            .session_new_full(cwd, mcp_servers, system_prompt, session_title)
+            .session_new_full(
+                cwd,
+                mcp_servers,
+                system_prompt,
+                session_title,
+                isolate_claude_user_config,
+                claude_thinking_options,
+            )
             .await?
             .session_id)
     }
@@ -733,6 +832,21 @@ impl AcpClient {
             "modelId": model_id,
         });
         self.send_request("session/set_model", params).await
+    }
+
+    /// Send `session/close`, releasing whatever the adapter holds for a session.
+    ///
+    /// This is what makes per-thread sessions affordable: in `claude-agent-acp`
+    /// a session owns a CLI process of its own (~535 MB measured), so a session
+    /// that is never closed is a process that is never reclaimed. Closing also
+    /// ends the session cleanly on the harness side, which is what lets memory
+    /// retention run on a real session boundary instead of never running.
+    ///
+    /// Gate calls on the adapter advertising `sessionCapabilities.close` in its
+    /// `initialize` response — adapters without it answer method-not-found.
+    pub async fn session_close(&mut self, session_id: &str) -> Result<serde_json::Value, AcpError> {
+        let params = serde_json::json!({ "sessionId": session_id });
+        self.send_request("session/close", params).await
     }
 
     /// Send `session/prompt` with idle-based timeout instead of wall-clock.
@@ -883,12 +997,22 @@ impl AcpClient {
 
     /// Notify the usage tracker that buzz-acp just spawned a new session.
     ///
-    /// Seeds a zero baseline so the first usage notification for `session_id`
-    /// produces `delta_reliable: true` (turn delta == cumulative from zero).
+    /// Seeds a zero baseline unless `session/new` already emitted a setup usage
+    /// snapshot, in which case that snapshot remains the committed baseline.
     /// Must be called only when buzz-acp created the session via `session/new`;
     /// never when attaching to a pre-existing session.
     pub(crate) fn notify_session_spawned(&mut self, session_id: &str) {
         self.goose_usage.seed_zero_baseline(session_id);
+    }
+
+    /// Drop usage accounting for a session after `session/close` succeeds.
+    pub(crate) fn notify_session_closed(&mut self, session_id: &str) {
+        self.goose_usage.remove_session(session_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracks_usage_session(&self, session_id: &str) -> bool {
+        self.goose_usage.contains_session(session_id)
     }
 
     /// Install a per-turn steer request channel for goose-native
@@ -2894,7 +3018,7 @@ mod tests {
     }
 
     async fn spawn_script(script: &str) -> AcpClient {
-        AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+        AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false, None)
             .await
             .expect("failed to spawn test script")
     }
@@ -2927,6 +3051,7 @@ mod tests {
             &[],
             extra_env,
             false,
+            None,
         )
         .await
         .expect("spawn env probe script");
@@ -2969,6 +3094,71 @@ mod tests {
             "<unset>",
             "non-Hermes spawns must not receive Hermes defaults"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_marks_every_managed_runtime_as_a_buzz_local_agent() {
+        if std::env::var_os(BUZZ_LOCAL_AGENT_ENV).is_some() {
+            // An inherited operator value wins and makes the default
+            // independently unobservable in this process.
+            return;
+        }
+
+        assert_eq!(
+            spawn_named_and_read_child_env("other-agent", BUZZ_LOCAL_AGENT_ENV, &[]).await,
+            "1"
+        );
+        assert_eq!(
+            spawn_named_and_read_child_env(
+                "other-agent",
+                BUZZ_LOCAL_AGENT_ENV,
+                &[(BUZZ_LOCAL_AGENT_ENV.into(), "0".into())],
+            )
+            .await,
+            "0",
+            "explicit persona env must override the default marker"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_applies_claude_user_config_isolation_defaults_only_to_claude() {
+        for var in [
+            "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+        ] {
+            if std::env::var_os(var).is_some() {
+                continue;
+            }
+            assert_eq!(
+                spawn_named_and_read_child_env("claude-agent-acp", var, &[]).await,
+                "1",
+                "Claude spawns must default {var}=1"
+            );
+            assert_eq!(
+                spawn_named_and_read_child_env("other-agent", var, &[]).await,
+                "<unset>",
+                "non-Claude spawns must not receive {var}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_removes_hindsight_bank_overrides_from_extra_env() {
+        for var in REMOVED_HINDSIGHT_BANK_ENV {
+            assert_eq!(
+                spawn_named_and_read_child_env(
+                    "other-agent",
+                    var,
+                    &[(var.into(), "must-not-cross-spawn".into())],
+                )
+                .await,
+                "<unset>",
+                "{var} must be removed after persona env is merged"
+            );
+        }
     }
 
     #[tokio::test]
@@ -3323,6 +3513,8 @@ mod tests {
                 vec![],
                 Some(SystemPromptTransport::Field("Custom system prompt")),
                 None,
+                false,
+                None,
             )
             .await
             .expect("session_new_full should succeed");
@@ -3408,7 +3600,7 @@ mod tests {
             .expect("initialize should succeed");
 
         let resp = client
-            .session_new_full("/tmp", vec![], None, None)
+            .session_new_full("/tmp", vec![], None, None, false, None)
             .await
             .expect("session_new_full should succeed");
 
@@ -3436,7 +3628,7 @@ mod tests {
             .expect("initialize should succeed");
 
         let resp = client
-            .session_new_full("/tmp", vec![], None, Some("Fizz · #buzz-dev"))
+            .session_new_full("/tmp", vec![], None, Some("Fizz · #buzz-dev"), false, None)
             .await
             .expect("session_new_full should succeed");
 
@@ -3464,7 +3656,7 @@ mod tests {
             .expect("initialize should succeed");
 
         let resp = client
-            .session_new_full("/tmp", vec![], None, None)
+            .session_new_full("/tmp", vec![], None, None, false, None)
             .await
             .expect("session_new_full should succeed");
 
@@ -3500,6 +3692,8 @@ mod tests {
                 vec![],
                 Some(SystemPromptTransport::ClaudeMeta("Be concise")),
                 None,
+                false,
+                None,
             )
             .await
             .expect("session_new_full should succeed");
@@ -3517,9 +3711,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_new_full_merges_claude_meta_and_session_title_into_single_meta_object() {
-        // Both ClaudeMeta prompt and session_title must coexist under _meta —
-        // the prompt must not clobber sessionTitle or vice versa.
+    async fn session_new_full_merges_all_claude_options_into_single_meta_object() {
+        // ClaudeMeta prompt, session_title, and user-config isolation must
+        // coexist under _meta without clobbering one another.
         let script = r#"
             read -t 2 _init
             echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
@@ -3533,12 +3727,18 @@ mod tests {
             .await
             .expect("initialize should succeed");
 
+        let thinking_options = serde_json::json!({
+            "effort": "max",
+            "thinking": { "type": "adaptive" }
+        });
         let resp = client
             .session_new_full(
                 "/tmp",
                 vec![],
                 Some(SystemPromptTransport::ClaudeMeta("Be concise")),
                 Some("Fizz · #buzz-dev"),
+                true,
+                Some(&thinking_options),
             )
             .await
             .expect("session_new_full should succeed");
@@ -3554,6 +3754,19 @@ mod tests {
             Some("Fizz · #buzz-dev"),
             "_meta.sessionTitle must be present alongside systemPrompt"
         );
+        assert_eq!(
+            received["params"]["_meta"]["claudeCode"]["options"]["settingSources"],
+            serde_json::json!(["project", "local"]),
+            "Claude sessions must exclude user-scoped settings"
+        );
+        assert_eq!(
+            received["params"]["_meta"]["claudeCode"]["options"]["effort"],
+            "max"
+        );
+        assert_eq!(
+            received["params"]["_meta"]["claudeCode"]["options"]["thinking"]["type"],
+            "adaptive"
+        );
     }
 
     // ── Goose-native steer scaffold (PR follow-up to #1160) ──────────────
@@ -3563,7 +3776,7 @@ mod tests {
     /// which is fine — these tests don't read from the agent, they just
     /// feed JSON into the parser.
     async fn spawn_inert_client() -> AcpClient {
-        AcpClient::spawn("cat", &[], &[], false)
+        AcpClient::spawn("cat", &[], &[], false, None)
             .await
             .expect("spawn cat as inert client")
     }
@@ -4409,7 +4622,7 @@ mod tests {
     fn build_codex_config_env_returns_none_when_no_codex_config_in_extra_env() {
         // Non-Codex agents: extra_env has no CODEX_CONFIG → None regardless of signal.
         let extra = env(&[("GOOSE_PROVIDER", "openai")]);
-        let result = build_codex_config_env(&extra, None, false).unwrap();
+        let result = build_codex_config_env(&extra, None, false, None).unwrap();
         assert_eq!(
             result, None,
             "no CODEX_CONFIG in extra_env must return None"
@@ -4423,7 +4636,7 @@ mod tests {
         let extra = env(&[("CODEX_CONFIG", GENERATED)]);
         let parent =
             r#"{"some_operator_key":"val","sandbox_workspace_write":{"operator_key":"keep"}}"#;
-        let merged = build_codex_config_env(&extra, Some(parent), true)
+        let merged = build_codex_config_env(&extra, Some(parent), true, None)
             .unwrap()
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
@@ -4449,7 +4662,7 @@ mod tests {
         // Must return None — no merging, no sandbox widening.
         let persona = r#"{"some_feature":"on"}"#;
         let extra = env(&[("CODEX_CONFIG", persona)]);
-        let result = build_codex_config_env(&extra, None, false).unwrap();
+        let result = build_codex_config_env(&extra, None, false, None).unwrap();
         assert_eq!(
             result, None,
             "persona-only CODEX_CONFIG with signal=false must return None"
@@ -4461,7 +4674,7 @@ mod tests {
         // Alias: same scenario as above, confirms the old count-based path no longer exists.
         let persona = r#"{"some_feature":"on"}"#;
         let extra = env(&[("CODEX_CONFIG", persona)]);
-        let result = build_codex_config_env(&extra, None, false).unwrap();
+        let result = build_codex_config_env(&extra, None, false, None).unwrap();
         assert_eq!(
             result, None,
             "persona-only CODEX_CONFIG with signal=false must return None"
@@ -4473,7 +4686,9 @@ mod tests {
         // Persona + generated overlay, signal=true: network_access is forced true.
         let persona = r#"{}"#;
         let extra = env(&[("CODEX_CONFIG", persona), ("CODEX_CONFIG", GENERATED)]);
-        let merged = build_codex_config_env(&extra, None, true).unwrap().unwrap();
+        let merged = build_codex_config_env(&extra, None, true, None)
+            .unwrap()
+            .unwrap();
         let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
         assert_eq!(v["sandbox_workspace_write"]["network_access"], true);
     }
@@ -4485,7 +4700,9 @@ mod tests {
         let persona_cfg = r#"{"some_feature":{"enabled":true}}"#;
         // Config::from_args appends generated AFTER persona env vars.
         let extra = env(&[("CODEX_CONFIG", persona_cfg), ("CODEX_CONFIG", GENERATED)]);
-        let merged = build_codex_config_env(&extra, None, true).unwrap().unwrap();
+        let merged = build_codex_config_env(&extra, None, true, None)
+            .unwrap()
+            .unwrap();
         let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
         assert_eq!(
             v["some_feature"]["enabled"], true,
@@ -4506,7 +4723,7 @@ mod tests {
         let persona_cfg = r#"{"sandbox_workspace_write":{"persona_only":"keep_me"}}"#;
         let extra = env(&[("CODEX_CONFIG", persona_cfg), ("CODEX_CONFIG", GENERATED)]);
         let parent = r#"{"sandbox_workspace_write":{"parent_only":"also_here"}}"#;
-        let merged = build_codex_config_env(&extra, Some(parent), true)
+        let merged = build_codex_config_env(&extra, Some(parent), true, None)
             .unwrap()
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
@@ -4535,7 +4752,7 @@ mod tests {
         // Config::from_args appends generated AFTER persona env vars.
         let extra = env(&[("CODEX_CONFIG", persona_cfg), ("CODEX_CONFIG", GENERATED)]);
         let parent = r#"{"parent_key":"parent_val","shared_key":"parent_version"}"#;
-        let merged = build_codex_config_env(&extra, Some(parent), true)
+        let merged = build_codex_config_env(&extra, Some(parent), true, None)
             .unwrap()
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
@@ -4566,7 +4783,7 @@ mod tests {
         let extra = env(&[("CODEX_CONFIG", persona), ("CODEX_CONFIG", GENERATED)]);
         let parent =
             r#"{"sandbox_workspace_write":{"network_access":false,"other_sandbox_key":"val"}}"#;
-        let merged = build_codex_config_env(&extra, Some(parent), true)
+        let merged = build_codex_config_env(&extra, Some(parent), true, None)
             .unwrap()
             .unwrap();
         let v: serde_json::Value = serde_json::from_str(&merged).unwrap();
@@ -4577,10 +4794,29 @@ mod tests {
     }
 
     #[test]
+    fn build_codex_config_env_merges_effort_without_losing_existing_config() {
+        let persona = r#"{"approval_policy":"never","persona_only":true}"#;
+        let extra = env(&[("CODEX_CONFIG", persona)]);
+        let parent = r#"{"sandbox_mode":"workspace-write","model_reasoning_effort":"low"}"#;
+        let merged = build_codex_config_env(&extra, Some(parent), false, Some("xhigh"))
+            .unwrap()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(value["approval_policy"], "never");
+        assert_eq!(value["persona_only"], true);
+        assert_eq!(value["sandbox_mode"], "workspace-write");
+        assert_eq!(value["model_reasoning_effort"], "xhigh");
+        assert!(
+            value.get("sandbox_workspace_write").is_none(),
+            "reasoning-only merge must not widen the network sandbox"
+        );
+    }
+
+    #[test]
     fn build_codex_config_env_errors_on_invalid_persona_json() {
         // Bad persona JSON + generated overlay, signal=true → parse error before merging.
         let extra = env(&[("CODEX_CONFIG", "not-json"), ("CODEX_CONFIG", GENERATED)]);
-        let result = build_codex_config_env(&extra, None, true);
+        let result = build_codex_config_env(&extra, None, true, None);
         assert!(result.is_err(), "invalid persona JSON must return Err");
         let msg = format!("{}", result.unwrap_err());
         assert!(
@@ -4593,7 +4829,7 @@ mod tests {
     fn build_codex_config_env_errors_on_non_object_persona_json() {
         // Non-object persona JSON + generated overlay, signal=true → parse error.
         let extra = env(&[("CODEX_CONFIG", "[1,2,3]"), ("CODEX_CONFIG", GENERATED)]);
-        let result = build_codex_config_env(&extra, None, true);
+        let result = build_codex_config_env(&extra, None, true, None);
         assert!(result.is_err(), "non-object persona JSON must return Err");
     }
 
@@ -4601,7 +4837,7 @@ mod tests {
     fn build_codex_config_env_errors_on_invalid_parent_json() {
         let persona = r#"{}"#;
         let extra = env(&[("CODEX_CONFIG", persona), ("CODEX_CONFIG", GENERATED)]);
-        let result = build_codex_config_env(&extra, Some("bad-json"), true);
+        let result = build_codex_config_env(&extra, Some("bad-json"), true, None);
         assert!(result.is_err(), "invalid parent env JSON must return Err");
     }
 
@@ -4614,7 +4850,7 @@ mod tests {
         let extra = env(&[("CODEX_CONFIG", persona), ("CODEX_CONFIG", GENERATED)]);
         // Parent replaces the object with a scalar — deep_merge: scalar overlay wins.
         let parent = r#"{"sandbox_workspace_write": 42}"#;
-        let result = build_codex_config_env(&extra, Some(parent), true);
+        let result = build_codex_config_env(&extra, Some(parent), true, None);
         assert!(
             result.is_err(),
             "non-object sandbox_workspace_write must return Err"

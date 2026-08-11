@@ -37,12 +37,12 @@ use serde_json::{json, Value};
 use tokio::io::BufReader;
 use tokio::sync::{mpsc, watch, Mutex};
 
-use crate::agent::RunCtx;
+use crate::agent::{RunCtx, SteerMessage};
 use crate::config::{Config, MAX_SYSTEM_PROMPT_BYTES, PROTOCOL_VERSION};
 use crate::hints::SkillEntry;
 use crate::llm::Llm;
 use crate::mcp::McpRegistry;
-use crate::types::{ContentBlock, HistoryItem};
+use crate::types::HistoryItem;
 use crate::wire::{
     classify, goose_session_update, Inbound, InitializeParams, SessionCancelParams,
     SessionNewParams, SessionPromptParams, SessionSetModelParams, SessionSteerParams, WireMsg,
@@ -53,12 +53,21 @@ struct App {
     cfg: Config,
     llm: Arc<Llm>,
     sessions: Mutex<HashMap<String, Session>>,
+    /// Serial admission queue for steer requests. The worker enqueues them into
+    /// each run in stdin order while per-request pickup ACKs resolve separately.
+    steer_requests: mpsc::Sender<SteerCommand>,
     /// Cached model catalog for Databricks providers. Populated lazily on the
     /// first successful `session/new` discovery call. Failed discovery is never
     /// cached: static-token authentication errors reject session creation, while
     /// OAuth authentication and non-auth errors use the configured model for that
     /// response and retry on the next session.
     models_cache: tokio::sync::OnceCell<Vec<ModelEntry>>,
+}
+
+struct SteerCommand {
+    id: Value,
+    params: Value,
+    wire_tx: WireSender,
 }
 
 struct Session {
@@ -78,7 +87,7 @@ struct Session {
     /// `cancel_tx`); the running prompt loop holds the matching receiver and
     /// drains queued steers at round boundaries. `None` when no prompt is in
     /// flight.
-    steer_tx: Option<mpsc::UnboundedSender<Vec<ContentBlock>>>,
+    steer_tx: Option<mpsc::UnboundedSender<SteerMessage>>,
     original_task: Option<String>,
     handoff_count: usize,
     /// Cache-summed input tokens the provider reported for this session's most
@@ -180,11 +189,22 @@ async fn async_main() {
     let cfg = Config::from_env().unwrap_or_else(|e| die(e));
     let llm = Arc::new(Llm::new(&cfg).unwrap_or_else(|e| die(e.to_string())));
     let max_line = cfg.max_line_bytes;
+    let (steer_requests, mut steer_request_rx) = mpsc::channel::<SteerCommand>(64);
     let app = Arc::new(App {
         cfg,
         llm,
         sessions: Mutex::new(HashMap::new()),
+        steer_requests,
         models_cache: tokio::sync::OnceCell::new(),
+    });
+    let weak_app = Arc::downgrade(&app);
+    let steer_worker = tokio::spawn(async move {
+        while let Some(command) = steer_request_rx.recv().await {
+            let Some(app) = weak_app.upgrade() else {
+                break;
+            };
+            steer_session(&app, command.id, command.params, &command.wire_tx).await;
+        }
     });
     let (wire_tx, wire_rx) = mpsc::channel::<WireMsg>(64);
     let writer = tokio::spawn(wire::writer_task(wire_rx));
@@ -201,6 +221,8 @@ async fn async_main() {
     for session in app.sessions.lock().await.values() {
         let _ = session.cancel_tx.send(true);
     }
+    steer_worker.abort();
+    let _ = steer_worker.await;
     let _ = writer.await;
 }
 
@@ -268,7 +290,21 @@ async fn handle_request(
         // `_goose/unstable/session/steer` wire contract so a single client-side
         // delivery path serves both agents.
         "_goose/unstable/session/steer" => {
-            steer_session(app, id, params, wire_tx).await;
+            let command = SteerCommand {
+                id,
+                params,
+                wire_tx: wire_tx.clone(),
+            };
+            if let Err(error) = app.steer_requests.try_send(command) {
+                let command = error.into_inner();
+                reject(
+                    wire_tx,
+                    command.id,
+                    INVALID_PARAMS,
+                    "steer: admission queue unavailable",
+                )
+                .await;
+            }
         }
         _ => {
             wire::send(
@@ -586,9 +622,9 @@ async fn set_model_session(app: &Arc<App>, id: Value, params: Value, wire_tx: &W
 ///   - `expectedRunId` mismatch → `invalid_params` (caller is steering a turn
 ///     that already ended or rotated; it must fall back to cancel+merge)
 ///
-/// On success the message is queued for pickup at the next round boundary and
-/// we reply `{ runId, messageId }`, then emit a `queuedSteer` session/update so
-/// the client can correlate the accepted steer with its eventual pickup.
+/// On success the message is picked up at a round boundary before we reply
+/// `{ runId, messageId }`. If the run finishes first, dropping the receiver
+/// rejects the request instead of acknowledging a message that was never used.
 async fn steer_session(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireSender) {
     let p: SessionSteerParams = match decode(params, "_goose/unstable/session/steer") {
         Ok(p) => p,
@@ -613,6 +649,7 @@ async fn steer_session(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireS
         .await;
     }
     let message_id = format!("steer_{}", session_token().unwrap_or_else(|_| "x".into()));
+    let (delivered_tx, delivered_rx) = tokio::sync::oneshot::channel();
     let run_id = {
         let sessions = app.sessions.lock().await;
         let Some(s) = sessions.get(&p.session_id) else {
@@ -635,27 +672,49 @@ async fn steer_session(app: &Arc<App>, id: Value, params: Value, wire_tx: &WireS
         }
         // A live run always has a steer_tx; if the channel is gone the run is
         // tearing down — treat as no active run rather than queue into the void.
-        match &s.steer_tx {
-            Some(tx) if tx.send(p.prompt).is_ok() => active.to_owned(),
-            _ => return reject(wire_tx, id, INVALID_PARAMS, "steer: no active run to steer").await,
+        let Some(tx) = &s.steer_tx else {
+            return reject(wire_tx, id, INVALID_PARAMS, "steer: no active run to steer").await;
+        };
+        if tx
+            .send(SteerMessage {
+                blocks: p.prompt,
+                delivered: delivered_tx,
+            })
+            .is_err()
+        {
+            return reject(wire_tx, id, INVALID_PARAMS, "steer: no active run to steer").await;
         }
+        active.to_owned()
     };
-    wire::send(
-        wire_tx,
-        wire::ok(id, json!({ "runId": run_id, "messageId": message_id })),
-    )
-    .await;
-    // Best-effort correlation hint for the client; mirrors goose's
-    // `send_queued_steer_update`. Not load-bearing for delivery.
-    wire::send(
-        wire_tx,
-        wire::session_update_with_goose_meta(
-            &p.session_id,
-            json!({ "sessionUpdate": "session_info_update" }),
-            json!({ "queuedSteer": { "messageId": message_id, "runId": run_id } }),
-        ),
-    )
-    .await;
+    let session_id = p.session_id;
+    let wire_tx = wire_tx.clone();
+    tokio::spawn(async move {
+        if delivered_rx.await.is_err() {
+            return reject(
+                &wire_tx,
+                id,
+                INVALID_PARAMS,
+                "steer: active run completed before delivery",
+            )
+            .await;
+        }
+        wire::send(
+            &wire_tx,
+            wire::ok(id, json!({ "runId": run_id, "messageId": message_id })),
+        )
+        .await;
+        // Best-effort correlation hint for the client; mirrors goose's
+        // `send_queued_steer_update`. Not load-bearing for delivery.
+        wire::send(
+            &wire_tx,
+            wire::session_update_with_goose_meta(
+                &session_id,
+                json!({ "sessionUpdate": "session_info_update" }),
+                json!({ "queuedSteer": { "messageId": message_id, "runId": run_id } }),
+            ),
+        )
+        .await;
+    });
 }
 
 fn spawn_prompt(app: Arc<App>, id: Value, params: Value, wire_tx: WireSender) {
@@ -867,7 +926,7 @@ async fn acquire_session(
         Arc<str>,
         Option<String>,
         String,
-        mpsc::UnboundedReceiver<Vec<ContentBlock>>,
+        mpsc::UnboundedReceiver<SteerMessage>,
         crate::types::SessionUsageBaseline,
     ),
     &'static str,

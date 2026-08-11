@@ -4,8 +4,9 @@
 //! Config file (TOML) for complex subscription rules.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use buzz_core::reasoning::{resolve_anthropic_thinking, AnthropicThinking, ThinkingEffort};
 use clap::Parser;
 use clap::ValueEnum;
 use nostr::Keys;
@@ -47,6 +48,86 @@ pub enum ConfigError {
     ConfigFile(String),
 }
 
+/// Environment variable an operator sets to pin the session working directory.
+///
+/// See `crates/buzz-persona/PERSONA_PACK_SPEC.md` § `$AGENT_CWD` Definition.
+pub const AGENT_CWD_ENV: &str = "AGENT_CWD";
+/// Shared effort selector used by the native runner and external ACP harnesses.
+pub const THINKING_EFFORT_ENV: &str = "BUZZ_AGENT_THINKING_EFFORT";
+
+#[derive(Debug, Error, PartialEq)]
+pub enum AgentCwdError {
+    #[error(
+        "{AGENT_CWD_ENV} is set to `{0}`, which is not an absolute path. \
+         The session working directory must be absolute so agents can resolve \
+         workspace files without searching $HOME."
+    )]
+    NotAbsolute(String),
+
+    #[error("{AGENT_CWD_ENV} is set to `{0}`, which is not an existing directory")]
+    NotADirectory(String),
+
+    #[error(
+        "cannot determine the session working directory: {AGENT_CWD_ENV} is unset \
+         and the current directory is unavailable ({0})"
+    )]
+    Undeterminable(String),
+}
+
+/// Resolve the value buzz-acp passes as `NewSessionRequest.cwd`.
+///
+/// Implements the order the persona pack spec already documents:
+///
+/// 1. `AGENT_CWD`, when set.
+/// 2. `std::env::current_dir()` as a fallback.
+/// 3. Otherwise refuse to start.
+///
+/// An `AGENT_CWD` that is set but unusable is an error rather than a silent
+/// fall-through to step 2: an operator who pinned a workspace and got the
+/// process directory instead would only notice once an agent answered without
+/// the repository's instructions loaded.
+///
+/// `current_dir` and `is_dir` are injected so the resolution order is testable
+/// without mutating process-global state.
+pub fn resolve_agent_cwd_with(
+    env_value: Option<String>,
+    current_dir: Result<PathBuf, std::io::Error>,
+    is_dir: impl Fn(&Path) -> bool,
+) -> Result<String, AgentCwdError> {
+    if let Some(raw) = env_value {
+        let trimmed = raw.trim();
+        // An empty or whitespace-only value reads as "unset" in every shell
+        // idiom that builds it (`AGENT_CWD=${WORKSPACE}`), so fall through.
+        if !trimmed.is_empty() {
+            let path = Path::new(trimmed);
+            if !path.is_absolute() {
+                return Err(AgentCwdError::NotAbsolute(trimmed.to_string()));
+            }
+            if !is_dir(path) {
+                return Err(AgentCwdError::NotADirectory(trimmed.to_string()));
+            }
+            return Ok(trimmed.to_string());
+        }
+    }
+
+    current_dir
+        .map(|path| path.to_string_lossy().to_string())
+        .map_err(|err| AgentCwdError::Undeterminable(err.to_string()))
+}
+
+/// Process-level entry point for [`resolve_agent_cwd_with`].
+pub fn resolve_agent_cwd() -> Result<String, AgentCwdError> {
+    resolve_agent_cwd_with(
+        std::env::var(AGENT_CWD_ENV).ok(),
+        std::env::current_dir(),
+        |path| path.is_dir(),
+    )
+}
+
+const CLAUDE_UNRESOLVED_MODEL_MESSAGE: &str =
+    "resolved BUZZ_AGENT_THINKING_EFFORT for Claude: model name does not identify a versioned Claude family, omitting thinking options; use a canonical model ID through Custom model... (for example, claude-opus-5[1m])";
+const LOCAL_CLAUDE_ALIAS_ASSUMPTION_MESSAGE: &str =
+    "resolved BUZZ_AGENT_THINKING_EFFORT for Claude via local fork assumption for unversioned model alias";
 #[derive(Debug, Clone, PartialEq, clap::ValueEnum)]
 pub enum SubscribeMode {
     Mentions,
@@ -58,6 +139,15 @@ pub enum SubscribeMode {
 pub enum DedupMode {
     Drop,
     Queue,
+}
+
+/// Policy for non-DM channels that are absent from the local workspace index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum UnindexedChannelPolicy {
+    /// Refuse to create a session outside a declared workspace.
+    Refuse,
+    /// Explicitly allow the harness process directory as the session cwd.
+    Root,
 }
 
 /// How to handle new @mentions while a turn is already in-flight for that channel.
@@ -261,6 +351,25 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_MCP_COMMAND", default_value = "")]
     pub mcp_command: String,
 
+    /// Additional MCP servers, comma-separated, each `name=/path` or `/path`.
+    ///
+    /// Exists because `BUZZ_ACP_MCP_COMMAND` is a single slot reserved by Buzz
+    /// Desktop for `buzz-mcp`, so an operator has no way to add a server of
+    /// their own. Each entry must be directly executable (a shebang is enough);
+    /// arguments are not parsed, so wrap anything that needs them in a script.
+    /// Without an explicit name the server is named after its file stem, which
+    /// is why `hindsight=…/mcp-server.js` reads better than the bare path.
+    ///
+    /// These servers receive an EMPTY environment — no relay URL, no agent
+    /// secret key, no auth tag. Only `buzz-mcp` gets the agent's identity.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_MCP_EXTRA",
+        default_value = "",
+        value_delimiter = ','
+    )]
+    pub mcp_extra: Vec<String>,
+
     /// Idle timeout: max seconds of silence before killing a turn.
     /// Resets on any agent stdout activity.
     #[arg(long, env = "BUZZ_ACP_IDLE_TIMEOUT")]
@@ -373,6 +482,22 @@ pub struct CliArgs {
           value_parser = clap::value_parser!(u32))]
     pub max_turns_per_session: u32,
 
+    /// Idle time after which a conversation's session is closed, in seconds.
+    ///
+    /// Unset keeps the per-harness default measured for each adapter (a session
+    /// costs ~535 MB under claude-agent-acp and ~0.7 MB under opencode, so one
+    /// global number cannot serve both). 0 disables idle eviction.
+    #[arg(long, env = "BUZZ_ACP_SESSION_IDLE_TTL_SECS")]
+    pub session_idle_ttl_secs: Option<u64>,
+
+    /// Maximum sessions one agent may hold at once.
+    ///
+    /// Bounds a burst of conversations arriving faster than the idle TTL can
+    /// retire them. Unset keeps the per-harness default; 0 disables the cap.
+    /// Total across the pool is this times `--agents`.
+    #[arg(long, env = "BUZZ_ACP_MAX_LIVE_SESSIONS")]
+    pub max_live_sessions: Option<usize>,
+
     /// Disable automatic presence (online/offline) status.
     #[arg(long, env = "BUZZ_ACP_NO_PRESENCE")]
     pub no_presence: bool,
@@ -423,11 +548,35 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_MODEL")]
     pub model: Option<String>,
 
+    /// Reasoning effort translated to the configured external ACP harness.
+    #[arg(long, env = "BUZZ_AGENT_THINKING_EFFORT")]
+    pub thinking_effort: Option<String>,
+
     /// Title for the agent's ACP sessions, passed out-of-band in `session/new`
     /// `_meta`. Adapters that recognize it name the session after this value;
     /// others ignore it. Never enters the prompt.
     #[arg(long, env = "BUZZ_ACP_SESSION_TITLE")]
     pub session_title: Option<String>,
+
+    /// Isolate Claude ACP sessions from user-scoped settings, hooks, MCP
+    /// servers, and personal instructions. Project and local settings remain.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_CLAUDE_ISOLATE_USER_CONFIG",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub claude_isolate_user_config: bool,
+
+    /// Policy for non-DM channels not declared by a local workspace index.
+    /// Channels whose type cannot be determined are always refused.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_UNINDEXED_CHANNEL_POLICY",
+        default_value = "refuse",
+        value_enum
+    )]
+    pub unindexed_channel_policy: UnindexedChannelPolicy,
 
     /// Permission mode for agents that support `session/set_config_option`
     /// with `configId: "mode"` (e.g. `claude-agent-acp`).
@@ -500,6 +649,8 @@ pub struct Config {
     pub agent_command: String,
     pub agent_args: Vec<String>,
     pub mcp_command: String,
+    /// Extra MCP servers (executable paths); empty entries ignored.
+    pub mcp_extra: Vec<String>,
     pub idle_timeout_secs: u64,
     pub max_turn_duration_secs: u64,
     pub agents: u32,
@@ -524,6 +675,10 @@ pub struct Config {
     pub context_message_limit: u32,
     /// Maximum turns per session before proactive rotation. 0 = disabled.
     pub max_turns_per_session: u32,
+    /// Idle seconds before a session is closed. `None` = per-harness default.
+    pub session_idle_ttl_secs: Option<u64>,
+    /// Cap on live sessions per agent. `None` = per-harness default.
+    pub max_live_sessions: Option<usize>,
     pub presence_enabled: bool,
     pub typing_enabled: bool,
     /// Whether NIP-AE agent core memory injection is enabled. When false,
@@ -533,9 +688,16 @@ pub struct Config {
     pub memory_enabled: bool,
     /// Desired LLM model ID. Applied after every `session_new_full()`.
     pub model: Option<String>,
+    /// Validated reasoning effort. `None` preserves the harness default.
+    pub thinking_effort: Option<ThinkingEffort>,
     /// Sanitized session title, sent as `_meta.sessionTitle` on `session/new`.
     /// `None` when unset or when the configured value sanitized to empty.
     pub session_title: Option<String>,
+    /// Whether Claude ACP sessions exclude user-scoped settings, hooks, MCP
+    /// servers, and personal instructions. Enabled by default.
+    pub claude_isolate_user_config: bool,
+    /// Policy for non-DM channels absent from the local workspace index.
+    pub unindexed_channel_policy: UnindexedChannelPolicy,
     /// Permission mode to apply after session creation. `Default` = skip.
     pub permission_mode: PermissionMode,
     /// Inbound author gate mode.
@@ -697,6 +859,150 @@ pub(crate) fn normalize_agent_command_identity(command: &str) -> String {
         .collect()
 }
 
+/// Map the shared effort axis to Codex's supported range.
+///
+/// Codex has no `none` or `max`: saturate those endpoints to its documented
+/// minimum and maximum (`minimal` and `xhigh`) rather than dropping the setting.
+pub(crate) fn codex_reasoning_effort(effort: ThinkingEffort) -> &'static str {
+    match effort {
+        ThinkingEffort::None | ThinkingEffort::Minimal => "minimal",
+        ThinkingEffort::Low => "low",
+        ThinkingEffort::Medium => "medium",
+        ThinkingEffort::High => "high",
+        ThinkingEffort::XHigh | ThinkingEffort::Max => "xhigh",
+    }
+}
+
+pub(crate) fn codex_reasoning_effort_for_command(
+    command: &str,
+    effort: Option<ThinkingEffort>,
+) -> Option<&'static str> {
+    matches!(
+        normalize_agent_command_identity(command).as_str(),
+        "codex" | "codex-acp"
+    )
+    .then(|| effort.map(codex_reasoning_effort))
+    .flatten()
+}
+
+/// Build the Claude Agent SDK options sent through `_meta.claudeCode.options`.
+///
+/// Unknown model families deliberately return `None`; guessing adaptive versus
+/// manual thinking can produce an invalid SDK request. `none`/`minimal` are
+/// rejected during startup for Claude and remain defensive omissions here.
+pub(crate) fn claude_thinking_options(
+    model: &str,
+    effort: ThinkingEffort,
+) -> Option<serde_json::Value> {
+    if matches!(effort, ThinkingEffort::None | ThinkingEffort::Minimal) {
+        return None;
+    }
+    let effective_model = local_unversioned_claude_alias_family(model).unwrap_or(model);
+    match resolve_anthropic_thinking(effective_model, effort)? {
+        AnthropicThinking::Adaptive { effort } => Some(serde_json::json!({
+            "effort": effort.as_str(),
+            "thinking": { "type": "adaptive" }
+        })),
+        AnthropicThinking::ManualBudget { budget_tokens } => Some(serde_json::json!({
+            "thinking": { "type": "enabled", "budgetTokens": budget_tokens }
+        })),
+    }
+}
+
+/// Resolve unversioned Claude aliases according to this fork owner's runtime policy.
+///
+/// This is a local assumption, not a fact about the aliases. The upstream
+/// `feat/acp-thinking-effort` branch deliberately requires a versioned model ID.
+/// These concrete families will become stale when an alias moves (for example,
+/// `opus` starts selecting Opus 6), so they must be updated with the local model
+/// policy. We cannot safely represent "latest adaptive family" instead:
+/// `clamp_adaptive_effort` derives capabilities such as `xhigh` support from a
+/// concrete family ID.
+fn local_unversioned_claude_alias_family(model: &str) -> Option<&'static str> {
+    let alias = if model.ends_with(']') {
+        model.rfind('[').map_or(model, |index| &model[..index])
+    } else {
+        model
+    };
+    match alias {
+        "opus" => Some("claude-opus-5"),
+        "fable" => Some("claude-fable-5"),
+        "sonnet" => Some("claude-sonnet-5"),
+        _ => None,
+    }
+}
+
+fn resolve_thinking_effort(
+    raw: Option<&str>,
+    agent_command: &str,
+    model: Option<&str>,
+) -> Result<Option<ThinkingEffort>, ConfigError> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let effort = raw
+        .parse::<ThinkingEffort>()
+        .map_err(ConfigError::ConfigFile)?;
+    let harness = normalize_agent_command_identity(agent_command);
+    match harness.as_str() {
+        "claude-agent-acp" | "claude-code-acp" | "claude-code" | "claudecode" => {
+            if matches!(effort, ThinkingEffort::None | ThinkingEffort::Minimal) {
+                return Err(ConfigError::ConfigFile(format!(
+                    "{THINKING_EFFORT_ENV}={} is not supported by claude-agent-acp; accepted Claude values: low|medium|high|xhigh|max",
+                    effort.as_str()
+                )));
+            }
+            match model.and_then(|model| claude_thinking_options(model, effort)) {
+                Some(options) => {
+                    if let Some(assumed_family) =
+                        model.and_then(local_unversioned_claude_alias_family)
+                    {
+                        tracing::info!(
+                            effort = effort.as_str(),
+                            model = model.unwrap_or_default(),
+                            assumed_family,
+                            options = %options,
+                            "{LOCAL_CLAUDE_ALIAS_ASSUMPTION_MESSAGE}"
+                        );
+                    } else {
+                        tracing::info!(
+                            effort = effort.as_str(),
+                            model = model.unwrap_or_default(),
+                            options = %options,
+                            "resolved BUZZ_AGENT_THINKING_EFFORT for Claude via session/new _meta.claudeCode.options"
+                        );
+                    }
+                }
+                None => tracing::info!(
+                    effort = effort.as_str(),
+                    model = model.unwrap_or("<unset>"),
+                    "{CLAUDE_UNRESOLVED_MODEL_MESSAGE}"
+                ),
+            }
+        }
+        "codex" | "codex-acp" => tracing::info!(
+            effort = effort.as_str(),
+            model_reasoning_effort = codex_reasoning_effort(effort),
+            "resolved BUZZ_AGENT_THINKING_EFFORT for Codex via merged CODEX_CONFIG"
+        ),
+        "buzz-agent" => tracing::info!(
+            effort = effort.as_str(),
+            "resolved BUZZ_AGENT_THINKING_EFFORT for native buzz-agent via inherited environment"
+        ),
+        "opencode" | "opencode-acp" => {
+            return Err(ConfigError::ConfigFile(format!(
+                "{THINKING_EFFORT_ENV} is not supported for opencode: OPENCODE_CONFIG is a file path and buzz-acp will not create or rewrite user config files; remove the variable or configure agent.build.variant in opencode"
+            )));
+        }
+        _ => {
+            return Err(ConfigError::ConfigFile(format!(
+                "{THINKING_EFFORT_ENV} is set but harness `{harness}` has no supported effort translation; supported harnesses: claude-agent-acp, codex-acp, buzz-agent"
+            )));
+        }
+    }
+    Ok(Some(effort))
+}
+
 fn default_agent_args(command: &str) -> Option<Vec<String>> {
     match normalize_agent_command_identity(command).as_str() {
         "goose" => Some(vec!["acp".to_string()]),
@@ -718,9 +1024,17 @@ fn default_agent_args(command: &str) -> Option<Vec<String>> {
 /// startup budget (see block/buzz#3355). Skip that unrelated global startup
 /// by default; an operator or persona can still opt back in by setting the
 /// variable explicitly.
+///
+/// Claude: disable personal CLAUDE.md loading and auto-memory in the managed
+/// child process. Session-level isolation separately removes user-scoped hooks,
+/// MCP servers, and settings while preserving project/local settings.
 pub(crate) fn default_agent_env(command: &str) -> &'static [(&'static str, &'static str)] {
     match normalize_agent_command_identity(command).as_str() {
         "hermes" | "hermes-agent" | "hermes-acp" => &[("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")],
+        "claude-agent-acp" | "claude-code-acp" | "claude-code" | "claudecode" => &[
+            ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1"),
+            ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
+        ],
         _ => &[],
     }
 }
@@ -1045,7 +1359,20 @@ impl Config {
         // Spawned desktop agents now carry a complete instance snapshot. Team
         // instructions arrive independently so they can be layered at runtime.
         let mut persona_env_vars = Vec::new();
-        let model = args.model;
+        let model = args.model.filter(|value| !value.trim().is_empty());
+        let thinking_effort = resolve_thinking_effort(
+            args.thinking_effort.as_deref(),
+            &agent_command,
+            model.as_deref(),
+        )?;
+        if normalize_agent_command_identity(&agent_command) == "buzz-agent" {
+            if let Some(effort) = thinking_effort {
+                // Environment-launched agents inherit this naturally. Also add
+                // it explicitly so the equivalent --thinking-effort CLI flag
+                // reaches the native child when no parent variable exists.
+                persona_env_vars.push((THINKING_EFFORT_ENV.into(), effort.as_str().into()));
+            }
+        }
 
         // Inject CODEX_CONFIG so the @agentclientprotocol/codex-acp adapter (1.x)
         // opens the Seatbelt network sandbox for buzz-cli (an MCP subprocess). No-op
@@ -1066,6 +1393,7 @@ impl Config {
             agent_command,
             agent_args,
             mcp_command: args.mcp_command,
+            mcp_extra: args.mcp_extra,
             idle_timeout_secs,
             max_turn_duration_secs,
             agents: args.agents,
@@ -1090,14 +1418,19 @@ impl Config {
             config_path: args.config,
             context_message_limit: args.context_message_limit,
             max_turns_per_session: args.max_turns_per_session,
+            session_idle_ttl_secs: args.session_idle_ttl_secs,
+            max_live_sessions: args.max_live_sessions,
             presence_enabled: !args.no_presence,
             typing_enabled: !args.no_typing,
             memory_enabled: args.memory && !args.no_memory,
             model,
+            thinking_effort,
             session_title: args
                 .session_title
                 .as_deref()
                 .and_then(sanitize_session_title),
+            claude_isolate_user_config: args.claude_isolate_user_config,
+            unindexed_channel_policy: args.unindexed_channel_policy,
             permission_mode: args.permission_mode,
             respond_to: args.respond_to,
             respond_to_allowlist,
@@ -1131,7 +1464,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} claude_isolate_user_config={} unindexed_channel_policy={:?} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1151,6 +1484,8 @@ impl Config {
             self.typing_enabled,
             self.memory_enabled,
             self.model.as_deref().unwrap_or("(agent default)"),
+            self.claude_isolate_user_config,
+            self.unindexed_channel_policy,
             self.permission_mode,
             respond_to_detail,
             allowed_respond_to_detail,
@@ -1445,6 +1780,7 @@ mod tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "".into(),
+            mcp_extra: vec![],
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -1464,11 +1800,16 @@ mod tests {
             config_path: PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            session_idle_ttl_secs: None,
+            max_live_sessions: None,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: true,
             model: None,
+            thinking_effort: None,
             session_title: None,
+            claude_isolate_user_config: true,
+            unindexed_channel_policy: UnindexedChannelPolicy::Refuse,
             permission_mode: PermissionMode::BypassPermissions,
             respond_to: RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
@@ -1641,7 +1982,7 @@ mod tests {
     }
 
     #[test]
-    fn default_agent_env_recognizes_hermes_identities() {
+    fn default_agent_env_recognizes_runtime_identities() {
         for command in [
             "hermes",
             "hermes-agent",
@@ -1656,10 +1997,27 @@ mod tests {
                 "unexpected env defaults for {command}"
             );
         }
-        for command in ["goose", "codex-acp", "claude-agent-acp", "buzz-agent", ""] {
+        for command in [
+            "claude-agent-acp",
+            "claude-code-acp",
+            "claude-code",
+            "claudecode",
+            "/opt/claude/bin/claude-agent-acp",
+            r"C:\Users\test\bin\Claude_Code_ACP.CMD",
+        ] {
+            assert_eq!(
+                default_agent_env(command),
+                &[
+                    ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1"),
+                    ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
+                ],
+                "unexpected env defaults for {command}"
+            );
+        }
+        for command in ["goose", "codex-acp", "buzz-agent", ""] {
             assert!(
                 default_agent_env(command).is_empty(),
-                "non-Hermes command must have no env defaults: {command}"
+                "unrecognized command must have no env defaults: {command}"
             );
         }
     }
@@ -2207,6 +2565,43 @@ channels = "ALL"
     }
 
     #[test]
+    fn claude_user_config_isolation_defaults_on_and_can_be_disabled() {
+        let key = "0".repeat(64);
+        assert!(
+            CliArgs::parse_from(["buzz-acp", "--private-key", &key]).claude_isolate_user_config
+        );
+        assert!(
+            !CliArgs::parse_from([
+                "buzz-acp",
+                "--private-key",
+                &key,
+                "--claude-isolate-user-config=false",
+            ])
+            .claude_isolate_user_config
+        );
+    }
+
+    #[test]
+    fn unindexed_channel_policy_defaults_to_refuse_and_accepts_root_opt_in() {
+        let key = "0".repeat(64);
+        assert_eq!(
+            CliArgs::parse_from(["buzz-acp", "--private-key", &key]).unindexed_channel_policy,
+            UnindexedChannelPolicy::Refuse
+        );
+        assert_eq!(
+            CliArgs::parse_from([
+                "buzz-acp",
+                "--private-key",
+                &key,
+                "--unindexed-channel-policy",
+                "root",
+            ])
+            .unindexed_channel_policy,
+            UnindexedChannelPolicy::Root
+        );
+    }
+
+    #[test]
     fn test_summary_includes_agents_and_heartbeat() {
         let config = test_config(SubscribeMode::Mentions);
         let s = config.summary();
@@ -2218,6 +2613,12 @@ channels = "ALL"
             s.contains("heartbeat=0s"),
             "summary should include heartbeat=0s, got: {s}"
         );
+    }
+
+    #[test]
+    fn summary_includes_claude_user_config_isolation() {
+        let config = test_config(SubscribeMode::Mentions);
+        assert!(config.summary().contains("claude_isolate_user_config=true"));
     }
 
     #[test]
@@ -2952,5 +3353,230 @@ channels = "ALL"
             "Found secret-bearing env args without hide_env_values=true. \
              Add `hide_env_values = true` to each: {violations:?}"
         );
+    }
+
+    // ── $AGENT_CWD resolution ────────────────────────────────────────────────
+    //
+    // Pins the order documented in PERSONA_PACK_SPEC.md § `$AGENT_CWD`
+    // Definition. Resolution is injected rather than read from the process, so
+    // these run in parallel without fighting over the environment.
+
+    fn io_err() -> std::io::Error {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no such directory")
+    }
+
+    #[test]
+    fn agent_cwd_env_wins_over_the_process_directory() {
+        let resolved = resolve_agent_cwd_with(
+            Some("/srv/workspaces/api".to_string()),
+            Ok(PathBuf::from("/opt/buzz")),
+            |_| true,
+        );
+        assert_eq!(resolved, Ok("/srv/workspaces/api".to_string()));
+    }
+
+    #[test]
+    fn agent_cwd_falls_back_to_the_process_directory_when_unset() {
+        let resolved = resolve_agent_cwd_with(None, Ok(PathBuf::from("/opt/buzz")), |_| true);
+        assert_eq!(resolved, Ok("/opt/buzz".to_string()));
+    }
+
+    #[test]
+    fn agent_cwd_treats_a_blank_value_as_unset() {
+        // `AGENT_CWD=${WORKSPACE}` with an unset WORKSPACE expands to "", which
+        // every shell idiom means as "I did not set this".
+        for blank in ["", "   ", "\t\n"] {
+            let resolved = resolve_agent_cwd_with(
+                Some(blank.to_string()),
+                Ok(PathBuf::from("/opt/buzz")),
+                |_| true,
+            );
+            assert_eq!(resolved, Ok("/opt/buzz".to_string()), "blank: {blank:?}");
+        }
+    }
+
+    #[test]
+    fn agent_cwd_is_trimmed() {
+        let resolved = resolve_agent_cwd_with(
+            Some("  /srv/workspaces/api\n".to_string()),
+            Ok(PathBuf::from("/opt/buzz")),
+            |_| true,
+        );
+        assert_eq!(resolved, Ok("/srv/workspaces/api".to_string()));
+    }
+
+    #[test]
+    fn relative_agent_cwd_is_rejected_instead_of_falling_back() {
+        // Falling back here would hand the agent the process directory while the
+        // operator believes the workspace is pinned — the silent failure this
+        // resolution order exists to prevent.
+        let resolved = resolve_agent_cwd_with(
+            Some("workspaces/api".to_string()),
+            Ok(PathBuf::from("/opt/buzz")),
+            |_| true,
+        );
+        assert_eq!(
+            resolved,
+            Err(AgentCwdError::NotAbsolute("workspaces/api".to_string()))
+        );
+    }
+
+    #[test]
+    fn missing_agent_cwd_directory_is_rejected() {
+        let resolved = resolve_agent_cwd_with(
+            Some("/srv/workspaces/typo".to_string()),
+            Ok(PathBuf::from("/opt/buzz")),
+            |_| false,
+        );
+        assert_eq!(
+            resolved,
+            Err(AgentCwdError::NotADirectory(
+                "/srv/workspaces/typo".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn unset_agent_cwd_and_unavailable_process_directory_refuses_to_start() {
+        let resolved = resolve_agent_cwd_with(None, Err(io_err()), |_| true);
+        assert!(
+            matches!(resolved, Err(AgentCwdError::Undeterminable(_))),
+            "expected refusal, got {resolved:?}"
+        );
+    }
+
+    #[test]
+    fn agent_cwd_never_silently_resolves_to_the_root_fallback() {
+        // The previous `unwrap_or_else(|_| PathBuf::from("/"))` produced a cwd of
+        // "/", which `workspace_section` drops — leaving protocol-v1 harnesses
+        // (#3148) to scan the whole filesystem. Refusing to start replaces it.
+        let resolved = resolve_agent_cwd_with(None, Err(io_err()), |_| true);
+        assert_ne!(resolved, Ok("/".to_string()));
+    }
+
+    #[test]
+    fn codex_effort_matrix_saturates_only_unsupported_endpoints() {
+        use buzz_core::reasoning::ThinkingEffort::*;
+        for (input, expected) in [
+            (None, "minimal"),
+            (Minimal, "minimal"),
+            (Low, "low"),
+            (Medium, "medium"),
+            (High, "high"),
+            (XHigh, "xhigh"),
+            (Max, "xhigh"),
+        ] {
+            assert_eq!(codex_reasoning_effort(input), expected);
+        }
+    }
+
+    #[test]
+    fn claude_adaptive_effort_matrix_preserves_high_xhigh_and_max() {
+        use buzz_core::reasoning::ThinkingEffort::*;
+        for effort in [Low, Medium, High, XHigh, Max] {
+            let options = claude_thinking_options("claude-opus-4-8", effort).unwrap();
+            assert_eq!(options["thinking"]["type"], "adaptive");
+            assert_eq!(options["effort"], effort.as_str());
+        }
+        assert_ne!(
+            claude_thinking_options("claude-opus-4-8", High).unwrap()["effort"],
+            claude_thinking_options("claude-opus-4-8", XHigh).unwrap()["effort"]
+        );
+        assert_ne!(
+            claude_thinking_options("claude-opus-4-8", High).unwrap()["effort"],
+            claude_thinking_options("claude-opus-4-8", Max).unwrap()["effort"]
+        );
+    }
+
+    #[test]
+    fn claude_legacy_effort_matrix_uses_manual_budgets() {
+        use buzz_core::reasoning::ThinkingEffort::*;
+        for (effort, budget) in [
+            (Low, 1_024),
+            (Medium, 8_192),
+            (High, 32_768),
+            (XHigh, 32_768),
+            (Max, 32_768),
+        ] {
+            let options = claude_thinking_options("claude-opus-4-5", effort).unwrap();
+            assert_eq!(options["thinking"]["type"], "enabled");
+            assert_eq!(options["thinking"]["budgetTokens"], budget);
+            assert!(options.get("effort").is_none());
+        }
+    }
+
+    #[test]
+    fn claude_unknown_model_and_non_anthropic_levels_omit_options() {
+        use buzz_core::reasoning::ThinkingEffort::{Max, Minimal, None as NoEffort};
+        assert_eq!(claude_thinking_options("claude-future-9", Max), None);
+        assert_eq!(claude_thinking_options("claude-opus-4-8", NoEffort), None);
+        assert_eq!(claude_thinking_options("claude-opus-4-8", Minimal), None);
+    }
+
+    #[test]
+    fn claude_context_suffixes_produce_named_adaptive_effort() {
+        use buzz_core::reasoning::ThinkingEffort::Medium;
+        for model in [
+            "claude-fable-5[1m]",
+            "claude-opus-5[1m]",
+            "goose-claude-fable-5[1m]",
+        ] {
+            let options = claude_thinking_options(model, Medium).unwrap();
+            assert_eq!(options["thinking"]["type"], "adaptive", "model: {model}");
+            assert_eq!(options["effort"], "medium", "model: {model}");
+        }
+    }
+
+    #[test]
+    fn local_claude_alias_policy_produces_named_adaptive_effort() {
+        use buzz_core::reasoning::ThinkingEffort::{High, Max, Medium, XHigh};
+        for alias in ["opus", "opus[1m]", "sonnet", "fable"] {
+            for effort in [Medium, High, XHigh, Max] {
+                let options = claude_thinking_options(alias, effort).unwrap();
+                assert_eq!(options["thinking"]["type"], "adaptive", "alias: {alias}");
+                assert_eq!(options["effort"], effort.as_str(), "alias: {alias}");
+            }
+        }
+    }
+
+    #[test]
+    fn unresolved_haiku_alias_omits_options_with_actionable_message() {
+        use buzz_core::reasoning::ThinkingEffort::Medium;
+        assert_eq!(claude_thinking_options("haiku", Medium), None);
+        assert!(CLAUDE_UNRESOLVED_MODEL_MESSAGE.contains("versioned Claude family"));
+        assert!(CLAUDE_UNRESOLVED_MODEL_MESSAGE.contains("Custom model..."));
+        assert!(CLAUDE_UNRESOLVED_MODEL_MESSAGE.contains("claude-opus-5[1m]"));
+        assert!(LOCAL_CLAUDE_ALIAS_ASSUMPTION_MESSAGE.contains("local fork assumption"));
+    }
+
+    #[test]
+    fn thinking_effort_absent_or_blank_preserves_current_behavior() {
+        assert_eq!(
+            resolve_thinking_effort(None, "codex-acp", Some("gpt-5")).expect("unset is valid"),
+            None
+        );
+        assert_eq!(
+            resolve_thinking_effort(Some("  "), "claude-agent-acp", Some("claude-opus-4-8"))
+                .expect("blank is valid"),
+            None
+        );
+    }
+
+    #[test]
+    fn thinking_effort_invalid_value_lists_every_accepted_value() {
+        let error = resolve_thinking_effort(Some("ultra"), "codex-acp", Some("gpt-5"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("BUZZ_AGENT_THINKING_EFFORT=ultra is invalid"));
+        assert!(error.contains("none|minimal|low|medium|high|xhigh|max"));
+    }
+
+    #[test]
+    fn opencode_refuses_configured_effort_without_writing_a_config_file() {
+        let error = resolve_thinking_effort(Some("max"), "opencode", None)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("OPENCODE_CONFIG is a file path"));
+        assert!(error.contains("will not create or rewrite user config files"));
     }
 }

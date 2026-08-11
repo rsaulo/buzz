@@ -77,9 +77,31 @@ async fn spawn_capturing_fake_llm(responses: Vec<Value>) -> (String, Arc<Mutex<V
 async fn spawn_capturing_fake_llm_with_statuses(
     responses: Vec<CannedResponse>,
 ) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_delayed_capturing_fake_llm_with_statuses(responses, None).await
+}
+
+async fn spawn_delayed_capturing_fake_llm(
+    responses: Vec<Value>,
+    first_delay: Duration,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    spawn_delayed_capturing_fake_llm_with_statuses(
+        responses
+            .into_iter()
+            .map(|body| CannedResponse { status: 200, body })
+            .collect(),
+        Some(first_delay),
+    )
+    .await
+}
+
+async fn spawn_delayed_capturing_fake_llm_with_statuses(
+    responses: Vec<CannedResponse>,
+    first_delay: Option<Duration>,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     let queue = Arc::new(Mutex::new(VecDeque::from(responses)));
+    let first_delay = Arc::new(Mutex::new(first_delay));
     let captures: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     let captures_clone = captures.clone();
     tokio::spawn(async move {
@@ -90,6 +112,7 @@ async fn spawn_capturing_fake_llm_with_statuses(
             };
             let queue = queue.clone();
             let captures = captures_clone.clone();
+            let first_delay = first_delay.clone();
             tokio::spawn(async move {
                 // Read headers.
                 let mut buf = Vec::new();
@@ -136,6 +159,10 @@ async fn spawn_capturing_fake_llm_with_statuses(
                     serde_json::from_slice::<Value>(&body_buf[..content_length.min(body_buf.len())])
                 {
                     captures.lock().await.push(parsed);
+                }
+
+                if let Some(delay) = first_delay.lock().await.take() {
+                    tokio::time::sleep(delay).await;
                 }
 
                 // Send canned response.
@@ -782,6 +809,10 @@ async fn steer_folds_into_active_turn_without_cancelling() {
     let (url, captures) = spawn_capturing_fake_llm(vec![
         openai_tool_call("call_steer", "fake__noop", json!({})),
         openai_text("acknowledged the steer"),
+        // Under scheduler contention the steer handler may enqueue while the
+        // second request is already in flight; the terminal boundary then
+        // forces this extra round rather than acknowledging and dropping it.
+        openai_text("acknowledged a late steer"),
     ])
     .await;
     let mut h = Harness::spawn(&url).await;
@@ -858,6 +889,199 @@ async fn steer_folds_into_active_turn_without_cancelling() {
         "steered text never reached the provider; captured requests: {reqs:#?}"
     );
     drop(reqs);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_steers_reach_history_in_wire_order() {
+    let first = "STEER-FIRST";
+    let second = "STEER-SECOND";
+    let (url, captures) = spawn_delayed_capturing_fake_llm(
+        vec![openai_text("initial answer"), openai_text("after steers")],
+        Duration::from_millis(300),
+    )
+    .await;
+    let mut h = Harness::spawn(&url).await;
+    let sid = init_session(&mut h).await;
+    let prompt_id = h
+        .send(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"start"}]}),
+        )
+        .await;
+    let run_id = recv_active_run_id(&mut h).await;
+    let first_id = h
+        .send(
+            "_goose/unstable/session/steer",
+            json!({
+                "sessionId": sid,
+                "expectedRunId": run_id,
+                "prompt": [{"type":"text","text": first}],
+            }),
+        )
+        .await;
+    let second_id = h
+        .send(
+            "_goose/unstable/session/steer",
+            json!({
+                "sessionId": sid,
+                "expectedRunId": run_id,
+                "prompt": [{"type":"text","text": second}],
+            }),
+        )
+        .await;
+
+    let mut saw_first = false;
+    let mut saw_second = false;
+    let mut saw_prompt = false;
+    for _ in 0..40 {
+        let value = h.recv().await;
+        saw_first |= value["id"] == json!(first_id) && value.get("result").is_some();
+        saw_second |= value["id"] == json!(second_id) && value.get("result").is_some();
+        saw_prompt |= value["id"] == json!(prompt_id) && value.get("result").is_some();
+        if saw_first && saw_second && saw_prompt {
+            break;
+        }
+    }
+    assert!(saw_first && saw_second && saw_prompt);
+
+    let requests = captures.lock().await;
+    let messages = requests
+        .last()
+        .and_then(|request| request["messages"].as_array())
+        .expect("final provider messages");
+    let first_position = messages
+        .iter()
+        .position(|message| message["content"] == first)
+        .expect("first steer in history");
+    let second_position = messages
+        .iter()
+        .position(|message| message["content"] == second)
+        .expect("second steer in history");
+    assert!(first_position < second_position);
+    drop(requests);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn whitespace_steer_is_rejected_instead_of_acknowledged() {
+    let (url, _captures) =
+        spawn_delayed_capturing_fake_llm(vec![openai_text("done")], Duration::from_millis(300))
+            .await;
+    let mut h = Harness::spawn(&url).await;
+    let sid = init_session(&mut h).await;
+    let prompt_id = h
+        .send(
+            "session/prompt",
+            json!({"sessionId": sid, "prompt": [{"type":"text","text":"start"}]}),
+        )
+        .await;
+    let run_id = recv_active_run_id(&mut h).await;
+    let steer_id = h
+        .send(
+            "_goose/unstable/session/steer",
+            json!({
+                "sessionId": sid,
+                "expectedRunId": run_id,
+                "prompt": [{"type":"text","text":"   "}],
+            }),
+        )
+        .await;
+
+    let mut steer = None;
+    let mut prompt_done = false;
+    for _ in 0..40 {
+        let value = h.recv().await;
+        if value["id"] == json!(steer_id) {
+            steer = Some(value);
+        } else if value["id"] == json!(prompt_id) {
+            prompt_done = true;
+        }
+        if steer.is_some() && prompt_done {
+            break;
+        }
+    }
+    let steer = steer.expect("steer rejection");
+    assert_eq!(steer["error"]["code"], -32602);
+    assert!(steer.get("result").is_none());
+    assert!(prompt_done);
+    h.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pending_steer_does_not_block_cancel_and_is_not_falsely_acknowledged() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        let (mut sock, _) = listener.accept().await.unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 4096];
+        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+            let n = sock.read(&mut tmp).await.unwrap_or(0);
+            if n == 0 {
+                return;
+            }
+            buf.extend_from_slice(&tmp[..n]);
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let body = openai_text("too late").to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let _ = sock.write_all(response.as_bytes()).await;
+    });
+
+    let mut h = Harness::spawn(&url).await;
+    let sid = init_session(&mut h).await;
+    let prompt_id = h
+        .send(
+            "session/prompt",
+            json!({
+                "sessionId": sid,
+                "prompt": [{"type":"text","text":"start slow work"}],
+            }),
+        )
+        .await;
+    let run_id = recv_active_run_id(&mut h).await;
+    let steer_id = h
+        .send(
+            "_goose/unstable/session/steer",
+            json!({
+                "sessionId": sid,
+                "expectedRunId": run_id,
+                "prompt": [{"type":"text","text":"late steer"}],
+            }),
+        )
+        .await;
+    let cancel_id = h.send("session/cancel", json!({ "sessionId": sid })).await;
+
+    let mut steer = None;
+    let mut cancel = None;
+    let mut prompt = None;
+    for _ in 0..40 {
+        let value = h.recv().await;
+        if value["id"] == json!(steer_id) {
+            steer = Some(value);
+        } else if value["id"] == json!(cancel_id) {
+            cancel = Some(value);
+        } else if value["id"] == json!(prompt_id) {
+            prompt = Some(value);
+        }
+        if steer.is_some() && cancel.is_some() && prompt.is_some() {
+            break;
+        }
+    }
+    let steer = steer.expect("steer response");
+    assert_eq!(steer["error"]["code"], -32602);
+    assert!(steer["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("completed before delivery")));
+    let cancel = cancel.expect("cancel response");
+    assert!(cancel.get("result").is_some());
+    let prompt = prompt.expect("prompt response");
+    assert_eq!(prompt["result"]["stopReason"], "cancelled");
     h.shutdown().await;
 }
 
@@ -1346,15 +1570,26 @@ async fn cancelled_turn_with_usage_emits_notification_before_response() {
     })
     .await;
 
-    // Now send cancel and release the round-2 gate. Cancel is enqueued before
-    // round 2 can respond, so the turn exits with stopReason: cancelled.
+    // Send cancel and wait for its acknowledgement before releasing round 2.
+    // Writing both back-to-back only establishes stdin order, not that the
+    // spawned HTTP response cannot win the scheduler race.
     let c_id = h.send("session/cancel", json!({"sessionId": sid})).await;
-    let _ = gate_tx.send(()); // unblock round 2
 
     let mut saw_usage_before_prompt_response = false;
     let mut saw_usage = false;
     let mut saw_cancel_ok = false;
     let mut saw_prompt_response = false;
+    while !saw_cancel_ok {
+        let v = h.recv().await;
+        if v["id"] == json!(c_id) {
+            saw_cancel_ok = true;
+        } else if is_usage_update(&v) {
+            saw_usage = true;
+            saw_usage_before_prompt_response = true;
+        }
+    }
+    let _ = gate_tx.send(()); // unblock round 2 after cancel is installed
+
     for _ in 0..40 {
         let v = h.recv().await;
         if v["id"] == json!(c_id) {

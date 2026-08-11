@@ -7,12 +7,15 @@ mod filter;
 mod observer;
 mod pool;
 mod pool_lifecycle;
+mod project_channel;
 mod queue;
 mod relay;
 mod setup_mode;
 mod usage;
+mod workspace_index;
 
 pub use usage::TurnUsage;
+pub use workspace_index::{WorkspaceIndex, WorkspaceIndexError};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
@@ -1137,7 +1140,7 @@ fn handle_cancel_turn_control(
         return;
     };
 
-    let fired = signal_in_flight_task(pool, channel_id, ControlSignal::Cancel);
+    let fired = signal_channel_turns(pool, channel_id, ControlSignal::Cancel) > 0;
     let status = if fired { "sent" } else { "no_active_turn" };
     if let Some(observer) = observer {
         observer.emit(
@@ -1198,11 +1201,12 @@ fn handle_switch_model_control(
         // Busy path: deliver over the oneshot. `false` means the oneshot was
         // already consumed this turn (a prior cancel/interrupt) — the turn is
         // already ending, so the switch cannot land on it.
-        if signal_in_flight_task(
+        if signal_channel_turns(
             pool,
             channel_id,
             ControlSignal::SwitchModel(model_id.to_string()),
-        ) {
+        ) > 0
+        {
             "sent"
         } else {
             "turn_ending"
@@ -1372,7 +1376,7 @@ fn any_respawn_in_flight(crash_history: &[SlotCircuit]) -> bool {
 struct RespawnResult {
     index: usize,
     /// Tuple: (initialized client, protocol version, agent name).
-    result: Result<(AcpClient, u32, String)>,
+    result: Result<(AcpClient, u32, String, bool)>,
 }
 
 /// Outcome of a non-cancelling steer attempt, forwarded from a per-attempt
@@ -1385,8 +1389,10 @@ struct RespawnResult {
 /// `EventQueue::withheld_native_steer`: `channel_id` is the routing key,
 /// `event_id` is the hex id of the single event the steer carried.
 struct SteerAckEvent {
-    channel_id: Uuid,
+    session_key: queue::SessionKey,
     event_id: String,
+    /// Generation of the prompt that accepted the native steer request.
+    turn_id: String,
     /// `Ok` if the read loop sent any of the locked `SteerAck` variants.
     /// `Err` if the oneshot was dropped without a send — should not happen
     /// under the current read-loop drains, but if it ever does the main
@@ -1416,7 +1422,7 @@ impl RespawnGuard {
     /// Send the result and disarm the guard. Uses `try_send` (sync) so there
     /// is no await boundary between marking `sent` and actually enqueueing —
     /// cancellation cannot slip between the two.
-    fn send(mut self, result: Result<(AcpClient, u32, String)>) {
+    fn send(mut self, result: Result<(AcpClient, u32, String, bool)>) {
         // Invariant: try_send succeeds because the channel capacity equals the
         // slot count, and respawn_in_flight guarantees at most one outstanding
         // result per slot. If this ever fails, the channel sizing or the
@@ -1574,6 +1580,27 @@ async fn tokio_main() -> Result<()> {
     {
         tracing::info!("buzz-acp: setup payload present, entering setup-listener mode");
         return setup_mode::run_setup_listener(config, payload).await;
+    }
+
+    let workspace_index = WorkspaceIndex::from_env();
+
+    // Resolved after the setup branch on purpose: setup mode never opens a
+    // session, so a workspace typo must not block an operator from fixing the
+    // credentials that put the agent in setup mode to begin with.
+    let agent_cwd = config::resolve_agent_cwd().map_err(|e| anyhow::anyhow!("{e}"))?;
+    let pinned_cwd = std::env::var(config::AGENT_CWD_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(|_| std::path::PathBuf::from(&agent_cwd));
+    let process_cwd = std::env::current_dir()
+        .map_err(|error| anyhow::anyhow!("cannot resolve heartbeat process cwd: {error}"))?;
+    if pinned_cwd.is_some() {
+        tracing::info!("buzz-acp channel sessions pinned to: {agent_cwd}");
+    } else {
+        tracing::info!(
+            process_cwd = %process_cwd.display(),
+            "buzz-acp channel sessions use workspace/project/DM cwd policy"
+        );
     }
 
     tracing::info!("buzz-acp starting: {}", config.summary());
@@ -1818,6 +1845,8 @@ async fn tokio_main() -> Result<()> {
         dedup_mode: config.dedup_mode,
         system_prompt: config.system_prompt.clone(),
         session_title: config.session_title.clone(),
+        claude_isolate_user_config: config.claude_isolate_user_config,
+        thinking_effort: config.thinking_effort,
         team_instructions: config.team_instructions.clone(),
         base_prompt: if config.no_base_prompt {
             None
@@ -1827,10 +1856,13 @@ async fn tokio_main() -> Result<()> {
             Some(include_str!("base_prompt.md"))
         },
         heartbeat_prompt: config.heartbeat_prompt.clone(),
-        cwd: std::env::current_dir()
-            .unwrap_or_else(|_| std::path::PathBuf::from("/"))
-            .to_string_lossy()
-            .to_string(),
+        session_cwd: pool::SessionCwdResolver::new(
+            pinned_cwd,
+            process_cwd,
+            workspace_index,
+            config.unindexed_channel_policy,
+            project_channel::ProjectChannelResolver::new(relay.rest_client()),
+        ),
         rest_client: relay.rest_client(),
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
         context_message_limit: config.context_message_limit,
@@ -1900,11 +1932,14 @@ async fn tokio_main() -> Result<()> {
         ))
     };
 
-    // Runs at the TOP of every loop iteration via Instant check — cannot be
-    // starved by the biased select. Slot refill spawns background tasks so
-    // spawn_and_init never blocks the main loop.
+    // Runs at the top of active loop iterations, with an independent tick to
+    // wake a completely quiet relay. Slot refill stays in background tasks.
     let maintenance_interval = Duration::from_secs(30);
     let mut last_maintenance = std::time::Instant::now();
+    let mut maintenance_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + maintenance_interval,
+        maintenance_interval,
+    );
 
     // Channel for background respawn tasks to return completed agents.
     // Bounded to agent count — at most one respawn per slot in flight.
@@ -1915,7 +1950,7 @@ async fn tokio_main() -> Result<()> {
     let mut wake_tasks: tokio::task::JoinSet<()> = tokio::task::JoinSet::new();
 
     // Channel for non-cancelling steer ack watchers to forward outcomes back
-    // to the main loop. Each `pool.send_steer(...) == Ok(())` spawns a
+    // to the main loop. Each accepted `pool.send_steer(...)` spawns a
     // short-lived task that awaits the `SteerRequest.ack_tx` oneshot and
     // forwards a `SteerAckEvent`. Unbounded because:
     //   1. The producer count is bounded by in-flight goose turns
@@ -2043,6 +2078,27 @@ async fn tokio_main() -> Result<()> {
             last_maintenance = std::time::Instant::now();
             queue.compact_expired_state();
 
+            if let Some(agent) = pool.recycle_one_uncloseable_agent().await {
+                tracing::info!(
+                    agent,
+                    "recycled adapter process without session/close support"
+                );
+            }
+
+            // Reclaim conversations that have gone idle. This runs at the top
+            // of the loop for the same reason the rest of maintenance does: it
+            // cannot be starved by the biased select. Only idle agents are
+            // swept, so no in-flight turn can have its session closed under it.
+            let evicted = pool::evict_idle_sessions(
+                &mut pool,
+                config.session_idle_ttl_secs,
+                config.max_live_sessions,
+            )
+            .await;
+            if evicted > 0 {
+                tracing::info!(evicted, "idle session sweep closed sessions");
+            }
+
             // Slot refill: spawn background tasks for empty slots whose
             // circuit breaker allows it. spawn_and_init runs off the main
             // loop so it never blocks event processing.
@@ -2059,10 +2115,20 @@ async fn tokio_main() -> Result<()> {
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
                 let has_codex = config.has_generated_codex_config;
+                let thinking_effort = config.thinking_effort;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+                    let result = spawn_and_init(
+                        &cmd,
+                        &args,
+                        &env,
+                        has_codex,
+                        thinking_effort,
+                        idx,
+                        observer,
+                    )
+                    .await;
                     guard.send(result);
                 });
             }
@@ -2085,7 +2151,7 @@ async fn tokio_main() -> Result<()> {
         while let Ok(rr) = respawn_rx.try_recv() {
             crash_history[rr.index].respawn_in_flight = false;
             match rr.result {
-                Ok((acp, protocol_version, agent_name)) => {
+                Ok((acp, protocol_version, agent_name, session_close_supported)) => {
                     let agent = OwnedAgent {
                         index: rr.index,
                         acp,
@@ -2096,6 +2162,7 @@ async fn tokio_main() -> Result<()> {
                         agent_name,
                         goose_system_prompt_supported: None,
                         protocol_version,
+                        session_close_supported,
                     };
                     pool.return_agent(agent);
                     tracing::info!(agent = rr.index, "respawn complete");
@@ -2161,6 +2228,7 @@ async fn tokio_main() -> Result<()> {
                         _ => std::future::pending().await,
                     }
                 } => None,
+                _ = maintenance_tick.tick() => None,
                 Some(Err(error)) = wake_tasks.join_next(), if !wake_tasks.is_empty() => {
                     if let Some(attempt) = pool_lifecycle.waking_attempt() {
                         let message = format!("pool wake task failed: {error}");
@@ -2372,9 +2440,14 @@ async fn tokio_main() -> Result<()> {
                             if is_cancel {
                                 if let Some(owner) = owner_cache.get() {
                                     if buzz_event.event.pubkey.to_hex() == *owner {
+                                        // Cancels the conversation it was
+                                        // posted in, not the whole channel.
                                         let fired = signal_in_flight_task(
                                             &mut pool,
-                                            buzz_event.channel_id,
+                                            &session_key_for(
+                                                buzz_event.channel_id,
+                                                &buzz_event.event,
+                                            ),
                                             ControlSignal::Cancel,
                                         );
                                         if !fired {
@@ -2412,7 +2485,10 @@ async fn tokio_main() -> Result<()> {
                                     if buzz_event.event.pubkey.to_hex() == *owner {
                                         let fired = signal_in_flight_task(
                                             &mut pool,
-                                            buzz_event.channel_id,
+                                            &session_key_for(
+                                                buzz_event.channel_id,
+                                                &buzz_event.event,
+                                            ),
                                             ControlSignal::Rotate,
                                         );
                                         if fired {
@@ -2421,11 +2497,15 @@ async fn tokio_main() -> Result<()> {
                                                 "!rotate received — cancelling in-flight turn and rotating session"
                                             );
                                         } else {
-                                            let invalidated = pool.invalidate_channel_sessions(buzz_event.channel_id);
+                                            let key = session_key_for(
+                                                buzz_event.channel_id,
+                                                &buzz_event.event,
+                                            );
+                                            let invalidated = pool.invalidate_idle_session(&key);
                                             tracing::info!(
                                                 channel_id = %buzz_event.channel_id,
                                                 invalidated,
-                                                "!rotate received — invalidated idle channel session(s)"
+                                                "!rotate received — invalidated idle conversation session"
                                             );
                                         }
                                         continue; // consume event — do NOT push to queue
@@ -2496,6 +2576,9 @@ async fn tokio_main() -> Result<()> {
                             // first. `nostr::Event::clone` is cheap (Arc-
                             // backed payload) so the cost is negligible.
                             let event_for_steer = buzz_event.event.clone();
+                            // Captured before the event is moved into the steer.
+                            let steer_session_key =
+                                session_key_for(buzz_event.channel_id, &buzz_event.event);
                             let prompt_tag_for_steer = prompt_tag.clone();
                             let accepted = queue.push(QueuedEvent {
                                 channel_id: buzz_event.channel_id,
@@ -2545,7 +2628,7 @@ async fn tokio_main() -> Result<()> {
                                         && try_native_steer(
                                             &mut pool,
                                             &mut queue,
-                                            buzz_event.channel_id,
+                                            &steer_session_key,
                                             event_for_steer,
                                             prompt_tag_for_steer,
                                             &steer_ack_tx,
@@ -2553,7 +2636,7 @@ async fn tokio_main() -> Result<()> {
                                     if !native_attempted {
                                         signal_in_flight_task(
                                             &mut pool,
-                                            buzz_event.channel_id,
+                                            &steer_session_key,
                                             signal,
                                         );
                                     }
@@ -2675,8 +2758,9 @@ async fn tokio_main() -> Result<()> {
         match pool_event {
             Some(PoolEvent::Result(result)) => {
                 // Stop typing indicator for the completed channel.
-                if let PromptSource::Channel(ch) = &result.source {
-                    typing_channels.remove(ch);
+                if let PromptSource::Channel(key) = &result.source {
+                    // Typing is a channel-level indicator, not a per-thread one.
+                    typing_channels.remove(&key.channel_id);
                 }
                 if handle_prompt_result(
                     &mut pool,
@@ -2741,8 +2825,9 @@ async fn tokio_main() -> Result<()> {
                 }
             }
             Some(PoolEvent::SteerAck(SteerAckEvent {
-                channel_id,
+                session_key,
                 event_id,
+                turn_id,
                 ack,
             })) => {
                 // Mid-turn steer attempt resolved (either transport:
@@ -2820,59 +2905,55 @@ async fn tokio_main() -> Result<()> {
                 //     pending_steer on every return path. If it does,
                 //     treat as PromptCompletedNeutral to avoid leaking
                 //     the withheld event in `withheld_native_steer`.
-                let (release_withheld, drop_withheld, signal_fallback) = match &ack {
-                    Ok(pool::SteerAck::Success { .. }) => (false, true, false),
+                let ack_turn_in_flight = pool.is_turn_in_flight(&session_key, &turn_id);
+                let (release_withheld, signal_fallback) = match &ack {
+                    // Settled below only after validating the exact live
+                    // session generation.
+                    Ok(pool::SteerAck::Success { .. }) => (false, false),
                     // -32601 = method_not_found: agent does not implement the
                     // steer extension. Fire cancel+merge so the message still
                     // reaches the agent.
                     Ok(pool::SteerAck::Err(pool::SteerError::AgentError { code, .. }))
                         if *code == -32601 =>
                     {
-                        (true, false, true)
+                        (true, true)
                     }
                     // AgentError: write landed, agent rejected it at the
                     // application level (e.g. wrong run id). Release for
                     // normal dispatch; no fallback signal (the turn is still
                     // running or just ended — either way there is nothing to
                     // cancel).
-                    Ok(pool::SteerAck::Err(pool::SteerError::AgentError { .. })) => {
-                        (true, false, false)
-                    }
+                    Ok(pool::SteerAck::Err(pool::SteerError::AgentError { .. })) => (true, false),
                     // Transport / ExpectedRunIdMissing / OutcomeRejected: the
                     // steer did not land. Release and fire the cancel+merge
                     // fallback so the message still reaches the agent.
-                    Ok(pool::SteerAck::Err(_)) => (true, false, true),
-                    Ok(pool::SteerAck::PromptCompletedNeutral) => (true, false, false),
-                    Err(_recv_err) => (true, false, false),
+                    Ok(pool::SteerAck::Err(_)) => (true, true),
+                    Ok(pool::SteerAck::PromptCompletedNeutral) => (true, false),
+                    Err(_recv_err) => (true, false),
                 };
                 tracing::info!(
-                    channel = %channel_id,
+                    session = %session_key,
                     event_id = %event_id,
+                    turn_id = %turn_id,
                     ?ack,
+                    ack_turn_in_flight,
                     release_withheld,
-                    drop_withheld,
                     signal_fallback,
                     "non-cancelling steer ack received"
                 );
                 if let Ok(pool::SteerAck::Success { session_id }) = &ack {
-                    queue.extend_in_flight_deadline(channel_id, config.max_turn_duration_secs);
-                    if !pool.record_successful_steer(
-                        channel_id,
-                        event_id.clone(),
-                        session_id.clone(),
-                    ) {
-                        tracing::warn!(
-                            channel = %channel_id,
-                            event_id = %event_id,
-                            "successful steer lost its in-flight delivery ledger"
-                        );
-                    }
-                }
-                if drop_withheld {
-                    queue.remove_event(channel_id, &event_id);
+                    settle_successful_steer_ack(
+                        &mut pool,
+                        &mut queue,
+                        &session_key,
+                        &event_id,
+                        session_id,
+                        &turn_id,
+                        config.max_turn_duration_secs,
+                    );
                 }
                 if release_withheld {
-                    queue.release_native_steer(channel_id, &event_id);
+                    queue.release_native_steer(&session_key, &event_id);
                 }
                 if signal_fallback {
                     // Universal cancel+merge fallback. Note: the
@@ -2880,7 +2961,7 @@ async fn tokio_main() -> Result<()> {
                     // front of `queues[channel_id]`, so the cancel
                     // will pick it up as part of the merged batch and
                     // re-prompt the agent.
-                    signal_in_flight_task(&mut pool, channel_id, ControlSignal::Steer);
+                    signal_steer_fallback_if_current(&mut pool, &session_key, &turn_id);
                 }
                 // After releasing a withheld event, give dispatch a chance
                 // to re-flush. If the prompt is still in flight, the
@@ -3027,7 +3108,7 @@ async fn tokio_main() -> Result<()> {
     // Drain any respawn results that completed before the abort. Explicitly
     // shut down returned agents instead of relying on AcpClient::Drop.
     while let Ok(rr) = respawn_rx.try_recv() {
-        if let Ok((mut acp, _, _)) = rr.result {
+        if let Ok((mut acp, _, _, _)) = rr.result {
             acp.shutdown().await;
             tracing::debug!(agent = rr.index, "reaped respawned agent on shutdown");
         }
@@ -3068,6 +3149,31 @@ async fn tokio_main() -> Result<()> {
 enum LoopAction {
     Continue,
     Exit,
+}
+
+/// Whether a failed prompt means the agent's stdio pipe can no longer be
+/// trusted, and the process must be respawned.
+///
+/// Only errors that involve the pipe itself qualify. Everything else — a prompt
+/// that timed out, malformed JSON from the agent, or a session the harness
+/// refused locally — leaves the process healthy and reusable. Misclassifying a
+/// local refusal here costs one process respawn *per queue retry*, which is how
+/// a single message to an unindexed channel used to churn the harness ten times
+/// over.
+fn is_transport_class(error: &acp::AcpError) -> bool {
+    match error {
+        acp::AcpError::Io(_)
+        | acp::AcpError::WriteTimeout(_)
+        | acp::AcpError::Timeout(_)
+        | acp::AcpError::Protocol(_) => true,
+        acp::AcpError::SessionRefused(_)
+        | acp::AcpError::Json(_)
+        | acp::AcpError::AgentExited
+        | acp::AcpError::IdleTimeout(_)
+        | acp::AcpError::HardTimeout { .. }
+        | acp::AcpError::CancelDrainTimeout(_)
+        | acp::AcpError::AgentError { .. } => false,
+    }
 }
 
 fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
@@ -3118,24 +3224,78 @@ fn mode_gate_signal(
 
 /// Send a control signal to the in-flight task for `channel_id`.
 /// Returns `true` if a signal was sent, `false` if no in-flight task was found.
-fn signal_in_flight_task(
+/// The conversation an incoming event belongs to.
+fn session_key_for(channel_id: uuid::Uuid, event: &nostr::Event) -> queue::SessionKey {
+    match queue::event_thread_root(event) {
+        Some(root) => queue::SessionKey::thread(channel_id, root),
+        None => queue::SessionKey::ambient(channel_id),
+    }
+}
+
+/// Signal **every** in-flight turn of a channel, returning how many were hit.
+///
+/// For callers that only know a channel and mean all of it: the observer's
+/// out-of-band control frames and model switches. An event-driven signal should
+/// use [`signal_in_flight_task`] with the event's own conversation instead.
+fn signal_channel_turns(
     pool: &mut AgentPool,
     channel_id: uuid::Uuid,
     mode: ControlSignal,
+) -> usize {
+    let keys: Vec<queue::SessionKey> = pool
+        .task_map_mut()
+        .values()
+        .filter(|m| m.channel_id == Some(channel_id))
+        .filter_map(|m| m.session_key.clone())
+        .collect();
+    keys.iter()
+        .filter(|key| signal_in_flight_task(pool, key, mode.clone()))
+        .count()
+}
+
+fn signal_in_flight_task(
+    pool: &mut AgentPool,
+    key: &queue::SessionKey,
+    mode: ControlSignal,
 ) -> bool {
+    // Routed by conversation: a channel can now hold several in-flight turns,
+    // and a signal aimed at one thread must not cancel another's work.
     let entry = pool
         .task_map_mut()
         .values_mut()
-        .find(|m| m.channel_id == Some(channel_id));
+        .find(|m| m.session_key.as_ref() == Some(key));
 
     if let Some(meta) = entry {
         if let Some(tx) = meta.control_tx.take() {
-            tracing::info!(channel = %channel_id, ?mode, "control signal sent to in-flight task");
-            let _ = tx.send(mode);
-            return true;
+            return match tx.send(mode) {
+                Ok(()) => {
+                    tracing::info!(session = %key, "control signal sent to in-flight task");
+                    true
+                }
+                Err(mode) => {
+                    tracing::warn!(session = %key, ?mode, "in-flight task dropped its control receiver");
+                    false
+                }
+            };
         }
     }
     false
+}
+
+fn signal_steer_fallback_if_current(
+    pool: &mut AgentPool,
+    key: &queue::SessionKey,
+    turn_id: &str,
+) -> bool {
+    if !pool.is_turn_in_flight(key, turn_id) {
+        tracing::warn!(
+            session = %key,
+            turn_id,
+            "ignoring stale steer failure acknowledgement"
+        );
+        return false;
+    }
+    signal_in_flight_task(pool, key, ControlSignal::Steer)
 }
 
 /// Attempt the non-cancelling (ACP) steer for a freshly-queued event.
@@ -3161,15 +3321,16 @@ fn signal_in_flight_task(
 /// event still reaches the agent via the universal path.
 ///
 /// The withheld event is NOT released here on `false` because no withhold
-/// was established: `mark_native_steer_pending` only runs on `Ok(())`.
+/// was established: `mark_native_steer_pending` only runs after acceptance.
 fn try_native_steer(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
-    channel_id: uuid::Uuid,
+    session_key: &queue::SessionKey,
     event: nostr::Event,
     prompt_tag: String,
     steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
 ) -> bool {
+    let channel_id = session_key.channel_id;
     // Build the steer body: framing strings come from
     // `queue::native_steer_framing()` (Eva's drift-proof requirement —
     // native and cancel+merge fallback share these so the agent gets the
@@ -3199,14 +3360,14 @@ fn try_native_steer(
         ack_tx,
     };
 
-    match pool.send_steer(channel_id, request) {
-        Ok(()) => {
+    match pool.send_steer(session_key, request) {
+        Ok(turn_id) => {
             // Withhold the queued event synchronously BEFORE spawning
             // the watcher: this closes the race where `mark_complete`
             // clears `in_flight_channels` and a stray `flush_next` could
             // re-deliver the event via normal dispatch. See
             // `EventQueue::mark_native_steer_pending` docs at queue.rs:606.
-            let withheld = queue.mark_native_steer_pending(channel_id, &event_id_hex);
+            let withheld = queue.mark_native_steer_pending(session_key, &event_id_hex);
             if !withheld {
                 // Race: the event was already drained out of the queue
                 // before we got here (e.g. a concurrent flush picked it
@@ -3224,11 +3385,13 @@ fn try_native_steer(
             }
             let ack_tx_clone = steer_ack_tx.clone();
             let event_id_for_watcher = event_id_hex.clone();
+            let key_for_watcher = session_key.clone();
             tokio::spawn(async move {
                 let ack = ack_rx.await;
                 let _ = ack_tx_clone.send(SteerAckEvent {
-                    channel_id,
+                    session_key: key_for_watcher,
                     event_id: event_id_for_watcher,
+                    turn_id,
                     ack,
                 });
             });
@@ -3245,6 +3408,39 @@ fn try_native_steer(
     }
 }
 
+/// Commit a successful steer only to the generation that accepted it.
+/// A stale success returns the withheld event to normal dispatch and leaves the
+/// replacement turn's deadline untouched.
+fn settle_successful_steer_ack(
+    pool: &mut AgentPool,
+    queue: &mut EventQueue,
+    session_key: &queue::SessionKey,
+    event_id: &str,
+    session_id: &str,
+    turn_id: &str,
+    max_turn_duration_secs: u64,
+) -> bool {
+    if pool.record_successful_steer(
+        session_key,
+        event_id.to_string(),
+        session_id.to_string(),
+        turn_id,
+    ) {
+        queue.extend_in_flight_deadline(session_key, max_turn_duration_secs);
+        queue.remove_event(session_key, event_id);
+        true
+    } else {
+        queue.release_native_steer(session_key, event_id);
+        tracing::warn!(
+            session = %session_key,
+            event_id,
+            session_id,
+            "ignoring successful steer ack for a stale session generation"
+        );
+        false
+    }
+}
+
 // ── dispatch_pending ──────────────────────────────────────────────────────────
 
 /// Flush queued work to available agents.
@@ -3255,8 +3451,14 @@ fn dispatch_pending(
     last_activity: &mut tokio::time::Instant,
 ) -> Vec<(Uuid, ThreadTags)> {
     let mut dispatched_channels = Vec::new();
+    let mut affinity_blocked = HashSet::new();
     loop {
-        let batch = match queue.flush_next() {
+        let next_batch = if affinity_blocked.is_empty() {
+            queue.flush_next()
+        } else {
+            queue.flush_next_excluding(&affinity_blocked)
+        };
+        let batch = match next_batch {
             Some(b) => b,
             None => break,
         };
@@ -3266,14 +3468,21 @@ fn dispatch_pending(
             .last()
             .map(|event| queue::parse_thread_tags(&event.event))
             .unwrap_or_default();
-        let affinity_hit = pool.has_session_for(channel_id);
-        let mut agent = match pool.try_claim(Some(channel_id)) {
+        // Affinity follows the conversation: the batch is thread-homogeneous,
+        // so its session key is the unit that must not be split across agents.
+        let session_key = batch.session_key();
+        let affinity_hit = pool.has_session_for(&session_key);
+        let mut agent = match pool.try_claim(Some(&session_key)) {
             Some(a) => a,
             None => {
-                let pending = queue.pending_channels();
-                tracing::debug!(pending_channels = pending, "pool_exhausted");
+                let pending = queue.pending_conversations();
+                tracing::debug!(pending_conversations = pending, "pool_exhausted");
                 queue.requeue_preserve_timestamps(batch);
-                queue.mark_complete(channel_id);
+                queue.release_unclaimed(&session_key);
+                if pool.any_idle() {
+                    affinity_blocked.insert(session_key);
+                    continue;
+                }
                 break;
             }
         };
@@ -3306,6 +3515,7 @@ fn dispatch_pending(
         let (control_tx, control_rx) = tokio::sync::oneshot::channel::<ControlSignal>();
         let turn_id = Uuid::new_v4().to_string();
         let task_turn_id = turn_id.clone();
+        queue.bind_in_flight_turn(&session_key, turn_id.clone());
 
         let abort_handle = pool.join_set.spawn(async move {
             pool::run_prompt_task(
@@ -3325,6 +3535,7 @@ fn dispatch_pending(
             pool::TaskMeta {
                 agent_index,
                 channel_id: Some(channel_id),
+                session_key: Some(session_key.clone()),
                 turn_id,
                 recoverable_batch,
                 control_tx: Some(control_tx),
@@ -3337,7 +3548,7 @@ fn dispatch_pending(
     }
     tracing::debug!(
         dispatched = dispatched_channels.len(),
-        queue_depth = queue.pending_channels(),
+        queue_depth = queue.pending_conversations(),
         "dispatch_pending"
     );
     dispatched_channels
@@ -3419,12 +3630,13 @@ fn handle_prompt_result(
         .unwrap_or_default();
     pool.task_map_mut()
         .retain(|_, meta| meta.agent_index != agent_index);
+    pool.finish_checkout(agent_index);
     debug_assert_eq!(before, pool.task_map().len() + 1);
-    if let PromptSource::Channel(channel_id) = &result.source {
+    if let PromptSource::Channel(key) = &result.source {
         // The task may have invalidated this session before returning. Never
         // resurrect delivery state for a dead session; its replacement must
         // receive fresh standing context and history.
-        if let Some(live_session_id) = result.agent.state.sessions.get(channel_id).cloned() {
+        if let Some(live_session_id) = result.agent.state.sessions.get(key).cloned() {
             let event_ids = successful_steer_deliveries
                 .into_iter()
                 .filter(|delivery| delivery.session_id == live_session_id)
@@ -3432,7 +3644,7 @@ fn handle_prompt_result(
             result
                 .agent
                 .state
-                .mark_channel_delivery_success(*channel_id, false, event_ids);
+                .mark_delivery_success(key, false, event_ids);
         }
     }
 
@@ -3554,7 +3766,9 @@ fn handle_prompt_result(
     }
 
     match &result.source {
-        PromptSource::Channel(ch) => queue.mark_complete(*ch),
+        PromptSource::Channel(key) => {
+            queue.mark_complete_turn(key, &result.turn_id);
+        }
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
     }
 
@@ -3590,7 +3804,7 @@ fn handle_prompt_result(
     let harness_pid = std::process::id();
 
     let channel_id = match &result.source {
-        PromptSource::Channel(ch) => Some(*ch),
+        PromptSource::Channel(key) => Some(key.channel_id),
         PromptSource::Heartbeat => None,
     };
     let turn_id = result.turn_id.clone();
@@ -3711,9 +3925,12 @@ fn handle_prompt_result(
         //    to the agent regardless of whether they occurred during session
         //    creation or an active prompt — respawn unconditionally.
         //
-        // 2. Application-class (IdleTimeout, HardTimeout, Json): the pipe is
-        //    intact but the prompt failed. Return the agent to the pool so it
-        //    can be reused for the next event.
+        // 2. Application-class (IdleTimeout, HardTimeout, Json, SessionRefused):
+        //    the pipe is intact but the prompt failed. Return the agent to the
+        //    pool so it can be reused for the next event. SessionRefused is the
+        //    strongest case of this: the harness refused the session locally and
+        //    never wrote to the agent at all, so respawning it would churn the
+        //    process once per queue retry while fixing nothing.
 
         // Intentional cancel — agent is healthy, return it to the pool.
         // No respawn, no retry penalty. The cancelled batch was already stored
@@ -3730,13 +3947,7 @@ fn handle_prompt_result(
             pool.return_agent(result.agent);
         }
         PromptOutcome::Error(ref e) => {
-            let is_transport_error = matches!(
-                e,
-                acp::AcpError::Io(_)
-                    | acp::AcpError::WriteTimeout(_)
-                    | acp::AcpError::Timeout(_)
-                    | acp::AcpError::Protocol(_)
-            );
+            let is_transport_error = is_transport_class(e);
             let error_code = match &e {
                 acp::AcpError::AgentError { code, .. } => Some(*code),
                 _ => None,
@@ -3804,6 +4015,7 @@ fn recover_panicked_agent(
         return;
     };
     let i = meta.agent_index;
+    pool.finish_checkout(i);
 
     // Requeue BEFORE mark_complete (same rationale as handle_prompt_result).
     if let Some(batch) = meta.recoverable_batch {
@@ -3822,10 +4034,14 @@ fn recover_panicked_agent(
         }
     }
 
-    if let Some(ch) = meta.channel_id {
-        queue.mark_complete(ch);
-        typing_channels.remove(&ch);
-        tracing::warn!("cleared wedged in-flight channel {ch} from panicked agent {i}");
+    if let (Some(ch), Some(key)) = (meta.channel_id, meta.session_key.as_ref()) {
+        queue.mark_complete_turn(key, &meta.turn_id);
+        // Typing is channel-level; clear it only when nothing else in the
+        // channel is still running.
+        if !queue.is_channel_in_flight(ch) {
+            typing_channels.remove(&ch);
+        }
+        tracing::warn!("cleared wedged in-flight conversation {key} from panicked agent {i}");
     } else {
         *heartbeat_in_flight = false;
         tracing::warn!("cleared wedged heartbeat_in_flight from panicked agent {i}");
@@ -3873,12 +4089,14 @@ fn recover_panicked_agent(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let thinking_effort = config.thinking_effort;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result =
+            spawn_and_init(&cmd, &args, &env, has_codex, thinking_effort, i, observer).await;
         guard.send(result);
     });
 }
@@ -3961,6 +4179,7 @@ fn dispatch_heartbeat(
         pool::TaskMeta {
             agent_index,
             channel_id: None,
+            session_key: None,
             turn_id,
             recoverable_batch: None,
             control_tx: None,
@@ -4068,6 +4287,7 @@ fn spawn_respawn_task(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let thinking_effort = config.thinking_effort;
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -4079,7 +4299,16 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result = spawn_and_init(
+            &cmd,
+            &args,
+            &env,
+            has_codex,
+            thinking_effort,
+            index,
+            observer,
+        )
+        .await;
         guard.send(result);
     });
 
@@ -4124,6 +4353,7 @@ struct PoolStartup {
     extra_env: Vec<(String, String)>,
     has_generated_codex_config: bool,
     model: Option<String>,
+    thinking_effort: Option<buzz_core::reasoning::ThinkingEffort>,
     observer: Option<observer::ObserverHandle>,
 }
 
@@ -4136,6 +4366,7 @@ impl PoolStartup {
             extra_env: config.persona_env_vars.clone(),
             has_generated_codex_config: config.has_generated_codex_config,
             model: config.model.clone(),
+            thinking_effort: config.thinking_effort,
             observer,
         }
     }
@@ -4154,6 +4385,10 @@ async fn initialize_agent_pool(
             &startup.args,
             &startup.extra_env,
             startup.has_generated_codex_config,
+            crate::config::codex_reasoning_effort_for_command(
+                &startup.command,
+                startup.thinking_effort,
+            ),
         )
         .await;
         match spawn_result {
@@ -4196,6 +4431,16 @@ async fn initialize_agent_pool(
                             }),
                         );
                         let agent_name = normalized_agent_name(&init_result);
+                        let session_close_supported = pool::advertises_session_close(&init_result);
+                        if !session_close_supported {
+                            tracing::warn!(
+                                agent = i,
+                                name = %agent_name,
+                                "adapter does not advertise session/close — idle sessions \
+                                 cannot be reclaimed and will hold their resources until \
+                                 the agent restarts"
+                            );
+                        }
                         agent_slots.push(Some(OwnedAgent {
                             index: i,
                             acp,
@@ -4206,6 +4451,7 @@ async fn initialize_agent_pool(
                             agent_name,
                             goose_system_prompt_supported: None,
                             protocol_version,
+                            session_close_supported,
                         }));
                     }
                     Ok(Err(e)) => {
@@ -4254,12 +4500,19 @@ async fn spawn_and_init(
     args: &[String],
     extra_env: &[(String, String)],
     has_generated_codex_config: bool,
+    thinking_effort: Option<buzz_core::reasoning::ThinkingEffort>,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
-) -> Result<(AcpClient, u32, String)> {
-    let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
+) -> Result<(AcpClient, u32, String, bool)> {
+    let mut acp = AcpClient::spawn(
+        command,
+        args,
+        extra_env,
+        has_generated_codex_config,
+        crate::config::codex_reasoning_effort_for_command(command, thinking_effort),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
     acp.set_observer(observer, agent_index);
 
     match acp.initialize().await {
@@ -4274,7 +4527,8 @@ async fn spawn_and_init(
                 }),
             );
             let agent_name = normalized_agent_name(&init_result);
-            Ok((acp, protocol_version, agent_name))
+            let session_close_supported = pool::advertises_session_close(&init_result);
+            Ok((acp, protocol_version, agent_name, session_close_supported))
         }
         Err(e) => {
             // Explicitly shut down the spawned child to prevent zombie/leak.
@@ -4288,7 +4542,7 @@ async fn spawn_and_init(
 
 async fn spawn_auth_client(agent: &AuthAgentArgs) -> Result<AcpClient, acp::AcpError> {
     let agent_args = config::normalize_agent_args(&agent.agent_command, agent.agent_args.clone());
-    AcpClient::spawn(&agent.agent_command, &agent_args, &[], false).await
+    AcpClient::spawn(&agent.agent_command, &agent_args, &[], false, None).await
 }
 
 fn extract_auth_methods(init_result: &serde_json::Value) -> Vec<serde_json::Value> {
@@ -4410,15 +4664,14 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
     use acp::{extract_model_config_options, extract_model_state};
 
     let agent_args = config::normalize_agent_args(&args.agent.agent_command, args.agent.agent_args);
-    let cwd = std::env::current_dir()
-        .unwrap_or_else(|_| std::path::PathBuf::from("/"))
-        .to_string_lossy()
-        .to_string();
+    // Same resolution as the long-running path, so `models` probes the agent in
+    // the workspace the operator pinned rather than wherever the CLI was run.
+    let cwd = config::resolve_agent_cwd().map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // Spawn outside the timeout so we always own the child for cleanup.
     // `models` subcommand doesn't use persona packs — no extra env, no codex config.
     let mut client =
-        match AcpClient::spawn(&args.agent.agent_command, &agent_args, &[], false).await {
+        match AcpClient::spawn(&args.agent.agent_command, &agent_args, &[], false, None).await {
             Ok(c) => c,
             Err(e) => {
                 eprintln!("error: failed to spawn agent: {e}");
@@ -4430,7 +4683,9 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
     // so shutdown() runs on all paths (success, error, timeout).
     let protocol_result = tokio::time::timeout(MODELS_TIMEOUT, async {
         let init = client.initialize().await?;
-        let session = client.session_new_full(&cwd, vec![], None, None).await?;
+        let session = client
+            .session_new_full(&cwd, vec![], None, None, false, None)
+            .await?;
         Ok::<_, acp::AcpError>((init, session))
     })
     .await;
@@ -4543,15 +4798,62 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
 }
 
 fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
-    if config.mcp_command.is_empty() {
-        return vec![];
+    let mut servers: Vec<McpServer> = Vec::new();
+    if !config.mcp_command.is_empty() {
+        servers.push(build_buzz_mcp_server(config));
     }
-    vec![McpServer {
-        name: std::path::Path::new(&config.mcp_command)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("mcp")
-            .to_string(),
+    // Extra servers are plain stdio executables with NO Buzz identity in their
+    // environment. The agent's secret key and auth tag belong to `buzz-mcp`
+    // alone; forwarding them to a third-party server would hand out the
+    // agent's Nostr credentials to anything an operator wires up here.
+    for entry in config
+        .mcp_extra
+        .iter()
+        .map(|c| c.trim())
+        .filter(|c| !c.is_empty())
+    {
+        let (name, command) = parse_extra_mcp_entry(entry);
+        servers.push(McpServer {
+            name,
+            command,
+            args: vec![],
+            env: vec![],
+        });
+    }
+    servers
+}
+
+/// Split an extra-MCP entry into `(name, command)`.
+///
+/// Accepts `name=/path/to/server` and a bare `/path/to/server`, which is named
+/// after its file stem. The `=` is only treated as a separator when the left
+/// side has no `/`: an MCP server name never contains one, while a path may
+/// (`/opt/a=b/server.js`), and reading that as a name would silently truncate
+/// the command to `b/server.js`.
+fn parse_extra_mcp_entry(entry: &str) -> (String, String) {
+    if let Some((name, command)) = entry.split_once('=') {
+        let name = name.trim();
+        let command = command.trim();
+        if !name.is_empty() && !command.is_empty() && !name.contains('/') {
+            return (name.to_string(), command.to_string());
+        }
+    }
+    (mcp_server_name(entry), entry.to_string())
+}
+
+/// Name an MCP server after its executable, as the protocol expects a stable id.
+fn mcp_server_name(command: &str) -> String {
+    std::path::Path::new(command)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("mcp")
+        .to_string()
+}
+
+/// Buzz's own MCP server, which carries the agent identity it needs to sign.
+fn build_buzz_mcp_server(config: &Config) -> McpServer {
+    McpServer {
+        name: mcp_server_name(&config.mcp_command),
         command: config.mcp_command.clone(),
         args: vec![],
         env: {
@@ -4596,7 +4898,7 @@ fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
             }
             env
         },
-    }]
+    }
 }
 
 #[cfg(test)]
@@ -4610,6 +4912,8 @@ mod heartbeat_base_prompt_tests {
 
     fn heartbeat_standing() -> queue::StandingContext<'static> {
         queue::StandingContext {
+            cwd: Some("/Users/me/.buzz"),
+            workspace_kind: queue::WorkspaceKind::Root,
             base_prompt: Some("you are a helpful agent"),
             ..Default::default()
         }
@@ -4621,10 +4925,10 @@ mod heartbeat_base_prompt_tests {
         // with the [Base] section exactly as the legacy session/new path would.
         let prompt = "[System: Heartbeat]\nrun feed get";
         let composed = pool::prepend_standing_for_legacy(1, &heartbeat_standing(), prompt);
-        assert_eq!(
-            composed,
-            "[Base]\nyou are a helpful agent\n\n[System: Heartbeat]\nrun feed get"
-        );
+        assert!(composed
+            .starts_with("[Workspace]\nYour absolute working directory is `/Users/me/.buzz`."));
+        assert!(composed
+            .contains("\n\n[Base]\nyou are a helpful agent\n\n[System: Heartbeat]\nrun feed get"));
     }
 
     #[test]
@@ -4687,6 +4991,47 @@ mod owner_control_command_tests {
     }
 
     #[test]
+    fn session_refusal_is_not_transport_class_and_never_respawns() {
+        // A channel the workspace index does not declare is refused locally,
+        // before anything is written to the agent. Classifying that as
+        // transport-class respawned the harness once per queue retry.
+        let refused = acp::AcpError::SessionRefused(
+            "channel 77a91977-09b0-5d68-b31a-802aa7e1b923 is not indexed".to_string(),
+        );
+        assert!(!is_transport_class(&refused));
+    }
+
+    #[test]
+    fn transport_class_covers_pipe_errors_only() {
+        use std::time::Duration;
+
+        for error in [
+            acp::AcpError::Io(std::io::Error::other("broken pipe")),
+            acp::AcpError::WriteTimeout(Duration::from_secs(1)),
+            acp::AcpError::Timeout(Duration::from_secs(1)),
+            acp::AcpError::Protocol("desynchronized".to_string()),
+        ] {
+            assert!(is_transport_class(&error), "expected transport: {error}");
+        }
+
+        for error in [
+            acp::AcpError::SessionRefused("policy".to_string()),
+            acp::AcpError::IdleTimeout(Duration::from_secs(1)),
+            acp::AcpError::HardTimeout {
+                silence: Duration::from_secs(1),
+            },
+            acp::AcpError::CancelDrainTimeout(Duration::from_secs(1)),
+            acp::AcpError::AgentExited,
+            acp::AcpError::AgentError {
+                code: -32000,
+                message: "nope".to_string(),
+            },
+        ] {
+            assert!(!is_transport_class(&error), "expected application: {error}");
+        }
+    }
+
+    #[test]
     fn mode_gate_signal_maps_handling_to_control_signal() {
         let owner = "a".repeat(64);
         let other = "b".repeat(64);
@@ -4739,6 +5084,7 @@ mod owner_control_command_tests {
             pool::TaskMeta {
                 agent_index: 0,
                 channel_id: Some(channel_id),
+                session_key: Some(crate::queue::SessionKey::ambient(channel_id)),
                 turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: Some(control_tx),
@@ -4749,18 +5095,18 @@ mod owner_control_command_tests {
 
         assert!(!signal_in_flight_task(
             &mut pool,
-            other_channel_id,
+            &crate::queue::SessionKey::ambient(other_channel_id),
             ControlSignal::Rotate
         ));
         assert!(signal_in_flight_task(
             &mut pool,
-            channel_id,
+            &crate::queue::SessionKey::ambient(channel_id),
             ControlSignal::Rotate
         ));
         assert_eq!(control_rx.await.unwrap(), ControlSignal::Rotate);
         assert!(!signal_in_flight_task(
             &mut pool,
-            channel_id,
+            &crate::queue::SessionKey::ambient(channel_id),
             ControlSignal::Rotate
         ));
     }
@@ -6216,6 +6562,7 @@ mod build_mcp_servers_tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
+            mcp_extra: vec![],
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -6235,11 +6582,16 @@ mod build_mcp_servers_tests {
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            session_idle_ttl_secs: None,
+            max_live_sessions: None,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
             model: None,
+            thinking_effort: None,
             session_title: None,
+            claude_isolate_user_config: true,
+            unindexed_channel_policy: config::UnindexedChannelPolicy::Refuse,
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: std::collections::HashSet::new(),
@@ -6369,6 +6721,84 @@ mod build_mcp_servers_tests {
         );
     }
 
+    /// The case this exists for: Buzz Desktop owns `BUZZ_ACP_MCP_COMMAND` and
+    /// leaves it empty, so an operator's own server must still reach the agent.
+    #[test]
+    fn extra_mcp_servers_are_added_when_buzz_slot_is_empty() {
+        let mut config = test_config();
+        config.mcp_command = "".into();
+        config.mcp_extra = vec!["/opt/tools/hindsight-mcp.js".into()];
+
+        let servers = build_mcp_servers(&config);
+
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].name, "hindsight-mcp");
+        assert_eq!(servers[0].command, "/opt/tools/hindsight-mcp.js");
+    }
+
+    #[test]
+    fn extra_mcp_entry_accepts_an_explicit_name() {
+        let mut config = test_config();
+        config.mcp_command = "".into();
+        config.mcp_extra = vec!["hindsight=/opt/tools/mcp-server.js".into()];
+
+        let servers = build_mcp_servers(&config);
+
+        assert_eq!(servers[0].name, "hindsight");
+        assert_eq!(servers[0].command, "/opt/tools/mcp-server.js");
+    }
+
+    /// A path may legitimately contain `=`; reading it as a name would truncate
+    /// the command and produce a server that cannot start.
+    #[test]
+    fn extra_mcp_entry_with_equals_in_the_path_stays_a_path() {
+        let mut config = test_config();
+        config.mcp_command = "".into();
+        config.mcp_extra = vec!["/opt/a=b/server.js".into()];
+
+        let servers = build_mcp_servers(&config);
+
+        assert_eq!(servers[0].command, "/opt/a=b/server.js");
+        assert_eq!(servers[0].name, "server");
+    }
+
+    /// Buzz's identity belongs to `buzz-mcp` alone. An extra server is a plain
+    /// executable an operator wired up; handing it the agent's secret key would
+    /// leak the credential to anything listed here.
+    #[test]
+    fn extra_mcp_servers_receive_no_buzz_identity() {
+        let mut config = test_config();
+        config.mcp_extra = vec!["/opt/tools/hindsight-mcp.js".into()];
+
+        let servers = build_mcp_servers(&config);
+        let buzz = servers
+            .iter()
+            .find(|s| s.name == "test-mcp-server")
+            .unwrap();
+        let extra = servers.iter().find(|s| s.name == "hindsight-mcp").unwrap();
+
+        assert!(
+            buzz.env.iter().any(|e| e.name == "BUZZ_PRIVATE_KEY"),
+            "buzz-mcp must keep its identity"
+        );
+        assert!(
+            extra.env.is_empty(),
+            "extra server must get no environment at all, got: {:?}",
+            extra.env.iter().map(|e| &e.name).collect::<Vec<_>>()
+        );
+    }
+
+    /// `default_value = ""` with a comma delimiter yields `[""]`, not `[]`, so
+    /// the blank entry must not become a server with an empty command.
+    #[test]
+    fn blank_extra_mcp_entries_are_ignored() {
+        let mut config = test_config();
+        config.mcp_command = "".into();
+        config.mcp_extra = vec!["".into(), "   ".into()];
+
+        assert!(build_mcp_servers(&config).is_empty());
+    }
+
     #[test]
     fn absolute_path_mcp_command_uses_file_stem_as_name() {
         let mut config = test_config();
@@ -6424,7 +6854,7 @@ mod error_outcome_emission_tests {
     use crate::pool::{
         AgentPool, OwnedAgent, PromptOutcome, PromptResult, PromptSource, TimeoutKind,
     };
-    use crate::queue::{BatchEvent, FlushBatch};
+    use crate::queue::{BatchEvent, FlushBatch, QueuedEvent};
     use nostr::{EventBuilder, Keys, Kind};
     use std::collections::HashSet;
 
@@ -6438,6 +6868,7 @@ mod error_outcome_emission_tests {
             agent_command: "true".into(),
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
+            mcp_extra: vec![],
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -6457,11 +6888,16 @@ mod error_outcome_emission_tests {
             config_path: std::path::PathBuf::from("./buzz-acp.toml"),
             context_message_limit: 12,
             max_turns_per_session: 0,
+            session_idle_ttl_secs: None,
+            max_live_sessions: None,
             presence_enabled: true,
             typing_enabled: true,
             memory_enabled: false,
             model: None,
+            thinking_effort: None,
             session_title: None,
+            claude_isolate_user_config: true,
+            unindexed_channel_policy: config::UnindexedChannelPolicy::Refuse,
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
@@ -6499,7 +6935,7 @@ mod error_outcome_emission_tests {
     async fn dummy_agent(index: usize) -> OwnedAgent {
         OwnedAgent {
             index,
-            acp: AcpClient::spawn("cat", &[], &[], false)
+            acp: AcpClient::spawn("cat", &[], &[], false, None)
                 .await
                 .expect("spawn cat as inert agent"),
             state: Default::default(),
@@ -6511,22 +6947,24 @@ mod error_outcome_emission_tests {
             // Error branches under test never read this; 1 is the legacy
             // non-systemPrompt path, the simplest valid value.
             protocol_version: 1,
+            session_close_supported: true,
         }
     }
 
     #[tokio::test]
     async fn successful_native_steer_is_transferred_to_live_session_delivery_state() {
         let channel_id = Uuid::new_v4();
+        let key = queue::SessionKey::ambient(channel_id);
         let steer_event_id = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
         let mut agent = dummy_agent(0).await;
         agent
             .state
             .sessions
-            .insert(channel_id, "live-session".into());
+            .insert(key.clone(), "live-session".into());
         agent
             .state
             .deliveries
-            .insert(channel_id, Default::default());
+            .insert(key.clone(), Default::default());
 
         let mut pool = AgentPool::from_slots(vec![None]);
         let task_id = pool.join_set.spawn(async {}).id();
@@ -6535,6 +6973,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: Some(channel_id),
+                session_key: Some(key.clone()),
                 turn_id: "test-turn-id".into(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -6561,7 +7000,7 @@ mod error_outcome_emission_tests {
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(channel_id),
+            source: PromptSource::Channel(key.clone()),
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
             batch: None,
@@ -6582,7 +7021,7 @@ mod error_outcome_emission_tests {
         );
 
         let returned = pool.agents_mut()[0].as_ref().expect("returned agent");
-        assert!(returned.state.deliveries[&channel_id]
+        assert!(returned.state.deliveries[&key]
             .delivered_event_ids
             .contains(steer_event_id));
     }
@@ -6590,15 +7029,16 @@ mod error_outcome_emission_tests {
     #[tokio::test]
     async fn in_flight_stale_native_steer_ack_cannot_update_replacement_session() {
         let channel_id = Uuid::new_v4();
+        let key = queue::SessionKey::ambient(channel_id);
         let mut agent = dummy_agent(0).await;
         agent
             .state
             .sessions
-            .insert(channel_id, "replacement-session".into());
+            .insert(key.clone(), "replacement-session".into());
         agent
             .state
             .deliveries
-            .insert(channel_id, Default::default());
+            .insert(key.clone(), Default::default());
 
         let mut pool = AgentPool::from_slots(vec![None]);
         let task_id = pool.join_set.spawn(async {}).id();
@@ -6607,6 +7047,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: Some(channel_id),
+                session_key: Some(key.clone()),
                 turn_id: "test-turn-id".into(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -6633,7 +7074,7 @@ mod error_outcome_emission_tests {
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(channel_id),
+            source: PromptSource::Channel(key.clone()),
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
             batch: None,
@@ -6654,7 +7095,7 @@ mod error_outcome_emission_tests {
         );
 
         let returned = pool.agents_mut()[0].as_ref().expect("returned agent");
-        assert!(returned.state.deliveries[&channel_id]
+        assert!(returned.state.deliveries[&key]
             .delivered_event_ids
             .is_empty());
     }
@@ -6662,25 +7103,31 @@ mod error_outcome_emission_tests {
     #[tokio::test]
     async fn successful_native_steer_ack_after_task_return_updates_matching_live_session() {
         let channel_id = Uuid::new_v4();
+        let key = queue::SessionKey::ambient(channel_id);
         let steer_event_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
         let mut agent = dummy_agent(0).await;
         agent
             .state
             .sessions
-            .insert(channel_id, "live-session".into());
+            .insert(key.clone(), "live-session".into());
         agent
             .state
             .deliveries
-            .insert(channel_id, Default::default());
+            .insert(key.clone(), Default::default());
+        agent
+            .state
+            .turn_generations
+            .insert(key.clone(), "completed-turn".into());
         let mut pool = AgentPool::from_slots(vec![Some(agent)]);
 
         assert!(pool.record_successful_steer(
-            channel_id,
+            &key,
             steer_event_id.into(),
             "live-session".into(),
+            "completed-turn",
         ));
         let returned = pool.agents_mut()[0].as_ref().expect("idle returned agent");
-        assert!(returned.state.deliveries[&channel_id]
+        assert!(returned.state.deliveries[&key]
             .delivered_event_ids
             .contains(steer_event_id));
     }
@@ -6688,31 +7135,147 @@ mod error_outcome_emission_tests {
     #[tokio::test]
     async fn late_native_steer_ack_cannot_update_replacement_session() {
         let channel_id = Uuid::new_v4();
+        let key = queue::SessionKey::ambient(channel_id);
         let mut agent = dummy_agent(0).await;
         agent
             .state
             .sessions
-            .insert(channel_id, "replacement-session".into());
+            .insert(key.clone(), "replacement-session".into());
         agent
             .state
             .deliveries
-            .insert(channel_id, Default::default());
+            .insert(key.clone(), Default::default());
+        agent
+            .state
+            .turn_generations
+            .insert(key.clone(), "replacement-turn".into());
         let mut pool = AgentPool::from_slots(vec![Some(agent)]);
 
         assert!(!pool.record_successful_steer(
-            channel_id,
+            &key,
             "stale-event".into(),
             "old-session".into(),
+            "old-turn",
         ));
         let returned = pool.agents_mut()[0].as_ref().expect("replacement agent");
-        assert!(returned.state.deliveries[&channel_id]
+        assert!(returned.state.deliveries[&key]
             .delivered_event_ids
             .is_empty());
     }
 
     #[tokio::test]
+    async fn stale_successful_steer_ack_releases_event_for_replacement_session() {
+        let channel_id = Uuid::new_v4();
+        let key = queue::SessionKey::ambient(channel_id);
+        let mut agent = dummy_agent(0).await;
+        agent
+            .state
+            .sessions
+            .insert(key.clone(), "replacement-session".into());
+        agent
+            .state
+            .deliveries
+            .insert(key.clone(), Default::default());
+        agent
+            .state
+            .turn_generations
+            .insert(key.clone(), "replacement-turn".into());
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        let event = EventBuilder::new(Kind::Custom(9), "stale steer")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        let event_id = event.id.to_hex();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        assert!(queue.push(QueuedEvent {
+            channel_id,
+            event,
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+        }));
+        assert!(queue.mark_native_steer_pending(&key, &event_id));
+
+        assert!(!settle_successful_steer_ack(
+            &mut pool,
+            &mut queue,
+            &key,
+            &event_id,
+            "old-session",
+            "old-turn",
+            config::DEFAULT_MAX_TURN_DURATION_SECS,
+        ));
+        assert_eq!(queue.queued_event_count(&key), 1);
+        let agent = pool.agents_mut()[0].as_ref().expect("replacement agent");
+        assert!(agent.state.deliveries[&key].delivered_event_ids.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_failed_steer_ack_cannot_signal_replacement_turn() {
+        let key = queue::SessionKey::ambient(Uuid::new_v4());
+        let mut pool = AgentPool::from_slots(vec![None]);
+        let task_id = pool.join_set.spawn(async {}).id();
+        let (control_tx, mut control_rx) = tokio::sync::oneshot::channel();
+        pool.task_map_mut().insert(
+            task_id,
+            crate::pool::TaskMeta {
+                agent_index: 0,
+                channel_id: Some(key.channel_id),
+                session_key: Some(key.clone()),
+                turn_id: "replacement-turn".into(),
+                recoverable_batch: None,
+                control_tx: Some(control_tx),
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+
+        assert!(!signal_steer_fallback_if_current(
+            &mut pool, &key, "old-turn"
+        ));
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(signal_steer_fallback_if_current(
+            &mut pool,
+            &key,
+            "replacement-turn"
+        ));
+        assert!(matches!(control_rx.await, Ok(ControlSignal::Steer)));
+    }
+
+    #[tokio::test]
+    async fn busy_session_owner_blocks_duplicate_affinity_on_an_idle_agent() {
+        let key = queue::SessionKey::ambient(Uuid::new_v4());
+        let other = queue::SessionKey::ambient(Uuid::new_v4());
+        let mut owner = dummy_agent(0).await;
+        owner
+            .state
+            .sessions
+            .insert(key.clone(), "live-session".into());
+        let spare = dummy_agent(1).await;
+        let mut pool = AgentPool::from_slots(vec![Some(owner), Some(spare)]);
+
+        let busy_owner = pool
+            .try_claim(Some(&other))
+            .expect("first idle agent is checked out for another conversation");
+        assert!(pool.has_session_for(&key));
+        assert!(
+            pool.try_claim(Some(&key)).is_none(),
+            "the idle spare must not create a divergent session while the owner is busy"
+        );
+
+        pool.return_agent(busy_owner);
+        let resumed = pool
+            .try_claim(Some(&key))
+            .expect("the owner becomes claimable after return");
+        assert_eq!(resumed.index, 0);
+    }
+
+    #[tokio::test]
     async fn invalidated_session_does_not_resurrect_successful_steer_delivery_state() {
         let channel_id = Uuid::new_v4();
+        let key = queue::SessionKey::ambient(channel_id);
         let agent = dummy_agent(0).await;
         // No live session: simulates the prompt task invalidating before return.
         let mut pool = AgentPool::from_slots(vec![None]);
@@ -6722,6 +7285,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: Some(channel_id),
+                session_key: Some(key.clone()),
                 turn_id: "test-turn-id".into(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -6747,7 +7311,7 @@ mod error_outcome_emission_tests {
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(channel_id),
+            source: PromptSource::Channel(key.clone()),
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
             batch: None,
@@ -6768,7 +7332,7 @@ mod error_outcome_emission_tests {
         );
 
         let returned = pool.agents_mut()[0].as_ref().expect("returned agent");
-        assert!(!returned.state.deliveries.contains_key(&channel_id));
+        assert!(!returned.state.deliveries.contains_key(&key));
     }
 
     /// Drive one error outcome through `handle_prompt_result` and return how
@@ -6787,6 +7351,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: None,
+                session_key: None,
                 turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -6810,7 +7375,7 @@ mod error_outcome_emission_tests {
 
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(Uuid::new_v4()),
+            source: PromptSource::Channel(crate::queue::SessionKey::ambient(Uuid::new_v4())),
             turn_id: "test-turn-id".to_string(),
             outcome,
             batch: None,
@@ -6864,6 +7429,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: Some(channel_id),
+                session_key: Some(crate::queue::SessionKey::ambient(channel_id)),
                 turn_id: "panic-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -6957,6 +7523,7 @@ mod error_outcome_emission_tests {
                 crate::pool::TaskMeta {
                     agent_index: 0,
                     channel_id: None,
+                    session_key: None,
                     turn_id: "test-turn-id".to_string(),
                     recoverable_batch: None,
                     control_tx: None,
@@ -6978,7 +7545,7 @@ mod error_outcome_emission_tests {
             let observer = ObserverHandle::in_process();
             let result = PromptResult {
                 agent,
-                source: PromptSource::Channel(Uuid::new_v4()),
+                source: PromptSource::Channel(crate::queue::SessionKey::ambient(Uuid::new_v4())),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: None,
@@ -7028,6 +7595,7 @@ mod error_outcome_emission_tests {
                 .unwrap();
             FlushBatch {
                 channel_id: Uuid::new_v4(),
+                root: None,
                 events: vec![BatchEvent {
                     event,
                     prompt_tag: "test".into(),
@@ -7049,6 +7617,7 @@ mod error_outcome_emission_tests {
                 crate::pool::TaskMeta {
                     agent_index: 0,
                     channel_id: None,
+                    session_key: None,
                     turn_id: "test-turn-id".to_string(),
                     recoverable_batch: None,
                     control_tx: None,
@@ -7069,7 +7638,7 @@ mod error_outcome_emission_tests {
             let mut respawn_tasks = tokio::task::JoinSet::new();
             let result = PromptResult {
                 agent,
-                source: PromptSource::Channel(channel_id),
+                source: PromptSource::Channel(crate::queue::SessionKey::ambient(channel_id)),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: Some(batch),
@@ -7088,8 +7657,8 @@ mod error_outcome_emission_tests {
                 None,
             );
             (
-                queue.pending_channels(),
-                queue.queued_event_count(&channel_id),
+                queue.pending_conversations(),
+                queue.queued_event_count(&crate::queue::SessionKey::ambient(channel_id)),
             )
         };
 
@@ -7135,6 +7704,7 @@ mod error_outcome_emission_tests {
                 .unwrap();
             FlushBatch {
                 channel_id,
+                root: None,
                 events: vec![BatchEvent {
                     event,
                     prompt_tag: "test".into(),
@@ -7155,6 +7725,7 @@ mod error_outcome_emission_tests {
                 crate::pool::TaskMeta {
                     agent_index: 0,
                     channel_id: None,
+                    session_key: None,
                     turn_id: "test-turn-id".to_string(),
                     recoverable_batch: None,
                     control_tx: None,
@@ -7175,7 +7746,7 @@ mod error_outcome_emission_tests {
             let mut respawn_tasks = tokio::task::JoinSet::new();
             let result = PromptResult {
                 agent,
-                source: PromptSource::Channel(channel_id),
+                source: PromptSource::Channel(crate::queue::SessionKey::ambient(channel_id)),
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: Some(batch),
@@ -7194,8 +7765,8 @@ mod error_outcome_emission_tests {
                 None,
             );
             (
-                queue.pending_channels(),
-                queue.queued_event_count(&channel_id),
+                queue.pending_conversations(),
+                queue.queued_event_count(&crate::queue::SessionKey::ambient(channel_id)),
             )
         };
 
@@ -7232,6 +7803,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: None,
+                session_key: None,
                 turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -7253,6 +7825,7 @@ mod error_outcome_emission_tests {
         let observer = ObserverHandle::in_process();
         let batch = FlushBatch {
             channel_id,
+            root: None,
             events: vec![BatchEvent {
                 event: EventBuilder::new(Kind::Custom(9), "test")
                     .sign_with_keys(&Keys::generate())
@@ -7265,7 +7838,7 @@ mod error_outcome_emission_tests {
         };
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(channel_id),
+            source: PromptSource::Channel(crate::queue::SessionKey::ambient(channel_id)),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
                 recently_active: true,
@@ -7299,7 +7872,7 @@ mod error_outcome_emission_tests {
             ),
         );
         assert_eq!(
-            queue.pending_channels(),
+            queue.pending_conversations(),
             1,
             "batch must be requeued, not dead-lettered, while within the retry budget"
         );
@@ -7317,7 +7890,10 @@ mod error_outcome_emission_tests {
         // Simulate MAX_RETRIES prior failed attempts on this channel so the
         // upcoming requeue() call in handle_prompt_result crosses the
         // dead-letter threshold.
-        queue.set_retry_count_for_test(channel_id, crate::queue::MAX_RETRIES);
+        queue.set_retry_count_for_test(
+            &crate::queue::SessionKey::ambient(channel_id),
+            crate::queue::MAX_RETRIES,
+        );
 
         let agent = dummy_agent(0).await;
         let mut pool = AgentPool::from_slots(vec![None]);
@@ -7327,6 +7903,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: None,
+                session_key: None,
                 turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -7347,6 +7924,7 @@ mod error_outcome_emission_tests {
         let observer = ObserverHandle::in_process();
         let batch = FlushBatch {
             channel_id,
+            root: None,
             events: vec![BatchEvent {
                 event: EventBuilder::new(Kind::Custom(9), "final-attempt")
                     .sign_with_keys(&Keys::generate())
@@ -7359,7 +7937,7 @@ mod error_outcome_emission_tests {
         };
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(channel_id),
+            source: PromptSource::Channel(crate::queue::SessionKey::ambient(channel_id)),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Timeout(TimeoutKind::Hard {
                 recently_active: true,
@@ -7393,7 +7971,7 @@ mod error_outcome_emission_tests {
             ),
         );
         assert_eq!(
-            queue.queued_event_count(&channel_id),
+            queue.queued_event_count(&crate::queue::SessionKey::ambient(channel_id)),
             0,
             "batch with an exhausted retry budget must be dead-lettered, not requeued"
         );
@@ -7427,6 +8005,7 @@ mod error_outcome_emission_tests {
         let channel_id = Uuid::new_v4();
         let batch = FlushBatch {
             channel_id,
+            root: None,
             events: vec![BatchEvent {
                 event: original_event.clone(),
                 prompt_tag: "test".into(),
@@ -7444,6 +8023,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: None,
+                session_key: None,
                 turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -7476,7 +8056,7 @@ mod error_outcome_emission_tests {
         let grace = std::time::Duration::from_secs(5);
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(channel_id),
+            source: PromptSource::Channel(crate::queue::SessionKey::ambient(channel_id)),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::CancelDrainTimeout(grace),
             batch: Some(batch),
@@ -7584,6 +8164,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: None,
+                session_key: None,
                 turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -7606,7 +8187,7 @@ mod error_outcome_emission_tests {
         let grace = std::time::Duration::from_secs(5);
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(Uuid::new_v4()),
+            source: PromptSource::Channel(crate::queue::SessionKey::ambient(Uuid::new_v4())),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::CancelDrainTimeout(grace),
             // Explicit Stop already dropped the batch upstream in
@@ -7631,7 +8212,7 @@ mod error_outcome_emission_tests {
 
         // No batch to merge — the queue has nothing pending for any channel.
         assert_eq!(
-            queue.pending_channels(),
+            queue.pending_conversations(),
             0,
             "a dropped Stop batch must not leave anything queued"
         );
@@ -7750,6 +8331,7 @@ mod error_outcome_emission_tests {
         let channel_id = uuid::Uuid::new_v4();
         let batch = FlushBatch {
             channel_id,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -7773,6 +8355,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: None,
+                session_key: None,
                 turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -7793,7 +8376,7 @@ mod error_outcome_emission_tests {
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(channel_id),
+            source: PromptSource::Channel(crate::queue::SessionKey::ambient(channel_id)),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(auth_error),
             batch: Some(batch),
@@ -7814,12 +8397,12 @@ mod error_outcome_emission_tests {
 
         // The batch must not be requeued: pending_channels returns 0.
         assert_eq!(
-            queue.pending_channels(),
+            queue.pending_conversations(),
             0,
             "auth error must dead-letter immediately — batch must not be requeued"
         );
         assert_eq!(
-            queue.queued_event_count(&channel_id),
+            queue.queued_event_count(&crate::queue::SessionKey::ambient(channel_id)),
             0,
             "auth error must dead-letter immediately — no events should be pending"
         );
@@ -7836,6 +8419,7 @@ mod error_outcome_emission_tests {
         let channel_id = uuid::Uuid::new_v4();
         let batch = FlushBatch {
             channel_id,
+            root: None,
             events: vec![BatchEvent {
                 event,
                 prompt_tag: "test".into(),
@@ -7859,6 +8443,7 @@ mod error_outcome_emission_tests {
             crate::pool::TaskMeta {
                 agent_index: 0,
                 channel_id: None,
+                session_key: None,
                 turn_id: "test-turn-id".to_string(),
                 recoverable_batch: None,
                 control_tx: None,
@@ -7879,7 +8464,7 @@ mod error_outcome_emission_tests {
         let mut respawn_tasks = tokio::task::JoinSet::new();
         let result = PromptResult {
             agent,
-            source: PromptSource::Channel(channel_id),
+            source: PromptSource::Channel(crate::queue::SessionKey::ambient(channel_id)),
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(usage_error),
             batch: Some(batch),
@@ -7900,12 +8485,12 @@ mod error_outcome_emission_tests {
 
         // Non-auth application error: batch IS requeued (first attempt, retry budget > 0).
         assert_eq!(
-            queue.pending_channels(),
+            queue.pending_conversations(),
             1,
             "non-auth application error must requeue the batch for retry"
         );
         assert_eq!(
-            queue.queued_event_count(&channel_id),
+            queue.queued_event_count(&crate::queue::SessionKey::ambient(channel_id)),
             1,
             "non-auth application error must preserve the event for retry"
         );
