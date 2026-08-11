@@ -2270,7 +2270,7 @@ pub async fn run_prompt_task(
                             &turn_id,
                             agent,
                             source,
-                            PromptOutcome::Error(AcpError::Protocol(reason)),
+                            PromptOutcome::Error(AcpError::SessionRefused(reason)),
                             requeue_batch_if_queue(&ctx, batch),
                         );
                         return;

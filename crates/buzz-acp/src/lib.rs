@@ -3126,6 +3126,31 @@ enum LoopAction {
     Exit,
 }
 
+/// Whether a failed prompt means the agent's stdio pipe can no longer be
+/// trusted, and the process must be respawned.
+///
+/// Only errors that involve the pipe itself qualify. Everything else — a prompt
+/// that timed out, malformed JSON from the agent, or a session the harness
+/// refused locally — leaves the process healthy and reusable. Misclassifying a
+/// local refusal here costs one process respawn *per queue retry*, which is how
+/// a single message to an unindexed channel used to churn the harness ten times
+/// over.
+fn is_transport_class(error: &acp::AcpError) -> bool {
+    match error {
+        acp::AcpError::Io(_)
+        | acp::AcpError::WriteTimeout(_)
+        | acp::AcpError::Timeout(_)
+        | acp::AcpError::Protocol(_) => true,
+        acp::AcpError::SessionRefused(_)
+        | acp::AcpError::Json(_)
+        | acp::AcpError::AgentExited
+        | acp::AcpError::IdleTimeout(_)
+        | acp::AcpError::HardTimeout { .. }
+        | acp::AcpError::CancelDrainTimeout(_)
+        | acp::AcpError::AgentError { .. } => false,
+    }
+}
+
 fn event_mentions_agent(event: &nostr::Event, agent_pubkey_hex: &str) -> bool {
     event.tags.iter().any(|t| {
         t.as_slice().first().map(|s| s.as_str()) == Some("p")
@@ -3782,9 +3807,12 @@ fn handle_prompt_result(
         //    to the agent regardless of whether they occurred during session
         //    creation or an active prompt — respawn unconditionally.
         //
-        // 2. Application-class (IdleTimeout, HardTimeout, Json): the pipe is
-        //    intact but the prompt failed. Return the agent to the pool so it
-        //    can be reused for the next event.
+        // 2. Application-class (IdleTimeout, HardTimeout, Json, SessionRefused):
+        //    the pipe is intact but the prompt failed. Return the agent to the
+        //    pool so it can be reused for the next event. SessionRefused is the
+        //    strongest case of this: the harness refused the session locally and
+        //    never wrote to the agent at all, so respawning it would churn the
+        //    process once per queue retry while fixing nothing.
 
         // Intentional cancel — agent is healthy, return it to the pool.
         // No respawn, no retry penalty. The cancelled batch was already stored
@@ -3801,13 +3829,7 @@ fn handle_prompt_result(
             pool.return_agent(result.agent);
         }
         PromptOutcome::Error(ref e) => {
-            let is_transport_error = matches!(
-                e,
-                acp::AcpError::Io(_)
-                    | acp::AcpError::WriteTimeout(_)
-                    | acp::AcpError::Timeout(_)
-                    | acp::AcpError::Protocol(_)
-            );
+            let is_transport_error = is_transport_class(e);
             let error_code = match &e {
                 acp::AcpError::AgentError { code, .. } => Some(*code),
                 _ => None,
@@ -4849,6 +4871,47 @@ mod owner_control_command_tests {
             "!rotate",
             &agent
         ));
+    }
+
+    #[test]
+    fn session_refusal_is_not_transport_class_and_never_respawns() {
+        // A channel the workspace index does not declare is refused locally,
+        // before anything is written to the agent. Classifying that as
+        // transport-class respawned the harness once per queue retry.
+        let refused = acp::AcpError::SessionRefused(
+            "channel 77a91977-09b0-5d68-b31a-802aa7e1b923 is not indexed".to_string(),
+        );
+        assert!(!is_transport_class(&refused));
+    }
+
+    #[test]
+    fn transport_class_covers_pipe_errors_only() {
+        use std::time::Duration;
+
+        for error in [
+            acp::AcpError::Io(std::io::Error::other("broken pipe")),
+            acp::AcpError::WriteTimeout(Duration::from_secs(1)),
+            acp::AcpError::Timeout(Duration::from_secs(1)),
+            acp::AcpError::Protocol("desynchronized".to_string()),
+        ] {
+            assert!(is_transport_class(&error), "expected transport: {error}");
+        }
+
+        for error in [
+            acp::AcpError::SessionRefused("policy".to_string()),
+            acp::AcpError::IdleTimeout(Duration::from_secs(1)),
+            acp::AcpError::HardTimeout {
+                silence: Duration::from_secs(1),
+            },
+            acp::AcpError::CancelDrainTimeout(Duration::from_secs(1)),
+            acp::AcpError::AgentExited,
+            acp::AcpError::AgentError {
+                code: -32000,
+                message: "nope".to_string(),
+            },
+        ] {
+            assert!(!is_transport_class(&error), "expected application: {error}");
+        }
     }
 
     #[test]

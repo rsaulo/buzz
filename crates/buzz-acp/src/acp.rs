@@ -113,6 +113,13 @@ pub enum AcpError {
     #[error("Protocol error: {0}")]
     Protocol(String),
 
+    /// A local policy refused to start the session — the harness never wrote to
+    /// the agent, so the stdio pipe is intact and the agent must **not** be
+    /// respawned. Retrying can only succeed after the operator changes
+    /// configuration (e.g. declaring the channel in `.buzz/workspace.json`).
+    #[error("Session refused: {0}")]
+    SessionRefused(String),
+
     #[error("Agent reported error (code {code}): {message}")]
     AgentError { code: i64, message: String },
 }
