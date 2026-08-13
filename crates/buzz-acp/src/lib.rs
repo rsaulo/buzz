@@ -3215,6 +3215,11 @@ async fn tokio_main() -> Result<()> {
                     // running or just ended — either way there is nothing to
                     // cancel).
                     Ok(pool::SteerAck::Err(pool::SteerError::AgentError { .. })) => (true, false),
+                    // promptRequired: the turn was already over and the adapter
+                    // deliberately did not consume the message. Release it for
+                    // normal dispatch; no fallback, because there is no
+                    // in-flight turn to cancel and nothing was delivered.
+                    Ok(pool::SteerAck::Err(pool::SteerError::PromptRequired)) => (true, false),
                     // Transport / ExpectedRunIdMissing / OutcomeRejected: the
                     // steer did not land. Release and fire the cancel+merge
                     // fallback so the message still reaches the agent.

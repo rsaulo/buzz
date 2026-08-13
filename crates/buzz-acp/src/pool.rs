@@ -963,6 +963,15 @@ pub enum SteerError {
     /// drop the user's message: codex-acp answers unrecognized extension
     /// methods with a bare `{}` success rather than `-32601`.
     OutcomeRejected { outcome: String },
+    /// The adapter answered `promptRequired`: the turn had already finished, so
+    /// it did not consume the message and handed it back to us — the host-owned
+    /// idle fallback we opt into via `_meta.steering.idleBehavior`.
+    ///
+    /// Not a failure. The main loop releases the withheld event for ordinary
+    /// dispatch and must NOT fire the cancel+merge fallback: there is no
+    /// in-flight turn to cancel, and the message was never delivered, so nothing
+    /// is duplicated by re-prompting it.
+    PromptRequired,
     /// The read loop never got to dispatch the steer because the prompt
     /// completed first. Delivery state for the underlying message is
     /// unknown after prompt completion — the main loop must treat this as
