@@ -328,13 +328,6 @@ impl EventQueue {
         self
     }
 
-    /// Monotonically extend an existing in-flight deadline for `channel_id`.
-    ///
-    /// Called when a successful steer grants a fresh turn budget. The new
-    /// deadline is `max(current, now + max_turn_secs + buffer)` — it never
-    /// moves backward. If the channel is not in-flight (already completed
-    /// via `mark_complete`), this is a no-op: a late ack never resurrects
-    /// a deadline.
     /// Record that we published a message into `key`'s conversation.
     ///
     /// Ignored unless the session is in flight: outside a turn there is no
@@ -350,6 +343,13 @@ impl EventQueue {
         self.published_epochs.get(key).copied().unwrap_or(0)
     }
 
+    /// Monotonically extend an existing in-flight deadline for `key`.
+    ///
+    /// Called when a successful steer grants a fresh turn budget. The new
+    /// deadline is `max(current, now + max_turn_secs + buffer)` — it never
+    /// moves backward. If the session is not in-flight (already completed
+    /// via `mark_complete`), this is a no-op: a late ack never resurrects
+    /// a deadline.
     pub fn extend_in_flight_deadline(&mut self, key: &SessionKey, max_turn_secs: u64) {
         if let Some(current) = self.in_flight_deadlines.get_mut(key) {
             let extended = Instant::now()

@@ -3187,6 +3187,13 @@ async fn wait_for_reconnect(
 /// - On first subscribe (`since` is `None`) adds `since=now` to avoid replaying
 ///   history. On reconnect (`since` is `Some`) subtracts [`SINCE_SKEW_SECS`].
 ///
+/// When `require_mention` is set, a second filter is appended so our OWN
+/// kind:9 messages come back. They carry `p` = whoever we answered, never
+/// ourselves, so the `#p` filter would hide them — and then the only evidence
+/// that a turn actually said something to somebody would never arrive. They are
+/// counted and dropped by the `ignore_self` gate; the extra filter exists purely
+/// so steer settlement can tell "replied" from "kept working in silence".
+///
 /// Returns `true` if the REQ was successfully written to the WebSocket.
 async fn send_subscribe(
     ws: &mut WsStream,
@@ -3224,7 +3231,24 @@ async fn send_subscribe(
     };
     req_filter.insert("since".into(), json!(since_ts));
 
-    let req = json!(["REQ", sub_id, Value::Object(req_filter)]);
+    let mut req = vec![json!("REQ"), json!(sub_id), Value::Object(req_filter)];
+
+    // Self-authored messages: only needed when `#p` above would exclude them.
+    // Scoped to kind:9 in this channel — that is the only kind settlement
+    // counts, and anything wider would replay our own reactions and receipts.
+    if filter.require_mention {
+        let mut self_filter = serde_json::Map::new();
+        self_filter.insert(
+            "kinds".into(),
+            json!([buzz_core::kind::KIND_STREAM_MESSAGE]),
+        );
+        self_filter.insert("#h".into(), json!([channel_id.to_string()]));
+        self_filter.insert("authors".into(), json!([agent_pubkey_hex]));
+        self_filter.insert("since".into(), json!(since_ts));
+        req.push(Value::Object(self_filter));
+    }
+
+    let req = Value::Array(req);
 
     match serde_json::to_string(&req) {
         Ok(text) => {
@@ -4442,6 +4466,86 @@ mod tests {
             kinds: Some(vec![9]),
             require_mention: false,
         }
+    }
+
+    /// A `#p`-filtered subscription hides our own messages: we publish with
+    /// `p` = whoever we answered. Without a second filter the settlement side
+    /// never sees an answer and requeues every steered mention — a duplicate
+    /// on every ordinary reply.
+    #[tokio::test]
+    async fn mention_subscription_also_requests_self_authored_messages() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let state = BgState::new();
+        let channel_id = Uuid::new_v4();
+        let filter = ChannelFilter {
+            kinds: Some(vec![9]),
+            require_mention: true,
+        };
+
+        assert!(
+            send_subscribe(
+                &mut client,
+                &state,
+                channel_id,
+                "agent-pubkey",
+                Some(2_000),
+                &filter
+            )
+            .await
+        );
+
+        let frame = next_test_frame(&mut server).await;
+        let filters = frame.as_array().expect("REQ frame is an array");
+        assert_eq!(filters.len(), 4, "REQ must carry two filters: {frame}");
+
+        let mentions = &filters[2];
+        assert_eq!(mentions["#p"], json!(["agent-pubkey"]));
+        assert!(mentions.get("authors").is_none());
+
+        let own = &filters[3];
+        assert_eq!(own["authors"], json!(["agent-pubkey"]));
+        assert_eq!(
+            own["kinds"],
+            json!([buzz_core::kind::KIND_STREAM_MESSAGE]),
+            "self filter must stay on messages — reactions and receipts are not answers"
+        );
+        assert_eq!(own["#h"], json!([channel_id.to_string()]));
+        assert!(
+            own.get("#p").is_none(),
+            "the self filter must not inherit the mention constraint that hides it"
+        );
+        assert_eq!(
+            own["since"], mentions["since"],
+            "both filters must share the reconnect floor"
+        );
+    }
+
+    /// Without `#p` our own messages already arrive on the channel filter, so
+    /// the extra filter would only duplicate the stream.
+    #[tokio::test]
+    async fn wildcard_subscription_stays_a_single_filter() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let state = BgState::new();
+        let channel_id = Uuid::new_v4();
+
+        assert!(
+            send_subscribe(
+                &mut client,
+                &state,
+                channel_id,
+                "agent-pubkey",
+                Some(2_000),
+                &test_channel_filter()
+            )
+            .await
+        );
+
+        let frame = next_test_frame(&mut server).await;
+        assert_eq!(
+            frame.as_array().expect("REQ frame is an array").len(),
+            3,
+            "unfiltered subscriptions already see our own messages: {frame}"
+        );
     }
 
     fn seed_test_subscription(state: &mut BgState, channel_id: Uuid) {
