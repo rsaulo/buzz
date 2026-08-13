@@ -234,6 +234,40 @@ pub struct AcpClient {
     standard_adapter: Option<StandardAdapterKind>,
     /// One NIP-AM sequence shared by custom and standard usage sources.
     published_usage_sequences: std::collections::HashMap<String, u64>,
+    /// Monotonic count of *visible output* produced by the current turn.
+    ///
+    /// Reset at the start of every `session/prompt` and advanced only by things
+    /// a human would recognise as the agent doing something: non-blank
+    /// assistant text, and tool calls that actually completed. Thoughts, plans,
+    /// blank chunks, tool *starts* and usage frames deliberately do not count.
+    ///
+    /// It is an epoch, not a boolean, because the question a steer settlement
+    /// has to answer is "did output happen **after** this message landed?" — and
+    /// a flag cannot tell "spoke, then went silent on the new message" from
+    /// "answered it".
+    turn_output_epoch: u64,
+}
+
+/// Whether a `session/update` counts as visible output for the turn's epoch.
+///
+/// The ACP schema lets the *initial* `tool_call` carry `status: "completed"`,
+/// so a connector that never sends a follow-up `tool_call_update` would look
+/// dead after doing real work. One shared predicate covers both events.
+fn update_produces_output(update_type: &str, update: &serde_json::Value) -> bool {
+    match update_type {
+        "agent_message_chunk" => update["content"]["text"]
+            .as_str()
+            .is_some_and(|t| !t.trim().is_empty()),
+        "tool_call" | "tool_call_update" => {
+            let completed = update.get("status").and_then(|v| v.as_str()) == Some("completed");
+            let errored = update
+                .pointer("/rawOutput/isError")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            completed && !errored
+        }
+        _ => false,
+    }
 }
 
 fn standard_adapter_kind(command: &str) -> Option<StandardAdapterKind> {
@@ -635,6 +669,7 @@ impl AcpClient {
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
             published_usage_sequences: std::collections::HashMap::new(),
+            turn_output_epoch: 0,
         })
     }
 
@@ -914,6 +949,10 @@ impl AcpClient {
         self.goose_usage.begin_turn(session_id);
         self.standard_usage.begin_turn(session_id);
 
+        // A new turn starts with no output to its name. Reset before the write,
+        // so output from the previous turn can never be read as this one's.
+        self.turn_output_epoch = 0;
+
         self.last_prompt_id = Some(self.next_id);
         let id = self.next_id;
         self.next_id += 1;
@@ -1025,6 +1064,12 @@ impl AcpClient {
             self.goose_usage.commit_standard_fallback(&usage);
         }
         Some(usage)
+    }
+
+    /// Visible-output count for the turn currently running (or the one that
+    /// just finished, until the next `session/prompt` resets it).
+    pub(crate) fn turn_output_epoch(&self) -> u64 {
+        self.turn_output_epoch
     }
 
     /// Notify the usage tracker that buzz-acp just spawned a new session.
@@ -1781,6 +1826,7 @@ impl AcpClient {
                                                 );
                                                 crate::pool::SteerAck::Success {
                                                     session_id: session_id.to_owned(),
+                                                    output_epoch: self.turn_output_epoch,
                                                 }
                                             }
                                             Some(_) => {
@@ -1795,6 +1841,7 @@ impl AcpClient {
                                                 }
                                                 crate::pool::SteerAck::Success {
                                                     session_id: session_id.to_owned(),
+                                                    output_epoch: self.turn_output_epoch,
                                                 }
                                             }
                                             None => {
@@ -1903,6 +1950,10 @@ impl AcpClient {
             .get("sessionUpdate")
             .and_then(|v| v.as_str())
             .unwrap_or("unknown");
+
+        if update_produces_output(update_type, update) {
+            self.turn_output_epoch += 1;
+        }
 
         match update_type {
             "agent_message_chunk" => {

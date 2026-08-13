@@ -632,6 +632,13 @@ pub struct PromptResult {
     pub outcome: PromptOutcome,
     /// Present on failure in Queue mode, for requeue.
     pub batch: Option<FlushBatch>,
+    /// The turn's visible-output count at the moment it ended.
+    ///
+    /// Compared against the epoch stamped on each delivered steer to decide
+    /// whether the turn actually answered it. Captured in
+    /// [`send_prompt_result`] so every terminal path reports it, including the
+    /// ones that return early on error.
+    pub final_output_epoch: u64,
 }
 
 /// Whether the prompt came from a channel event or a heartbeat.
@@ -973,9 +980,17 @@ pub enum SteerError {
 #[derive(Debug)]
 pub enum SteerAck {
     /// The agent returned a successful response to the steer request.
-    /// The main loop must drop the withheld event (`remove_event`) — it
-    /// has been delivered via the non-cancelling path.
-    Success { session_id: String },
+    ///
+    /// Delivery is proven; an *answer* is not. The main loop parks the event in
+    /// the delivered-steer ledger stamped with `output_epoch` — the turn's
+    /// visible-output count at the moment the steer was accepted — and the
+    /// turn's terminal settlement decides its fate by comparing that stamp
+    /// against the final epoch. `session_id` continues to fence the ack to the
+    /// exact ACP session generation that accepted it.
+    Success {
+        session_id: String,
+        output_epoch: u64,
+    },
     /// The steer was attempted but failed. Delivery state for the
     /// underlying message is unknown after prompt completion; the main
     /// loop must release the withheld event and fall back to the
@@ -2368,12 +2383,17 @@ fn send_prompt_result(
     batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
+    // Read the epoch before the agent moves into the result: this is the single
+    // choke point every terminal path goes through, so no early-return error
+    // branch can forget to report it.
+    let final_output_epoch = agent.acp.turn_output_epoch();
     let _ = result_tx.send(PromptResult {
         agent,
         source,
         turn_id: turn_id.to_owned(),
         outcome,
         batch,
+        final_output_epoch,
     });
 }
 
@@ -3430,6 +3450,41 @@ pub async fn run_prompt_task(
                                 "control signal arrived but turn already completed — treating as success"
                             );
                         }
+                        // This branch synthesizes its own EndTurn, so it must
+                        // run the same classifier rather than assume success.
+                        // Relying on an invariant that lives in another function
+                        // would hold today and turn this into a silent bypass the
+                        // moment someone inserts an `.await` upstream of it.
+                        if is_dead_turn(
+                            &source,
+                            &StopReason::EndTurn,
+                            batch.as_ref(),
+                            agent.acp.turn_output_epoch(),
+                        ) {
+                            tracing::warn!(
+                                target: "pool::prompt",
+                                "turn for {source:?} completed silently before a control signal but owed an answer — retrying"
+                            );
+                            let usage = agent.acp.take_turn_usage();
+                            publish_agent_turn_metric(
+                                &ctx,
+                                usage,
+                                observer_channel_id,
+                                &session_id,
+                                &turn_id,
+                                Some(buzz_core::agent_turn_metric::StopReason::Error),
+                            )
+                            .await;
+                            send_prompt_result(
+                                &result_tx,
+                                &turn_id,
+                                agent,
+                                source,
+                                PromptOutcome::Error(dead_turn_error()),
+                                requeue_batch_if_queue(&ctx, batch),
+                            );
+                            return;
+                        }
                         if let PromptSource::Channel(key) = &source {
                             let standing_sent = !agent.has_system_prompt_support();
                             agent.state.mark_delivery_success(
@@ -3471,6 +3526,40 @@ pub async fn run_prompt_task(
     match prompt_result {
         Ok(stop_reason) => {
             log_stop_reason(&source, &stop_reason);
+
+            // Classify BEFORE committing delivery. A batch that silently failed
+            // must not be recorded as successfully delivered — doing so would
+            // suppress its context on the retry and mark its events seen.
+            if is_dead_turn(
+                &source,
+                &stop_reason,
+                batch.as_ref(),
+                agent.acp.turn_output_epoch(),
+            ) {
+                tracing::warn!(
+                    target: "pool::prompt",
+                    "turn for {source:?} ended with no output but owed an answer — retrying"
+                );
+                let usage = agent.acp.take_turn_usage();
+                publish_agent_turn_metric(
+                    &ctx,
+                    usage,
+                    observer_channel_id,
+                    &session_id,
+                    &turn_id,
+                    Some(buzz_core::agent_turn_metric::StopReason::Error),
+                )
+                .await;
+                send_prompt_result(
+                    &result_tx,
+                    &turn_id,
+                    agent,
+                    source,
+                    PromptOutcome::Error(dead_turn_error()),
+                    requeue_batch_if_queue(&ctx, batch),
+                );
+                return;
+            }
 
             if let PromptSource::Channel(key) = &source {
                 let standing_sent = !agent.has_system_prompt_support();
@@ -4725,6 +4814,42 @@ fn parse_nostr_dm_response(json: serde_json::Value, limit: u32) -> Option<Conver
 
 /// Return the batch for requeue only in Queue mode; drop it in Drop mode.
 #[inline]
+/// The error a silently-vanished turn is reported as.
+///
+/// Deliberately an `AgentError` (application class, not transport): the stdio
+/// pipe is intact and the subprocess answered normally, so respawning would
+/// charge the crash circuit for a fault the process did not have. It only needs
+/// to be retryable, so the batch goes back through the ordinary, fully-budgeted
+/// retry path.
+pub(crate) fn dead_turn_error() -> AcpError {
+    AcpError::AgentError {
+        code: -32099,
+        message: "turn ended without producing any output for a message that required an answer"
+            .to_string(),
+    }
+}
+
+/// Whether this turn ended having produced nothing, for someone who was owed an
+/// answer.
+///
+/// All four conditions matter. Heartbeats have no one to answer. A non-`EndTurn`
+/// stop reason already has its own handling. A turn that produced visible output
+/// answered *something*. And a batch nobody addressed is entitled to silence —
+/// the base prompt tells the agent to stay quiet when it has nothing to add, and
+/// retrying that would turn correct restraint into ten retries and a
+/// user-visible failure notice.
+fn is_dead_turn(
+    source: &PromptSource,
+    stop_reason: &StopReason,
+    batch: Option<&FlushBatch>,
+    final_output_epoch: u64,
+) -> bool {
+    matches!(source, PromptSource::Channel(_))
+        && matches!(stop_reason, StopReason::EndTurn)
+        && final_output_epoch == 0
+        && batch.is_some_and(FlushBatch::requires_response)
+}
+
 fn requeue_batch_if_queue(ctx: &PromptContext, batch: Option<FlushBatch>) -> Option<FlushBatch> {
     match ctx.dedup_mode {
         DedupMode::Queue => batch,
@@ -5963,6 +6088,7 @@ done
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -6178,6 +6304,7 @@ while IFS= read -r line; do
     2)
       : > "__USER_PROMPT_MARKER__"
       printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"metric-session","update":{"sessionUpdate":"usage_update","used":24,"size":200000,"cost":{"amount":0.25,"currency":"USD"}}}}'
+      printf '%s\n' '{"jsonrpc":"2.0","method":"session/update","params":{"update":{"sessionUpdate":"agent_message_chunk","content":{"text":"answered"}}}}'
       printf '%s\n' '{"jsonrpc":"2.0","id":2,"result":{"stopReason":"end_turn","usage":{"inputTokens":20,"outputTokens":4,"totalTokens":24}}}'
       ;;
   esac
@@ -6250,6 +6377,7 @@ done
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -7446,6 +7574,7 @@ done
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -7550,6 +7679,7 @@ while IFS= read -r line; do
   if [ "$count" -eq 1 ]; then
     printf '%s\n' '{{"jsonrpc":"2.0","id":0,"error":{{"code":-32000,"message":"retry me"}}}}'
   else
+    printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"text":"answered"}}}}}}}}'
     printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$((count - 1)),\"result\":{{\"stopReason\":\"end_turn\"}}}}"
   fi
 done"#
@@ -7651,6 +7781,7 @@ while IFS= read -r line; do
   if [ "$count" -eq 1 ]; then
     printf '%s\n' '{{"jsonrpc":"2.0","id":0,"error":{{"code":-32000,"message":"retry me"}}}}'
   else
+    printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"text":"answered"}}}}}}}}'
     printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$((count - 1)),\"result\":{{\"stopReason\":\"end_turn\"}}}}"
   fi
 done"#
@@ -7705,6 +7836,7 @@ done"#
                     event,
                     prompt_tag: "test".into(),
                     received_at: std::time::Instant::now(),
+                    requires_response: true,
                 }],
                 cancelled_events: vec![],
                 cancel_reason: None,
@@ -7797,11 +7929,13 @@ done"#
                 event: new_event.clone(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![crate::queue::BatchEvent {
                 event: carry_over.clone(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancel_reason: Some(crate::queue::CancelReason::Steer),
         };
@@ -7812,6 +7946,7 @@ done"#
                 event: next_event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -7845,6 +7980,7 @@ done"#
             r#"count=0
 while IFS= read -r line; do
   printf '%s\n' "$line" >> '{quoted_capture}'
+  printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"text":"answered"}}}}}}}}'
   printf '%s\n' "{{\"jsonrpc\":\"2.0\",\"id\":$count,\"result\":{{\"stopReason\":\"end_turn\"}}}}"
   count=$((count + 1))
 done"#
@@ -7976,6 +8112,7 @@ done"#
                 event: trigger,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -8009,6 +8146,7 @@ done"#
         let script = format!(
             r#"IFS= read -r line
 printf '%s\n' "$line" > '{quoted_capture}'
+printf '%s\n' '{{"jsonrpc":"2.0","method":"session/update","params":{{"update":{{"sessionUpdate":"agent_message_chunk","content":{{"text":"answered"}}}}}}}}'
 printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"#
         );
         let acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false, None)
@@ -8965,6 +9103,7 @@ sleep 1
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,

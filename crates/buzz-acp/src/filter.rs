@@ -153,6 +153,16 @@ pub struct MatchedRule {
     pub rule_index: usize,
     /// Prompt tag to use (rule's `prompt_tag` or its `name`).
     pub prompt_tag: String,
+    /// Whether somebody is actually owed an answer for this event.
+    ///
+    /// True when the matching rule required a mention, or when the event
+    /// `p`-tags this agent under a broader rule. False for passive traffic the
+    /// agent merely watches: under `--subscribe all` or a
+    /// `require_mention: false` rule the agent sees messages nobody addressed
+    /// to it, and the base prompt tells it to stay silent when it has nothing
+    /// to add. Retry and dead-turn classification must not treat that correct
+    /// restraint as a failure.
+    pub requires_response: bool,
 }
 
 /// Maximum expression length accepted by `evaluate_filter`.
@@ -387,15 +397,17 @@ pub async fn match_event(
         // 3. Mention check — look for a `p` tag whose first element equals
         //    agent_pubkey_hex. Uses tag.as_slice() for stable, library-independent
         //    access — avoids relying on the Display impl of tag kind.
-        if rule.require_mention {
-            let mentioned = event.tags.iter().any(|tag| {
-                let s = tag.as_slice();
-                s.first().map(|k| k.as_str()) == Some("p")
-                    && s.get(1).map(|v| v.as_str()) == Some(agent_pubkey_hex)
-            });
-            if !mentioned {
-                continue;
-            }
+        //
+        //    Computed unconditionally, not just under `require_mention`: a
+        //    direct mention that arrives under a BROAD rule still obliges an
+        //    answer, and `requires_response` below needs to know.
+        let mentioned = event.tags.iter().any(|tag| {
+            let s = tag.as_slice();
+            s.first().map(|k| k.as_str()) == Some("p")
+                && s.get(1).map(|v| v.as_str()) == Some(agent_pubkey_hex)
+        });
+        if rule.require_mention && !mentioned {
+            continue;
         }
 
         // 4. Optional evalexpr filter expression.
@@ -453,6 +465,7 @@ pub async fn match_event(
         return Some(MatchedRule {
             rule_index: index,
             prompt_tag,
+            requires_response: rule.require_mention || mentioned,
         });
     }
 
@@ -783,5 +796,102 @@ mod tests {
         let rules = vec![rule];
         let result = match_event(&event, channel_id, &rules, "").await;
         assert!(result.is_none(), "disabled rule must return None");
+    }
+
+    // ── Response obligation classification ──────────────────────────────────
+    //
+    // `requires_response` decides whether a silent turn is a failure worth
+    // retrying or correct restraint. Getting it wrong is expensive in both
+    // directions: too broad turns a passive watcher into ten retries and a
+    // user-visible failure notice; too narrow lets a real mention vanish.
+
+    #[tokio::test]
+    async fn test_mention_gated_rule_marks_event_response_required() {
+        let agent = Keys::generate().public_key().to_hex();
+        let event = make_event_with_p_tag(9, "@bot please look", &agent);
+        let rules = vec![make_rule(
+            "mentions",
+            ChannelScope::All("all".into()),
+            vec![],
+            true,
+            None,
+            None,
+        )];
+
+        let matched = match_event(&event, any_channel(), &rules, &agent)
+            .await
+            .expect("mention matches");
+        assert!(
+            matched.requires_response,
+            "a mention-gated rule always owes an answer"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_mention_under_broad_rule_is_response_required() {
+        let agent = Keys::generate().public_key().to_hex();
+        let event = make_event_with_p_tag(9, "@bot please look", &agent);
+        // Broad rule: no mention required to match at all.
+        let rules = vec![make_rule(
+            "subscribe-all",
+            ChannelScope::All("all".into()),
+            vec![],
+            false,
+            None,
+            None,
+        )];
+
+        let matched = match_event(&event, any_channel(), &rules, &agent)
+            .await
+            .expect("broad rule matches");
+        assert!(
+            matched.requires_response,
+            "being addressed directly obliges an answer even under a broad rule"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_passive_event_under_broad_rule_is_not_response_required() {
+        let agent = Keys::generate().public_key().to_hex();
+        let event = make_event(9, "two humans talking to each other");
+        let rules = vec![make_rule(
+            "subscribe-all",
+            ChannelScope::All("all".into()),
+            vec![],
+            false,
+            None,
+            None,
+        )];
+
+        let matched = match_event(&event, any_channel(), &rules, &agent)
+            .await
+            .expect("broad rule matches");
+        assert!(
+            !matched.requires_response,
+            "nobody addressed the agent — silence is the correct outcome"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_p_tag_naming_someone_else_is_not_response_required() {
+        let agent = Keys::generate().public_key().to_hex();
+        let somebody_else = Keys::generate().public_key().to_hex();
+        let event = make_event_with_p_tag(9, "@other can you check?", &somebody_else);
+        let rules = vec![make_rule(
+            "subscribe-all",
+            ChannelScope::All("all".into()),
+            vec![],
+            false,
+            None,
+            None,
+        )];
+
+        let matched = match_event(&event, any_channel(), &rules, &agent)
+            .await
+            .expect("broad rule matches");
+        assert!(
+            !matched.requires_response,
+            "a p-tag for a different pubkey is not a mention of this agent"
+        );
     }
 }

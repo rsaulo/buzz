@@ -49,6 +49,9 @@ pub struct QueuedEvent {
     pub received_at: Instant,
     /// Tag identifying which rule (or mode) matched this event.
     pub prompt_tag: String,
+    /// Whether somebody is owed an answer for this event. See
+    /// [`crate::filter::MatchedRule::requires_response`].
+    pub requires_response: bool,
 }
 
 impl QueuedEvent {
@@ -67,6 +70,9 @@ pub struct BatchEvent {
     pub event: Event,
     pub prompt_tag: String,
     pub received_at: Instant,
+    /// Whether somebody is owed an answer for this event. See
+    /// [`crate::filter::MatchedRule::requires_response`].
+    pub requires_response: bool,
 }
 
 /// Why a batch's prior turn was cancelled — controls how `format_prompt`
@@ -133,6 +139,18 @@ pub fn event_thread_root(event: &Event) -> Option<String> {
     parse_thread_tags(event).root_event_id
 }
 
+/// One event handed to a live turn by a native steer, and its fate so far.
+#[derive(Debug, Clone)]
+struct PendingSteer {
+    event: QueuedEvent,
+    /// Turn generation that accepted the steer write. Settlement is scoped to
+    /// the exact turn so a later turn cannot judge an older turn's steer.
+    turn_id: String,
+    /// `None` while the ack is outstanding; `Some(epoch)` once a `Success`
+    /// proved delivery, carrying the turn's visible-output count at that moment.
+    delivered_at_epoch: Option<u64>,
+}
+
 /// A batch of events to prompt the agent with.
 ///
 /// Every batch is **homogeneous in thread**: all its events share one
@@ -164,6 +182,18 @@ impl FlushBatch {
             Some(root) => SessionKey::thread(self.channel_id, root),
             None => SessionKey::ambient(self.channel_id),
         }
+    }
+
+    /// Whether anyone in this batch is owed an answer.
+    ///
+    /// Counts `cancelled_events` too: a mention that was interrupted and merged
+    /// into this re-prompt is still unanswered, and dropping it from the
+    /// predicate would let a silent retry look like legitimate restraint.
+    pub fn requires_response(&self) -> bool {
+        self.events
+            .iter()
+            .chain(self.cancelled_events.iter())
+            .any(|be| be.requires_response)
     }
 }
 
@@ -244,7 +274,7 @@ pub struct EventQueue {
     /// at line 453). Bulk recovery on in-flight deadline expiry is performed
     /// by `flush_next` / `has_flushable_work` (recover, not log-and-drop —
     /// the events were never delivered to the agent).
-    withheld_native_steer: HashMap<SessionKey, Vec<QueuedEvent>>,
+    withheld_native_steer: HashMap<SessionKey, Vec<PendingSteer>>,
     /// Duration after which an in-flight channel is auto-expired as orphaned.
     /// Must be strictly greater than `max_turn_duration` so a turn running to
     /// the hard cap returns via `mark_complete` before the backstop fires.
@@ -448,6 +478,7 @@ impl EventQueue {
                 event: qe.event,
                 prompt_tag: qe.prompt_tag,
                 received_at: qe.received_at,
+                requires_response: qe.requires_response,
             })
             .collect();
         // Relay replay delivers stored events newest-first (`ORDER BY
@@ -617,12 +648,25 @@ impl EventQueue {
 
         let queue = self.queues.entry(key.clone()).or_default();
         // Push to front in reverse order so original order is preserved.
-        for be in batch.events.into_iter().rev() {
+        //
+        // BOTH buckets, not just `events`. A merged re-prompt carries the work
+        // an interrupted turn was already handling in `cancelled_events`; a
+        // mention that was interrupted and then died in the merged retry used to
+        // vanish here with no error anywhere. Cancelled events are normalised
+        // into ordinary queued events rather than returned to the cancelled side
+        // table: that table is exempt from `retry_after` in the cancelled-only
+        // flush fallback, so restoring there would let a throttled batch
+        // re-flush immediately and spin — and the merge annotation frames
+        // in-progress interrupted work, of which a failed turn has none.
+        // Cancelled work first: it is the older half (the turn that was
+        // interrupted), so FIFO puts it ahead of the events that arrived after.
+        for be in batch.cancelled_events.into_iter().chain(batch.events).rev() {
             queue.push_front(QueuedEvent {
                 channel_id,
                 event: be.event,
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at, // preserve original timestamp (#46)
+                requires_response: be.requires_response,
             });
         }
         // Enforce per-channel cap: trim oldest (back) events if requeue pushed
@@ -690,6 +734,7 @@ impl EventQueue {
                 event: be.event,
                 prompt_tag: be.prompt_tag,
                 received_at: be.received_at,
+                requires_response: be.requires_response,
             });
         }
         // Enforce per-channel cap: trim newest (back) events if over limit.
@@ -896,31 +941,45 @@ impl EventQueue {
         !self.in_flight_sessions.is_empty()
     }
 
-    // ── Goose-native steer withhold (side table) ──────────────────────────
+    // ── Native steer side table ───────────────────────────────────────────
     //
-    // While a goose-native `_goose/unstable/session/steer` write is in flight
-    // for a specific queued event, that event is moved out of `queues` into
-    // `withheld_native_steer` so `flush_next` / `has_flushable_work` / the
-    // contiguous drain at line 285 cannot see it — closing the race window
-    // between `mark_complete` (which clears `in_flight_sessions`) and the
-    // ack arriving on the main loop. On `Success` the event is consumed
-    // (`remove_event`); on `Err` / `PromptCompletedNeutral` it is released
-    // back to the queue front (`release_native_steer`), preserving its
-    // original `received_at` for FIFO fairness.
+    // While a native steer write is in flight for a specific queued event, that
+    // event is moved out of `queues` into `withheld_native_steer` so
+    // `flush_next` / `has_flushable_work` / the contiguous drain cannot see it —
+    // closing the race between `mark_complete` (which clears
+    // `in_flight_sessions`) and the ack arriving on the main loop.
+    //
+    // A `Success` ack does NOT drop the event. Delivery is not an answer: the
+    // agent has the message, but the turn may still end without responding to
+    // it. The ack instead stamps the entry with the turn's output epoch at
+    // acceptance, and the turn's terminal settlement decides:
+    //
+    //   output after the stamp        → answered, retire
+    //   no output after, and owed     → unanswered, release for a normal retry
+    //   no output after, and passive  → silence was correct, retire
+    //   ack never arrived             → delivery unknown, release
+    //
+    // Both states live in ONE table on purpose. Upstream keeps two and has to
+    // remember to settle both at every terminal boundary; a single table with an
+    // optional epoch makes "settled half the state" unrepresentable.
 
-    /// Move a queued event out of `queues[channel_id]` into the side table
-    /// to withhold it from `flush_next` while a goose-native steer is in
-    /// flight.
+    /// Move a queued event out of `queues[key]` into the side table to withhold
+    /// it from `flush_next` while a native steer is in flight.
     ///
-    /// Returns `true` if the event was found and withheld, `false` if the
-    /// event id was not present in `queues[channel_id]` (race-safe no-op:
-    /// the event may have already been drained, removed, or never queued).
+    /// Returns `true` if the event was found and withheld, `false` if the event
+    /// id was not present (race-safe no-op: it may already have been drained,
+    /// removed, or never queued).
     ///
-    /// Must be called synchronously from the mode-gate fork immediately
-    /// after `pool.send_steer` returns `Ok(())` and before any watcher task
-    /// is spawned, so the withhold is established before `mark_complete` /
-    /// any subsequent `flush_next` tick can run.
-    pub fn mark_native_steer_pending(&mut self, key: &SessionKey, event_id: &str) -> bool {
+    /// Must be called synchronously from the mode-gate fork immediately after
+    /// `pool.send_steer` returns, and before any watcher task is spawned, so the
+    /// withhold is established before `mark_complete` / any subsequent
+    /// `flush_next` tick can run.
+    pub fn mark_native_steer_pending(
+        &mut self,
+        key: &SessionKey,
+        event_id: &str,
+        turn_id: &str,
+    ) -> bool {
         let Some(q) = self.queues.get_mut(key) else {
             return false;
         };
@@ -936,106 +995,163 @@ impl EventQueue {
         self.withheld_native_steer
             .entry(key.clone())
             .or_default()
-            .push(qe);
+            .push(PendingSteer {
+                event: qe,
+                turn_id: turn_id.to_owned(),
+                delivered_at_epoch: None,
+            });
         true
     }
 
-    /// Release a single withheld event back to the front of
-    /// `queues[channel_id]`, preserving its original `received_at`.
+    /// Record that a native steer was delivered into `turn_id`, stamping the
+    /// turn's output epoch at the moment of acceptance.
     ///
-    /// Called on `SteerAck::Err(_)` and `SteerAck::PromptCompletedNeutral`
-    /// (delivery unknown after prompt completion; restoring queued event
-    /// for normal dispatch). Idempotent: a no-op if the event was already
-    /// removed or never withheld.
-    ///
-    /// Push-to-front matches the discipline of `requeue_preserve_timestamps`
-    /// at line 453, preserving fairness across channels.
-    pub fn release_native_steer(&mut self, key: &SessionKey, event_id: &str) {
+    /// Returns `false` when the event is no longer pending for that exact turn —
+    /// the turn already settled and released it, or the ack belongs to a turn
+    /// that is gone. That answer is what makes a late ack a total no-op: no
+    /// second copy, no deadline extension for an unrelated turn, and no
+    /// cancel+merge fallback aimed at a turn that already ended.
+    pub fn record_delivered_steer(
+        &mut self,
+        key: &SessionKey,
+        event_id: &str,
+        turn_id: &str,
+        accepted_at_epoch: u64,
+    ) -> bool {
         let Some(entries) = self.withheld_native_steer.get_mut(key) else {
-            return;
+            return false;
+        };
+        let Some(entry) = entries
+            .iter_mut()
+            .find(|p| p.event.event.id.to_hex() == event_id && p.turn_id == turn_id)
+        else {
+            return false;
+        };
+        entry.delivered_at_epoch = Some(accepted_at_epoch);
+        true
+    }
+
+    /// Release a single withheld event back to the front of `queues[key]`,
+    /// preserving its original `received_at`.
+    ///
+    /// Called for the failure-shaped acks, where the steer did not land.
+    /// Returns `false` if the event was already settled or never withheld — the
+    /// caller uses that to suppress a fallback signal aimed at nothing.
+    pub fn release_native_steer(&mut self, key: &SessionKey, event_id: &str) -> bool {
+        let Some(entries) = self.withheld_native_steer.get_mut(key) else {
+            return false;
         };
         let Some(pos) = entries
             .iter()
-            .position(|qe| qe.event.id.to_hex() == event_id)
+            .position(|p| p.event.event.id.to_hex() == event_id)
         else {
-            return;
+            return false;
         };
-        let qe = entries.remove(pos);
+        let entry = entries.remove(pos);
         if entries.is_empty() {
             self.withheld_native_steer.remove(key);
         }
-        // Push to FRONT so original `received_at` keeps the event at the head
-        // of the conversation's queue. The depth cap is enforced below in case
-        // a flood of events arrived during the ack window.
-        let queue = self.queues.entry(key.clone()).or_default();
-        queue.push_front(qe);
-        while queue.len() > MAX_PENDING_PER_CHANNEL {
-            queue.pop_back();
-            tracing::warn!(
+        self.push_front_with_cap(key, entry.event, "release_native_steer");
+        true
+    }
+
+    /// Settle every steer this turn accepted, and return how many events were
+    /// released back to the queue.
+    ///
+    /// Called at the turn's terminal boundary — including panic recovery and
+    /// in-flight expiry — so a delivered event can never outlive its turn.
+    /// Scoped to the exact `turn_id`: a sibling thread's steers, and steers a
+    /// replacement turn accepted, are untouched.
+    pub fn settle_turn_steers(
+        &mut self,
+        key: &SessionKey,
+        turn_id: &str,
+        final_output_epoch: u64,
+    ) -> usize {
+        let Some(entries) = self.withheld_native_steer.get_mut(key) else {
+            return 0;
+        };
+        // Partition in place, preserving arrival order among the released.
+        let mut released = Vec::new();
+        entries.retain(|p| {
+            if p.turn_id != turn_id {
+                return true;
+            }
+            let keep_out = match p.delivered_at_epoch {
+                // Delivered, and the turn produced output AFTER it landed: the
+                // agent answered. Redelivering would show the same message twice.
+                Some(epoch) if final_output_epoch > epoch => false,
+                // Delivered, nothing after: only worth retrying if someone is
+                // owed an answer. Passive traffic keeps the base prompt's
+                // silence-as-success contract.
+                Some(_) => p.event.requires_response,
+                // The ack never arrived, so delivery itself is unknown — release
+                // regardless of obligation rather than guess.
+                None => true,
+            };
+            if keep_out {
+                released.push(p.clone());
+            }
+            false
+        });
+        let count = released.len();
+        if entries.is_empty() {
+            self.withheld_native_steer.remove(key);
+        }
+        // Reverse so the per-entry push_front composes back to arrival order.
+        for entry in released.into_iter().rev() {
+            self.push_front_with_cap(key, entry.event, "settle_turn_steers");
+        }
+        if count > 0 {
+            tracing::info!(
                 session = %key,
-                limit = MAX_PENDING_PER_CHANNEL,
-                "release_native_steer overflow — dropped newest event to enforce cap"
+                turn_id,
+                released = count,
+                final_output_epoch,
+                "turn settled unanswered steer event(s) — requeued for normal dispatch"
             );
         }
+        count
     }
 
-    /// Drop a specific event by id from both the side table and the main
-    /// queue.
+    /// Release every entry in the side table for this conversation, whatever
+    /// its state.
     ///
-    /// Called on `SteerAck::Success` — the agent received the steer, so the
-    /// event has been "delivered" via the non-cancelling path and must not
-    /// be redelivered via normal dispatch. Idempotent across both stores.
-    pub fn remove_event(&mut self, key: &SessionKey, event_id: &str) {
-        if let Some(entries) = self.withheld_native_steer.get_mut(key) {
-            entries.retain(|qe| qe.event.id.to_hex() != event_id);
-            if entries.is_empty() {
-                self.withheld_native_steer.remove(key);
-            }
-        }
-        if let Some(q) = self.queues.get_mut(key) {
-            q.retain(|qe| qe.event.id.to_hex() != event_id);
-            if q.is_empty() {
-                self.queues.remove(key);
-            }
-        }
-    }
-
-    /// Bulk-release every withheld event for `channel_id` back to the queue
-    /// front, preserving relative FIFO order.
-    ///
-    /// Called from the `in_flight_deadline` expiry blocks in
-    /// `flush_next` and `has_flushable_work` — if a steer ack never arrives
-    /// (read loop hung, watcher never posted), the withheld events would
-    /// otherwise be permanently orphaned. Recover, do not log-and-drop: the
-    /// events were never delivered to the agent, so normal dispatch must
-    /// have a chance to deliver them.
-    ///
-    /// Iterates the stored entries in reverse so per-entry `push_front`
-    /// composes to original-FIFO order at the queue front (same discipline
-    /// as `requeue_preserve_timestamps` at line 453).
+    /// Called from the `in_flight_deadline` expiry blocks: if a turn never
+    /// reports a result (read loop hung, watcher never posted) nothing will ever
+    /// settle its ledger, and the events would be orphaned. Recover, do not
+    /// log-and-drop — at worst the agent sees a message twice, which is the
+    /// duplicate-over-silent-loss trade this whole path is built on.
     fn recover_withheld_for_expired_session(&mut self, key: &SessionKey) {
         let Some(entries) = self.withheld_native_steer.remove(key) else {
             return;
         };
         let n = entries.len();
-        let queue = self.queues.entry(key.clone()).or_default();
-        for qe in entries.into_iter().rev() {
-            queue.push_front(qe);
+        for entry in entries.into_iter().rev() {
+            self.push_front_with_cap(key, entry.event, "withheld-steer recovery");
         }
+        tracing::warn!(
+            session = %key,
+            recovered = n,
+            "in-flight expiry recovered steer event(s) — \
+             the turn never settled them; normal dispatch will deliver"
+        );
+    }
+
+    /// Push a recovered event back to the head of its conversation, preserving
+    /// `received_at`, and enforce the per-conversation depth cap.
+    fn push_front_with_cap(&mut self, key: &SessionKey, event: QueuedEvent, whence: &str) {
+        let queue = self.queues.entry(key.clone()).or_default();
+        queue.push_front(event);
         while queue.len() > MAX_PENDING_PER_CHANNEL {
             queue.pop_back();
             tracing::warn!(
                 session = %key,
                 limit = MAX_PENDING_PER_CHANNEL,
-                "withheld-steer recovery overflow — dropped newest event to enforce cap"
+                whence,
+                "steer release overflow — dropped newest event to enforce cap"
             );
         }
-        tracing::warn!(
-            session = %key,
-            recovered = n,
-            "in-flight expiry recovered withheld steer event(s) — \
-             steer ack never arrived; normal dispatch will deliver"
-        );
     }
 
     /// Compact expired metadata entries to prevent unbounded map growth.
@@ -2057,6 +2173,7 @@ mod tests {
             channel_id,
             event: make_event(content),
             received_at: Instant::now(),
+            requires_response: true,
             prompt_tag: "test".into(),
         }
     }
@@ -2067,6 +2184,7 @@ mod tests {
             channel_id,
             event: make_event(content),
             received_at: Instant::now() - age,
+            requires_response: true,
             prompt_tag: "test".into(),
         }
     }
@@ -2087,6 +2205,7 @@ mod tests {
             channel_id,
             event,
             received_at: Instant::now(),
+            requires_response: true,
             prompt_tag: "test".into(),
         }
     }
@@ -2309,6 +2428,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -2340,11 +2460,13 @@ mod tests {
                 event: make_event("the new message"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![BatchEvent {
                 event: make_event("the original task"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancel_reason: reason,
         }
@@ -2473,17 +2595,20 @@ mod tests {
                     event: make_event("new one"),
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
+                    requires_response: true,
                 },
                 BatchEvent {
                     event: make_event("new two"),
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
+                    requires_response: true,
                 },
             ],
             cancelled_events: vec![BatchEvent {
                 event: make_event("original"),
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancel_reason: Some(CancelReason::Steer),
         };
@@ -2530,11 +2655,13 @@ mod tests {
                 event: steering,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![BatchEvent {
                 event: original,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancel_reason: Some(CancelReason::Steer),
         };
@@ -2731,16 +2858,19 @@ mod tests {
                     event: e1,
                     prompt_tag: "tag-a".into(),
                     received_at: Instant::now(),
+                    requires_response: true,
                 },
                 BatchEvent {
                     event: e2,
                     prompt_tag: "tag-b".into(),
                     received_at: Instant::now(),
+                    requires_response: true,
                 },
                 BatchEvent {
                     event: e3,
                     prompt_tag: "tag-c".into(),
                     received_at: Instant::now(),
+                    requires_response: true,
                 },
             ],
             cancelled_events: vec![],
@@ -2771,6 +2901,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -2795,6 +2926,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -2828,6 +2960,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -2859,6 +2992,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -2887,6 +3021,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -2912,6 +3047,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -2984,6 +3120,7 @@ mod tests {
                 event: make_event("hello"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3038,6 +3175,7 @@ mod tests {
                     event: make_event("hello"),
                     prompt_tag: "test".into(),
                     received_at: Instant::now(),
+                    requires_response: true,
                 }],
                 cancelled_events: vec![],
                 cancel_reason: None,
@@ -3072,6 +3210,7 @@ mod tests {
                 event: make_event("hello"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3129,6 +3268,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3168,6 +3308,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3397,6 +3538,7 @@ mod tests {
             channel_id: ch,
             event: make_event("old-msg"),
             received_at: old_time,
+            requires_response: true,
             prompt_tag: "test".into(),
         });
 
@@ -3681,6 +3823,7 @@ mod tests {
                 ]],
             ),
             received_at: Instant::now(),
+            requires_response: true,
             prompt_tag: "test".into(),
         }
     }
@@ -3860,6 +4003,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3893,6 +4037,7 @@ mod tests {
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3933,6 +4078,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -3962,6 +4108,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4009,6 +4156,7 @@ mod tests {
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4061,6 +4209,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4270,6 +4419,7 @@ mod tests {
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4338,6 +4488,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4372,6 +4523,7 @@ mod tests {
                 event: make_event("follow up"),
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4422,6 +4574,7 @@ mod tests {
                 event,
                 prompt_tag: "dm".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4464,6 +4617,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4489,6 +4643,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4513,6 +4668,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4887,6 +5043,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4930,6 +5087,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4966,6 +5124,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -4996,6 +5155,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5040,6 +5200,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5077,6 +5238,7 @@ mod tests {
                 event,
                 prompt_tag: "@mention".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5114,11 +5276,13 @@ mod tests {
                     event: plain,
                     prompt_tag: "test".into(),
                     received_at: Instant::now(),
+                    requires_response: true,
                 },
                 BatchEvent {
                     event: threaded,
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
+                    requires_response: true,
                 },
             ],
             cancelled_events: vec![],
@@ -5152,11 +5316,13 @@ mod tests {
                     event: threaded,
                     prompt_tag: "@mention".into(),
                     received_at: Instant::now(),
+                    requires_response: true,
                 },
                 BatchEvent {
                     event: plain,
                     prompt_tag: "test".into(),
                     received_at: Instant::now(),
+                    requires_response: true,
                 },
             ],
             cancelled_events: vec![],
@@ -5185,6 +5351,7 @@ mod tests {
                 event: make_event(content),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5262,6 +5429,7 @@ mod tests {
             event: make_event("another message"),
             prompt_tag: "test".into(),
             received_at: Instant::now(),
+            requires_response: true,
         });
         assert_eq!(slash_command_for_batch(&multi, &[]), None);
 
@@ -5271,6 +5439,7 @@ mod tests {
             event: make_event("interrupted"),
             prompt_tag: "test".into(),
             received_at: Instant::now(),
+            requires_response: true,
         });
         assert_eq!(slash_command_for_batch(&cancelled, &[]), None);
 
@@ -5304,7 +5473,7 @@ mod tests {
         let event_id = qe.event.id.to_hex();
         q.push(qe);
 
-        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &event_id));
+        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &event_id, "test-turn"));
 
         assert!(
             q.flush_next().is_none(),
@@ -5346,7 +5515,7 @@ mod tests {
         q.push(e3);
 
         // Steer in flight for e3 — withhold it from normal dispatch.
-        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &e3_id));
+        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &e3_id, "test-turn"));
 
         // Earlier events flush as a normal batch; e3 is invisible.
         let batch = q
@@ -5392,7 +5561,7 @@ mod tests {
         q.in_flight_deadlines
             .insert(SessionKey::ambient(ch), Instant::now());
         q.in_flight_batch_sizes.insert(SessionKey::ambient(ch), 1);
-        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &event_id));
+        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &event_id, "test-turn"));
 
         // Force the in-flight deadline to be in the past, simulating the
         // steer ack never arriving and the read loop hanging long enough
@@ -5449,9 +5618,9 @@ mod tests {
         // tests. What matters here is that the bulk-recovery path
         // (reverse iter + push_front) composes to original FIFO at the
         // queue front.
-        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &e1_id));
-        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &e2_id));
-        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &e3_id));
+        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &e1_id, "test-turn"));
+        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &e2_id, "test-turn"));
+        assert!(q.mark_native_steer_pending(&SessionKey::ambient(ch), &e3_id, "test-turn"));
         assert_eq!(pending_count(&q), 0);
         assert_eq!(
             q.withheld_native_steer
@@ -5482,6 +5651,248 @@ mod tests {
         assert!(q.withheld_native_steer.is_empty());
     }
 
+    // ── Delivered-steer settlement ──────────────────────────────────────────
+    //
+    // A `Success` ack proves the agent HAS the message, not that it answered.
+    // These pin the four verdicts, plus the orderings where the ack and the
+    // turn's own result race each other.
+
+    const TURN: &str = "turn-1";
+
+    /// Withhold `qe` for a steer on `TURN`, and optionally deliver it at
+    /// `accepted_at_epoch`.
+    fn steer(
+        q: &mut EventQueue,
+        key: &SessionKey,
+        qe: QueuedEvent,
+        delivered_at: Option<u64>,
+    ) -> String {
+        let event_id = qe.event.id.to_hex();
+        q.push(qe);
+        assert!(q.mark_native_steer_pending(key, &event_id, TURN));
+        if let Some(epoch) = delivered_at {
+            assert!(q.record_delivered_steer(key, &event_id, TURN, epoch));
+        }
+        assert_eq!(pending_count(q), 0, "a steered event is not dispatchable");
+        event_id
+    }
+
+    /// The incident, exactly: the steer was accepted mid-turn and the turn then
+    /// ended having produced nothing. Before the ledger, the ack dropped the
+    /// event outright and the mention was gone for good.
+    #[test]
+    fn steered_mention_survives_a_turn_that_produced_nothing() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let key = SessionKey::ambient(ch);
+        let event_id = steer(&mut q, &key, make_queued(ch, "mid-turn mention"), Some(0));
+
+        assert_eq!(q.settle_turn_steers(&key, TURN, 0), 1);
+
+        let batch = q.flush_next().expect("released event is dispatchable");
+        assert_eq!(batch.events.len(), 1);
+        assert_eq!(batch.events[0].event.id.to_hex(), event_id);
+    }
+
+    /// Output that happened BEFORE the steer landed does not answer it. This is
+    /// the case a per-turn boolean cannot express, and the reason the ledger
+    /// stores an epoch instead of a flag.
+    #[test]
+    fn steered_mention_is_requeued_when_output_only_preceded_it() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let key = SessionKey::ambient(ch);
+        steer(&mut q, &key, make_queued(ch, "mid-turn mention"), Some(3));
+
+        assert_eq!(
+            q.settle_turn_steers(&key, TURN, 3),
+            1,
+            "the agent spoke before the mention arrived, then went silent"
+        );
+    }
+
+    /// Output after delivery retires it — redelivering would prompt the agent
+    /// twice with the same message.
+    #[test]
+    fn answered_steered_mention_is_not_redelivered() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let key = SessionKey::ambient(ch);
+        steer(&mut q, &key, make_queued(ch, "mid-turn mention"), Some(3));
+
+        assert_eq!(q.settle_turn_steers(&key, TURN, 4), 0);
+        assert_eq!(pending_count(&q), 0);
+        assert!(q.flush_next().is_none());
+    }
+
+    /// Passive traffic steered mid-turn keeps the base prompt's
+    /// silence-as-success contract: nobody asked the agent anything.
+    #[test]
+    fn passive_steered_event_is_not_requeued_when_unanswered() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let key = SessionKey::ambient(ch);
+        let mut qe = make_queued(ch, "two humans talking");
+        qe.requires_response = false;
+        steer(&mut q, &key, qe, Some(0));
+
+        assert_eq!(q.settle_turn_steers(&key, TURN, 0), 0);
+        assert_eq!(pending_count(&q), 0);
+    }
+
+    /// The ack lost the race with its own turn's result. Delivery is unknown,
+    /// so the event is released regardless of obligation rather than guessed at.
+    #[test]
+    fn steer_whose_ack_never_arrived_is_released_at_settlement() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let key = SessionKey::ambient(ch);
+        let event_id = steer(&mut q, &key, make_queued(ch, "mid-turn mention"), None);
+
+        assert_eq!(q.settle_turn_steers(&key, TURN, 7), 1);
+        let batch = q.flush_next().expect("released");
+        assert_eq!(batch.events[0].event.id.to_hex(), event_id);
+    }
+
+    /// The exact ordering regression: the turn settles first, then the late
+    /// `Success` runs. It must find nothing and queue no second copy.
+    #[test]
+    fn late_success_ack_after_settlement_is_a_no_op() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let key = SessionKey::ambient(ch);
+        let event_id = steer(&mut q, &key, make_queued(ch, "mid-turn mention"), None);
+        assert_eq!(q.settle_turn_steers(&key, TURN, 0), 1);
+
+        assert!(
+            !q.record_delivered_steer(&key, &event_id, TURN, 0),
+            "a late ack must report that the event is already settled"
+        );
+        assert!(
+            !q.release_native_steer(&key, &event_id),
+            "and a late failure-shaped ack must report the same"
+        );
+        assert_eq!(pending_count(&q), 1, "released exactly once");
+        assert!(q.withheld_native_steer.is_empty());
+    }
+
+    /// Settlement is scoped to the exact turn. A replacement turn must not
+    /// judge — or release — the steer an earlier turn accepted.
+    #[test]
+    fn settlement_ignores_steers_belonging_to_another_turn() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let key = SessionKey::ambient(ch);
+        steer(&mut q, &key, make_queued(ch, "mid-turn mention"), Some(0));
+
+        assert_eq!(
+            q.settle_turn_steers(&key, "some-other-turn", 9),
+            0,
+            "a different turn's settlement must not touch this entry"
+        );
+        assert_eq!(pending_count(&q), 0, "still parked, not released");
+        assert_eq!(
+            q.settle_turn_steers(&key, TURN, 0),
+            1,
+            "its own turn settles it"
+        );
+    }
+
+    /// Two threads of one channel are separate conversations: settling one must
+    /// leave the other's steer untouched.
+    #[test]
+    fn settlement_does_not_cross_sibling_threads() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let root_a = "a".repeat(64);
+        let root_b = "b".repeat(64);
+        let key_a = SessionKey::thread(ch, root_a.clone());
+        let key_b = SessionKey::thread(ch, root_b.clone());
+        steer(
+            &mut q,
+            &key_a,
+            make_queued_in_thread(ch, "A", &root_a),
+            Some(0),
+        );
+        steer(
+            &mut q,
+            &key_b,
+            make_queued_in_thread(ch, "B", &root_b),
+            Some(0),
+        );
+
+        assert_eq!(q.settle_turn_steers(&key_a, TURN, 0), 1);
+        assert_eq!(
+            q.queues.get(&key_b).map(|v| v.len()),
+            None,
+            "thread B's steer is still parked, untouched by A's settlement"
+        );
+        assert_eq!(q.settle_turn_steers(&key_b, TURN, 0), 1);
+    }
+
+    /// Expiry is the backstop for a turn that never reports a result: without
+    /// it a delivered event would be orphaned in the ledger forever.
+    #[test]
+    fn expiry_releases_delivered_steer_as_unanswered() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let key = SessionKey::ambient(ch);
+        let event_id = steer(&mut q, &key, make_queued(ch, "delivered"), Some(0));
+
+        q.in_flight_sessions.insert(key.clone());
+        q.in_flight_batch_sizes.insert(key.clone(), 1);
+        q.in_flight_deadlines
+            .insert(key.clone(), Instant::now() - Duration::from_secs(1));
+
+        assert!(q.has_flushable_work(), "expiry must recover the event");
+        let batch = q.flush_next().expect("recovered");
+        assert_eq!(batch.events[0].event.id.to_hex(), event_id);
+    }
+
+    /// A merged re-prompt carries interrupted work in `cancelled_events`. Both
+    /// buckets must survive a retry: a mention that was interrupted and then
+    /// died in the merged retry used to vanish with no error anywhere.
+    #[test]
+    fn requeue_preserves_both_buckets_of_a_merged_batch() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let key = SessionKey::ambient(ch);
+
+        // First turn is interrupted, so its events become cancelled carryover.
+        q.push(make_queued(ch, "interrupted mention"));
+        let first = q.flush_next().expect("first batch");
+        q.requeue_as_cancelled(first, CancelReason::Steer);
+        q.mark_complete(&key);
+
+        // A new event arrives and merges with the carryover.
+        q.push(make_queued(ch, "new mention"));
+        let merged = q.flush_next().expect("merged batch");
+        assert_eq!(merged.events.len(), 1);
+        assert_eq!(merged.cancelled_events.len(), 1);
+
+        // The merged turn now fails and is retried.
+        assert!(q.requeue(merged).is_none(), "requeued, not dead-lettered");
+        q.mark_complete(&key);
+
+        assert_eq!(
+            pending_count(&q),
+            2,
+            "both the interrupted mention and the new one survive the retry"
+        );
+        let contents: Vec<String> = q
+            .queues
+            .get(&key)
+            .expect("queue")
+            .iter()
+            .map(|qe| qe.event.content.clone())
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["interrupted mention".to_string(), "new mention".to_string()],
+            "cancelled work is older, so it stays ahead in FIFO"
+        );
+    }
+
     // ── format_prompt: agent_canvas ─────────────────────────────────────────
 
     #[test]
@@ -5495,6 +5906,7 @@ mod tests {
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5525,6 +5937,7 @@ mod tests {
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5554,6 +5967,7 @@ mod tests {
                 event: make_event("hi"),
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -5982,6 +6396,7 @@ mod tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,

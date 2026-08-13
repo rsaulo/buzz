@@ -2786,8 +2786,8 @@ async fn tokio_main() -> Result<()> {
                             }
 
                             let matched = filter::match_event(&buzz_event.event, buzz_event.channel_id, &rules, &pubkey_hex).await;
-                            let prompt_tag = match matched {
-                                Some(m) => m.prompt_tag,
+                            let (prompt_tag, requires_response) = match matched {
+                                Some(m) => (m.prompt_tag, m.requires_response),
                                 None => {
                                     tracing::debug!(channel_id = %buzz_event.channel_id, kind = buzz_event.event.kind.as_u16(), "event matched no rule — dropping");
                                     continue;
@@ -2817,6 +2817,7 @@ async fn tokio_main() -> Result<()> {
                                 event: buzz_event.event,
                                 received_at: std::time::Instant::now(),
                                 prompt_tag,
+                                requires_response,
                             });
                             // 👀 — immediate "seen" reaction, only if the event
                             // was actually queued (not dropped by DedupMode::Drop).
@@ -2864,6 +2865,7 @@ async fn tokio_main() -> Result<()> {
                                             &steer_session_key,
                                             event_for_steer,
                                             prompt_tag_for_steer,
+                                            requires_response,
                                             &steer_ack_tx,
                                         );
                                         apply_native_steer_result(
@@ -3230,7 +3232,12 @@ async fn tokio_main() -> Result<()> {
                     signal_fallback,
                     "non-cancelling steer ack received"
                 );
-                if let Ok(pool::SteerAck::Success { session_id }) = &ack {
+                let mut signal_fallback = signal_fallback;
+                if let Ok(pool::SteerAck::Success {
+                    session_id,
+                    output_epoch,
+                }) = &ack
+                {
                     settle_successful_steer_ack(
                         &mut pool,
                         &mut queue,
@@ -3238,11 +3245,22 @@ async fn tokio_main() -> Result<()> {
                         &event_id,
                         session_id,
                         &turn_id,
+                        *output_epoch,
                         config.max_turn_duration_secs,
                     );
                 }
-                if release_withheld {
-                    queue.release_native_steer(&session_key, &event_id);
+                if release_withheld && !queue.release_native_steer(&session_key, &event_id) {
+                    // Nothing was pending: this ack lost the race with its own
+                    // turn's result, which already settled the event. Suppress
+                    // the fallback — it would cancel a turn that never saw this
+                    // message, and the released copy is already queued.
+                    tracing::warn!(
+                        session = %session_key,
+                        event_id = %event_id,
+                        turn_id = %turn_id,
+                        "steer ack arrived after its turn settled — no-op"
+                    );
+                    signal_fallback = false;
                 }
                 if signal_fallback {
                     // Universal cancel+merge fallback. Note: the
@@ -3621,12 +3639,14 @@ enum NativeSteerResult {
     NoActiveTurn,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn try_native_steer(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
     session_key: &queue::SessionKey,
     event: nostr::Event,
     prompt_tag: String,
+    requires_response: bool,
     steer_ack_tx: &mpsc::UnboundedSender<SteerAckEvent>,
 ) -> NativeSteerResult {
     let channel_id = session_key.channel_id;
@@ -3649,6 +3669,7 @@ fn try_native_steer(
         event,
         prompt_tag: prompt_tag.clone(),
         received_at: std::time::Instant::now(),
+        requires_response,
     };
     let event_block = queue::format_event_block(channel_id, None, &be, None);
     let body = format!("{header}\n\n[Buzz event: {prompt_tag}]\n{event_block}\n\n{closing}");
@@ -3666,7 +3687,7 @@ fn try_native_steer(
             // clears `in_flight_channels` and a stray `flush_next` could
             // re-deliver the event via normal dispatch. See
             // `EventQueue::mark_native_steer_pending` docs at queue.rs:606.
-            let withheld = queue.mark_native_steer_pending(session_key, &event_id_hex);
+            let withheld = queue.mark_native_steer_pending(session_key, &event_id_hex, &turn_id);
             if !withheld {
                 // Race: the event was already drained out of the queue
                 // before we got here (e.g. a concurrent flush picked it
@@ -3731,6 +3752,7 @@ fn apply_native_steer_result(
 /// Commit a successful steer only to the generation that accepted it.
 /// A stale success returns the withheld event to normal dispatch and leaves the
 /// replacement turn's deadline untouched.
+#[allow(clippy::too_many_arguments)]
 fn settle_successful_steer_ack(
     pool: &mut AgentPool,
     queue: &mut EventQueue,
@@ -3738,8 +3760,24 @@ fn settle_successful_steer_ack(
     event_id: &str,
     session_id: &str,
     turn_id: &str,
+    output_epoch: u64,
     max_turn_duration_secs: u64,
 ) -> bool {
+    // Prove the event is STILL pending for this exact turn before doing
+    // anything else. A `Success` can be processed after the turn it belongs to
+    // has already terminated — the ack and the prompt result travel on
+    // different channels and the main loop polls results first — and by then
+    // terminal settlement has released the event. Acting on that late ack would
+    // remove the sole requeued copy, so it must change nothing at all.
+    if !queue.record_delivered_steer(session_key, event_id, turn_id, output_epoch) {
+        tracing::warn!(
+            session = %session_key,
+            event_id,
+            turn_id,
+            "ignoring successful steer ack for an already-settled event"
+        );
+        return false;
+    }
     if pool.record_successful_steer(
         session_key,
         event_id.to_string(),
@@ -3747,9 +3785,11 @@ fn settle_successful_steer_ack(
         turn_id,
     ) {
         queue.extend_in_flight_deadline(session_key, max_turn_duration_secs);
-        queue.remove_event(session_key, event_id);
         true
     } else {
+        // The turn matched but its ACP session was replaced underneath it, so
+        // the delivery cannot be attributed. Release rather than leave the entry
+        // parked against a generation that will never settle it.
         queue.release_native_steer(session_key, event_id);
         tracing::warn!(
             session = %session_key,
@@ -4088,6 +4128,11 @@ fn handle_prompt_result(
 
     match &result.source {
         PromptSource::Channel(key) => {
+            // Settle this turn's steers before releasing the conversation. Every
+            // event the turn was handed gets a verdict here — answered, owed and
+            // unanswered, or delivery-unknown — so none can outlive the turn
+            // that accepted it.
+            queue.settle_turn_steers(key, &result.turn_id, result.final_output_epoch);
             queue.mark_complete_turn(key, &result.turn_id);
         }
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
@@ -5451,6 +5496,7 @@ mod owner_control_command_tests {
             channel_id: key.channel_id,
             event: event.clone(),
             received_at: std::time::Instant::now(),
+            requires_response: true,
             prompt_tag: "test".into(),
         }));
         event
@@ -5536,6 +5582,7 @@ mod owner_control_command_tests {
             &key_a,
             event,
             "test".into(),
+            true,
             &steer_ack_tx,
         );
 
@@ -5570,6 +5617,7 @@ mod owner_control_command_tests {
             &key,
             event,
             "test".into(),
+            true,
             &steer_ack_tx,
         );
 
@@ -5611,6 +5659,7 @@ mod owner_control_command_tests {
             &key,
             event,
             "test".into(),
+            true,
             &steer_ack_tx,
         );
 
@@ -7518,6 +7567,7 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
             batch: None,
+            final_output_epoch: 0,
         };
 
         handle_prompt_result(
@@ -7592,6 +7642,7 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
             batch: None,
+            final_output_epoch: 0,
         };
 
         handle_prompt_result(
@@ -7705,9 +7756,10 @@ mod error_outcome_emission_tests {
             channel_id,
             event,
             received_at: std::time::Instant::now(),
+            requires_response: true,
             prompt_tag: "test".into(),
         }));
-        assert!(queue.mark_native_steer_pending(&key, &event_id));
+        assert!(queue.mark_native_steer_pending(&key, &event_id, "old-turn"));
 
         assert!(!settle_successful_steer_ack(
             &mut pool,
@@ -7716,6 +7768,7 @@ mod error_outcome_emission_tests {
             &event_id,
             "old-session",
             "old-turn",
+            0,
             config::DEFAULT_MAX_TURN_DURATION_SECS,
         ));
         assert_eq!(queue.queued_event_count(&key), 1);
@@ -7829,6 +7882,7 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
             batch: None,
+            final_output_epoch: 0,
         };
 
         handle_prompt_result(
@@ -7893,6 +7947,7 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".to_string(),
             outcome,
             batch: None,
+            final_output_epoch: 0,
         };
 
         handle_prompt_result(
@@ -8063,6 +8118,7 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: None,
+                final_output_epoch: 0,
             };
             handle_prompt_result(
                 &mut pool,
@@ -8114,6 +8170,7 @@ mod error_outcome_emission_tests {
                     event,
                     prompt_tag: "test".into(),
                     received_at: std::time::Instant::now(),
+                    requires_response: true,
                 }],
                 cancelled_events: vec![],
                 cancel_reason: None,
@@ -8156,6 +8213,7 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: Some(batch),
+                final_output_epoch: 0,
             };
             handle_prompt_result(
                 &mut pool,
@@ -8223,6 +8281,7 @@ mod error_outcome_emission_tests {
                     event,
                     prompt_tag: "test".into(),
                     received_at: std::time::Instant::now(),
+                    requires_response: true,
                 }],
                 cancelled_events: vec![],
                 cancel_reason: None,
@@ -8264,6 +8323,7 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: Some(batch),
+                final_output_epoch: 0,
             };
             handle_prompt_result(
                 &mut pool,
@@ -8346,6 +8406,7 @@ mod error_outcome_emission_tests {
                     .unwrap(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -8358,6 +8419,7 @@ mod error_outcome_emission_tests {
                 recently_active: true,
             }),
             batch: Some(batch),
+            final_output_epoch: 0,
         };
         handle_prompt_result(
             &mut pool,
@@ -8445,6 +8507,7 @@ mod error_outcome_emission_tests {
                     .unwrap(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -8457,6 +8520,7 @@ mod error_outcome_emission_tests {
                 recently_active: true,
             }),
             batch: Some(batch),
+            final_output_epoch: 0,
         };
         handle_prompt_result(
             &mut pool,
@@ -8524,6 +8588,7 @@ mod error_outcome_emission_tests {
                 event: original_event.clone(),
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: Some(CancelReason::Steer),
@@ -8554,6 +8619,7 @@ mod error_outcome_emission_tests {
             channel_id,
             event: new_event.clone(),
             received_at: std::time::Instant::now(),
+            requires_response: true,
             prompt_tag: "test".into(),
         });
         let config = test_config();
@@ -8574,6 +8640,7 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::CancelDrainTimeout(grace),
             batch: Some(batch),
+            final_output_epoch: 0,
         };
 
         handle_prompt_result(
@@ -8708,6 +8775,7 @@ mod error_outcome_emission_tests {
             // `classify_control_cancel_failure` — `handle_prompt_result`
             // never sees one to requeue.
             batch: None,
+            final_output_epoch: 0,
         };
 
         handle_prompt_result(
@@ -8850,6 +8918,7 @@ mod error_outcome_emission_tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -8894,6 +8963,7 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(auth_error),
             batch: Some(batch),
+            final_output_epoch: 0,
         };
         handle_prompt_result(
             &mut pool,
@@ -8938,6 +9008,7 @@ mod error_outcome_emission_tests {
                 event,
                 prompt_tag: "test".into(),
                 received_at: std::time::Instant::now(),
+                requires_response: true,
             }],
             cancelled_events: vec![],
             cancel_reason: None,
@@ -8982,6 +9053,7 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(usage_error),
             batch: Some(batch),
+            final_output_epoch: 0,
         };
         handle_prompt_result(
             &mut pool,
