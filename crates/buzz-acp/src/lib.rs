@@ -4184,7 +4184,28 @@ fn handle_prompt_result(
             // event the turn was handed gets a verdict here — answered, owed and
             // unanswered, or delivery-unknown — so none can outlive the turn
             // that accepted it.
-            queue.settle_turn_steers(key, &result.turn_id);
+            let settlement = queue.settle_turn_steers(key, &result.turn_id);
+            // A retired steer is the one event whose 👀 no other path clears:
+            // it joined the turn after the reaction guard captured its ids, and
+            // it will never be dispatched. Released ones are left alone — their
+            // next turn clears them normally.
+            if !settlement.retired.is_empty() {
+                tracing::debug!(
+                    session = %key,
+                    turn_id = %result.turn_id,
+                    retired = settlement.retired.len(),
+                    released = settlement.released,
+                    "clearing 👀 left by retired steers"
+                );
+                if let Some(rest) = rest_client {
+                    let rest = rest.clone();
+                    tokio::spawn(async move {
+                        for eid in &settlement.retired {
+                            pool::reaction_remove(&rest, eid, "👀").await;
+                        }
+                    });
+                }
+            }
             queue.mark_complete_turn(key, &result.turn_id);
         }
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
@@ -7833,7 +7854,7 @@ mod error_outcome_emission_tests {
         ));
 
         assert_eq!(
-            queue.settle_turn_steers(&key, "turn-1"),
+            queue.settle_turn_steers(&key, "turn-1").released,
             1,
             "a turn that never published anything has answered nobody"
         );
@@ -7901,7 +7922,7 @@ mod error_outcome_emission_tests {
         );
 
         assert_eq!(
-            queue.settle_turn_steers(&key, "turn-1"),
+            queue.settle_turn_steers(&key, "turn-1").released,
             0,
             "it was answered — redelivering would ask the same thing twice"
         );

@@ -153,6 +153,18 @@ struct PendingSteer {
     delivered_at_epoch: Option<u64>,
 }
 
+/// What a turn's terminal boundary did with the steers it had accepted.
+#[derive(Debug, Default, Clone)]
+pub struct SteerSettlement {
+    /// Events put back on the queue, to be dispatched again.
+    pub released: usize,
+    /// Ids of events retired for good — answered, or passive and unanswered.
+    /// They leave here with a 👀 nobody else will remove: the reaction guard
+    /// only knows the ids its prompt was launched with, and a steered event
+    /// joined the turn after that.
+    pub retired: Vec<String>,
+}
+
 /// A batch of events to prompt the agent with.
 ///
 /// Every batch is **homogeneous in thread**: all its events share one
@@ -1090,23 +1102,23 @@ impl EventQueue {
         true
     }
 
-    /// Settle every steer this turn accepted, and return how many events were
-    /// released back to the queue.
+    /// Settle every steer this turn accepted.
     ///
     /// Called at the turn's terminal boundary — including panic recovery and
     /// in-flight expiry — so a delivered event can never outlive its turn.
     /// Scoped to the exact `turn_id`: a sibling thread's steers, and steers a
     /// replacement turn accepted, are untouched.
-    pub fn settle_turn_steers(&mut self, key: &SessionKey, turn_id: &str) -> usize {
+    pub fn settle_turn_steers(&mut self, key: &SessionKey, turn_id: &str) -> SteerSettlement {
         // Read before borrowing the ledger, and read *published* messages, not
         // agent activity: a turn that kept calling tools after a steered
         // mention and never spoke has not answered anybody.
         let final_published_epoch = self.published_epoch(key);
         let Some(entries) = self.withheld_native_steer.get_mut(key) else {
-            return 0;
+            return SteerSettlement::default();
         };
         // Partition in place, preserving arrival order among the released.
         let mut released = Vec::new();
+        let mut retired = Vec::new();
         let mut answered = 0usize;
         let mut passive = 0usize;
         entries.retain(|p| {
@@ -1135,6 +1147,11 @@ impl EventQueue {
             };
             if keep_out {
                 released.push(p.clone());
+            } else {
+                // Retired here and never dispatched again: nothing else will
+                // ever clear its 👀, because the reaction guard only knows the
+                // ids the prompt was launched with.
+                retired.push(p.event.event.id.to_hex());
             }
             false
         });
@@ -1160,7 +1177,10 @@ impl EventQueue {
                 "turn settled its steer ledger"
             );
         }
-        count
+        SteerSettlement {
+            released: count,
+            retired,
+        }
     }
 
     /// Release every entry in the side table for this conversation, whatever
@@ -5746,7 +5766,7 @@ mod tests {
         let key = SessionKey::ambient(ch);
         let event_id = steer(&mut q, &key, make_queued(ch, "mid-turn mention"), true);
 
-        assert_eq!(q.settle_turn_steers(&key, TURN), 1);
+        assert_eq!(q.settle_turn_steers(&key, TURN).released, 1);
         q.mark_complete(&key);
 
         let batch = q.flush_next().expect("released event is dispatchable");
@@ -5767,7 +5787,7 @@ mod tests {
         steer(&mut q, &key, make_queued(ch, "mid-turn mention"), true);
 
         assert_eq!(
-            q.settle_turn_steers(&key, TURN),
+            q.settle_turn_steers(&key, TURN).released,
             1,
             "the agent spoke before the mention arrived, then went silent"
         );
@@ -5785,9 +5805,59 @@ mod tests {
         steer(&mut q, &key, make_queued(ch, "mid-turn mention"), true);
         publish(&mut q, &key, 1);
 
-        assert_eq!(q.settle_turn_steers(&key, TURN), 0);
+        assert_eq!(q.settle_turn_steers(&key, TURN).released, 0);
         assert_eq!(pending_count(&q), 0);
         assert!(q.flush_next().is_none());
+    }
+
+    /// Field canary of 2026-08-13: the answer went out, the steer was correctly
+    /// retired — and its 👀 stayed on the message forever. Nothing else can
+    /// clear it: the reaction guard captured its ids before this event existed,
+    /// and a retired event is never dispatched.
+    #[test]
+    fn retired_steers_hand_back_their_ids_for_reaction_cleanup() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let key = SessionKey::ambient(ch);
+        let answered = make_queued(ch, "answered inline");
+        let answered_id = answered.event.id.to_hex();
+        let mut passive = make_queued(ch, "two humans talking");
+        passive.requires_response = false;
+        let passive_id = passive.event.id.to_hex();
+
+        begin_turn(&mut q, &key);
+        steer(&mut q, &key, answered, true);
+        steer(&mut q, &key, passive, true);
+        publish(&mut q, &key, 1);
+
+        let settled = q.settle_turn_steers(&key, TURN);
+        assert_eq!(settled.released, 0);
+        assert_eq!(
+            settled.retired.len(),
+            2,
+            "both verdicts retire the event, so both owe a cleanup: {:?}",
+            settled.retired
+        );
+        assert!(settled.retired.contains(&answered_id));
+        assert!(settled.retired.contains(&passive_id));
+    }
+
+    /// A requeued steer must NOT be cleaned up here — it is going back out, and
+    /// the turn that picks it up clears both reactions on completion.
+    #[test]
+    fn requeued_steers_keep_their_reactions_for_the_next_turn() {
+        let mut q = EventQueue::new(DedupMode::Queue);
+        let ch = Uuid::new_v4();
+        let key = SessionKey::ambient(ch);
+        begin_turn(&mut q, &key);
+        steer(&mut q, &key, make_queued(ch, "mid-turn mention"), true);
+
+        let settled = q.settle_turn_steers(&key, TURN);
+        assert_eq!(settled.released, 1);
+        assert!(
+            settled.retired.is_empty(),
+            "clearing 👀 on a requeued event would tell the user it was handled"
+        );
     }
 
     /// Passive traffic steered mid-turn keeps the base prompt's
@@ -5801,7 +5871,7 @@ mod tests {
         qe.requires_response = false;
         steer(&mut q, &key, qe, true);
 
-        assert_eq!(q.settle_turn_steers(&key, TURN), 0);
+        assert_eq!(q.settle_turn_steers(&key, TURN).released, 0);
         assert_eq!(pending_count(&q), 0);
     }
 
@@ -5815,7 +5885,7 @@ mod tests {
         let event_id = steer(&mut q, &key, make_queued(ch, "mid-turn mention"), false);
         publish(&mut q, &key, 7);
 
-        assert_eq!(q.settle_turn_steers(&key, TURN), 1);
+        assert_eq!(q.settle_turn_steers(&key, TURN).released, 1);
         q.mark_complete(&key);
         let batch = q.flush_next().expect("released");
         assert_eq!(batch.events[0].event.id.to_hex(), event_id);
@@ -5829,7 +5899,7 @@ mod tests {
         let ch = Uuid::new_v4();
         let key = SessionKey::ambient(ch);
         let event_id = steer(&mut q, &key, make_queued(ch, "mid-turn mention"), false);
-        assert_eq!(q.settle_turn_steers(&key, TURN), 1);
+        assert_eq!(q.settle_turn_steers(&key, TURN).released, 1);
 
         assert!(
             !q.record_delivered_steer(&key, &event_id, TURN, 0),
@@ -5853,13 +5923,13 @@ mod tests {
         steer(&mut q, &key, make_queued(ch, "mid-turn mention"), true);
 
         assert_eq!(
-            q.settle_turn_steers(&key, "some-other-turn"),
+            q.settle_turn_steers(&key, "some-other-turn").released,
             0,
             "a different turn's settlement must not touch this entry"
         );
         assert_eq!(pending_count(&q), 0, "still parked, not released");
         assert_eq!(
-            q.settle_turn_steers(&key, TURN),
+            q.settle_turn_steers(&key, TURN).released,
             1,
             "its own turn settles it"
         );
@@ -5888,13 +5958,13 @@ mod tests {
             true,
         );
 
-        assert_eq!(q.settle_turn_steers(&key_a, TURN), 1);
+        assert_eq!(q.settle_turn_steers(&key_a, TURN).released, 1);
         assert_eq!(
             q.queues.get(&key_b).map(|v| v.len()),
             None,
             "thread B's steer is still parked, untouched by A's settlement"
         );
-        assert_eq!(q.settle_turn_steers(&key_b, TURN), 1);
+        assert_eq!(q.settle_turn_steers(&key_b, TURN).released, 1);
     }
 
     /// Expiry is the backstop for a turn that never reports a result: without
