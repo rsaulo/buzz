@@ -632,13 +632,6 @@ pub struct PromptResult {
     pub outcome: PromptOutcome,
     /// Present on failure in Queue mode, for requeue.
     pub batch: Option<FlushBatch>,
-    /// The turn's visible-output count at the moment it ended.
-    ///
-    /// Compared against the epoch stamped on each delivered steer to decide
-    /// whether the turn actually answered it. Captured in
-    /// [`send_prompt_result`] so every terminal path reports it, including the
-    /// ones that return early on error.
-    pub final_output_epoch: u64,
 }
 
 /// Whether the prompt came from a channel event or a heartbeat.
@@ -2392,17 +2385,12 @@ fn send_prompt_result(
     batch: Option<FlushBatch>,
 ) {
     agent.acp.clear_steer_rx();
-    // Read the epoch before the agent moves into the result: this is the single
-    // choke point every terminal path goes through, so no early-return error
-    // branch can forget to report it.
-    let final_output_epoch = agent.acp.turn_output_epoch();
     let _ = result_tx.send(PromptResult {
         agent,
         source,
         turn_id: turn_id.to_owned(),
         outcome,
         batch,
-        final_output_epoch,
     });
 }
 

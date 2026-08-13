@@ -147,7 +147,9 @@ struct PendingSteer {
     /// the exact turn so a later turn cannot judge an older turn's steer.
     turn_id: String,
     /// `None` while the ack is outstanding; `Some(epoch)` once a `Success`
-    /// proved delivery, carrying the turn's visible-output count at that moment.
+    /// proved delivery, carrying [`EventQueue::published_epoch`] at that moment
+    /// — the count of messages we had published into this conversation when the
+    /// steer landed, which the turn's terminal boundary compares against.
     delivered_at_epoch: Option<u64>,
 }
 
@@ -275,6 +277,19 @@ pub struct EventQueue {
     /// by `flush_next` / `has_flushable_work` (recover, not log-and-drop —
     /// the events were never delivered to the agent).
     withheld_native_steer: HashMap<SessionKey, Vec<PendingSteer>>,
+    /// Count of messages *we published* into each in-flight conversation.
+    ///
+    /// This — not the agent's ACP output — is what settles a steer. A managed
+    /// agent answers by shelling out to `buzz messages send`, so at the ACP
+    /// layer answering is indistinguishable from any other completed tool call:
+    /// an agent that ignores a steered mention and keeps working looks exactly
+    /// like one that replied to it. Counting our own published messages instead
+    /// asks the only question that matters — *did anything reach the human
+    /// after this message landed?*
+    ///
+    /// Tracked only while a session is in flight and dropped when the turn
+    /// clears, so the map cannot outgrow the live conversations.
+    published_epochs: HashMap<SessionKey, u64>,
     /// Duration after which an in-flight channel is auto-expired as orphaned.
     /// Must be strictly greater than `max_turn_duration` so a turn running to
     /// the hard cap returns via `mark_complete` before the backstop fires.
@@ -294,6 +309,7 @@ impl EventQueue {
             in_flight_deadlines: HashMap::new(),
             in_flight_batch_sizes: HashMap::new(),
             in_flight_turn_ids: HashMap::new(),
+            published_epochs: HashMap::new(),
             retry_after: HashMap::new(),
             retry_counts: HashMap::new(),
             dedup_mode,
@@ -319,6 +335,21 @@ impl EventQueue {
     /// moves backward. If the channel is not in-flight (already completed
     /// via `mark_complete`), this is a no-op: a late ack never resurrects
     /// a deadline.
+    /// Record that we published a message into `key`'s conversation.
+    ///
+    /// Ignored unless the session is in flight: outside a turn there is no
+    /// steer to settle, and tracking idle conversations would leak entries.
+    pub fn note_published_message(&mut self, key: &SessionKey) {
+        if self.in_flight_sessions.contains(key) {
+            *self.published_epochs.entry(key.clone()).or_insert(0) += 1;
+        }
+    }
+
+    /// How many messages we have published into `key` during the current turn.
+    pub fn published_epoch(&self, key: &SessionKey) -> u64 {
+        self.published_epochs.get(key).copied().unwrap_or(0)
+    }
+
     pub fn extend_in_flight_deadline(&mut self, key: &SessionKey, max_turn_secs: u64) {
         if let Some(current) = self.in_flight_deadlines.get_mut(key) {
             let extended = Instant::now()
@@ -408,6 +439,7 @@ impl EventQueue {
             self.in_flight_sessions.remove(&key);
             self.in_flight_deadlines.remove(&key);
             self.in_flight_turn_ids.remove(&key);
+            self.published_epochs.remove(&key);
             // Recover any withheld goose-native steer events for the expired
             // conversation back to the queue front so normal dispatch delivers
             // them. Unlike the in-flight batch above (already delivered to a
@@ -534,6 +566,7 @@ impl EventQueue {
         self.in_flight_deadlines.remove(key);
         self.in_flight_batch_sizes.remove(key);
         self.in_flight_turn_ids.remove(key);
+        self.published_epochs.remove(key);
         let now = Instant::now();
         match self.retry_after.get(key) {
             // Active throttle → it was requeued; keep retry_counts intact.
@@ -558,6 +591,7 @@ impl EventQueue {
         self.in_flight_deadlines.remove(key);
         self.in_flight_batch_sizes.remove(key);
         self.in_flight_turn_ids.remove(key);
+        self.published_epochs.remove(key);
     }
 
     /// Bind the dispatched turn generation to the current in-flight batch.
@@ -807,6 +841,7 @@ impl EventQueue {
             self.in_flight_sessions.remove(&key);
             self.in_flight_deadlines.remove(&key);
             self.in_flight_turn_ids.remove(&key);
+            self.published_epochs.remove(&key);
             // Symmetric with the flush_next expiry block: recover withheld
             // goose-native steer events for the expired conversation so they
             // are not permanently orphaned in the side table.
@@ -1062,29 +1097,38 @@ impl EventQueue {
     /// in-flight expiry — so a delivered event can never outlive its turn.
     /// Scoped to the exact `turn_id`: a sibling thread's steers, and steers a
     /// replacement turn accepted, are untouched.
-    pub fn settle_turn_steers(
-        &mut self,
-        key: &SessionKey,
-        turn_id: &str,
-        final_output_epoch: u64,
-    ) -> usize {
+    pub fn settle_turn_steers(&mut self, key: &SessionKey, turn_id: &str) -> usize {
+        // Read before borrowing the ledger, and read *published* messages, not
+        // agent activity: a turn that kept calling tools after a steered
+        // mention and never spoke has not answered anybody.
+        let final_published_epoch = self.published_epoch(key);
         let Some(entries) = self.withheld_native_steer.get_mut(key) else {
             return 0;
         };
         // Partition in place, preserving arrival order among the released.
         let mut released = Vec::new();
+        let mut answered = 0usize;
+        let mut passive = 0usize;
         entries.retain(|p| {
             if p.turn_id != turn_id {
                 return true;
             }
             let keep_out = match p.delivered_at_epoch {
-                // Delivered, and the turn produced output AFTER it landed: the
+                // Delivered, and we published something AFTER it landed: the
                 // agent answered. Redelivering would show the same message twice.
-                Some(epoch) if final_output_epoch > epoch => false,
-                // Delivered, nothing after: only worth retrying if someone is
-                // owed an answer. Passive traffic keeps the base prompt's
-                // silence-as-success contract.
-                Some(_) => p.event.requires_response,
+                Some(epoch) if final_published_epoch > epoch => {
+                    answered += 1;
+                    false
+                }
+                // Delivered, nothing published after: only worth retrying if
+                // someone is owed an answer. Passive traffic keeps the base
+                // prompt's silence-as-success contract.
+                Some(_) => {
+                    if !p.event.requires_response {
+                        passive += 1;
+                    }
+                    p.event.requires_response
+                }
                 // The ack never arrived, so delivery itself is unknown — release
                 // regardless of obligation rather than guess.
                 None => true,
@@ -1102,13 +1146,18 @@ impl EventQueue {
         for entry in released.into_iter().rev() {
             self.push_front_with_cap(key, entry.event, "settle_turn_steers");
         }
-        if count > 0 {
+        // Log every verdict, not just the requeues. A steer that is dropped
+        // leaves no other trace, and "the message vanished and nothing was
+        // logged" is precisely the incident this ledger exists to explain.
+        if count > 0 || answered > 0 || passive > 0 {
             tracing::info!(
                 session = %key,
                 turn_id,
                 released = count,
-                final_output_epoch,
-                "turn settled unanswered steer event(s) — requeued for normal dispatch"
+                dropped_answered = answered,
+                dropped_passive = passive,
+                final_published_epoch,
+                "turn settled its steer ledger"
             );
         }
         count
@@ -5659,18 +5708,28 @@ mod tests {
 
     const TURN: &str = "turn-1";
 
-    /// Withhold `qe` for a steer on `TURN`, and optionally deliver it at
-    /// `accepted_at_epoch`.
-    fn steer(
-        q: &mut EventQueue,
-        key: &SessionKey,
-        qe: QueuedEvent,
-        delivered_at: Option<u64>,
-    ) -> String {
+    /// Put `key` in flight, the way dispatching a turn does. A steer only ever
+    /// happens mid-turn, and published-message accounting is scoped to that.
+    fn begin_turn(q: &mut EventQueue, key: &SessionKey) {
+        q.in_flight_sessions.insert(key.clone());
+    }
+
+    /// The agent published `n` messages into `key`'s conversation.
+    fn publish(q: &mut EventQueue, key: &SessionKey, n: usize) {
+        for _ in 0..n {
+            q.note_published_message(key);
+        }
+    }
+
+    /// Withhold `qe` for a steer on `TURN`, stamping delivery at whatever has
+    /// been published so far when `delivered` (i.e. the ack came back).
+    fn steer(q: &mut EventQueue, key: &SessionKey, qe: QueuedEvent, delivered: bool) -> String {
         let event_id = qe.event.id.to_hex();
         q.push(qe);
+        begin_turn(q, key);
         assert!(q.mark_native_steer_pending(key, &event_id, TURN));
-        if let Some(epoch) = delivered_at {
+        if delivered {
+            let epoch = q.published_epoch(key);
             assert!(q.record_delivered_steer(key, &event_id, TURN, epoch));
         }
         assert_eq!(pending_count(q), 0, "a steered event is not dispatchable");
@@ -5685,9 +5744,10 @@ mod tests {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
         let key = SessionKey::ambient(ch);
-        let event_id = steer(&mut q, &key, make_queued(ch, "mid-turn mention"), Some(0));
+        let event_id = steer(&mut q, &key, make_queued(ch, "mid-turn mention"), true);
 
-        assert_eq!(q.settle_turn_steers(&key, TURN, 0), 1);
+        assert_eq!(q.settle_turn_steers(&key, TURN), 1);
+        q.mark_complete(&key);
 
         let batch = q.flush_next().expect("released event is dispatchable");
         assert_eq!(batch.events.len(), 1);
@@ -5702,25 +5762,30 @@ mod tests {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
         let key = SessionKey::ambient(ch);
-        steer(&mut q, &key, make_queued(ch, "mid-turn mention"), Some(3));
+        begin_turn(&mut q, &key);
+        publish(&mut q, &key, 3);
+        steer(&mut q, &key, make_queued(ch, "mid-turn mention"), true);
 
         assert_eq!(
-            q.settle_turn_steers(&key, TURN, 3),
+            q.settle_turn_steers(&key, TURN),
             1,
             "the agent spoke before the mention arrived, then went silent"
         );
     }
 
-    /// Output after delivery retires it — redelivering would prompt the agent
-    /// twice with the same message.
+    /// A message published after delivery retires it — redelivering would
+    /// prompt the agent twice with the same message.
     #[test]
     fn answered_steered_mention_is_not_redelivered() {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
         let key = SessionKey::ambient(ch);
-        steer(&mut q, &key, make_queued(ch, "mid-turn mention"), Some(3));
+        begin_turn(&mut q, &key);
+        publish(&mut q, &key, 3);
+        steer(&mut q, &key, make_queued(ch, "mid-turn mention"), true);
+        publish(&mut q, &key, 1);
 
-        assert_eq!(q.settle_turn_steers(&key, TURN, 4), 0);
+        assert_eq!(q.settle_turn_steers(&key, TURN), 0);
         assert_eq!(pending_count(&q), 0);
         assert!(q.flush_next().is_none());
     }
@@ -5734,9 +5799,9 @@ mod tests {
         let key = SessionKey::ambient(ch);
         let mut qe = make_queued(ch, "two humans talking");
         qe.requires_response = false;
-        steer(&mut q, &key, qe, Some(0));
+        steer(&mut q, &key, qe, true);
 
-        assert_eq!(q.settle_turn_steers(&key, TURN, 0), 0);
+        assert_eq!(q.settle_turn_steers(&key, TURN), 0);
         assert_eq!(pending_count(&q), 0);
     }
 
@@ -5747,9 +5812,11 @@ mod tests {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
         let key = SessionKey::ambient(ch);
-        let event_id = steer(&mut q, &key, make_queued(ch, "mid-turn mention"), None);
+        let event_id = steer(&mut q, &key, make_queued(ch, "mid-turn mention"), false);
+        publish(&mut q, &key, 7);
 
-        assert_eq!(q.settle_turn_steers(&key, TURN, 7), 1);
+        assert_eq!(q.settle_turn_steers(&key, TURN), 1);
+        q.mark_complete(&key);
         let batch = q.flush_next().expect("released");
         assert_eq!(batch.events[0].event.id.to_hex(), event_id);
     }
@@ -5761,8 +5828,8 @@ mod tests {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
         let key = SessionKey::ambient(ch);
-        let event_id = steer(&mut q, &key, make_queued(ch, "mid-turn mention"), None);
-        assert_eq!(q.settle_turn_steers(&key, TURN, 0), 1);
+        let event_id = steer(&mut q, &key, make_queued(ch, "mid-turn mention"), false);
+        assert_eq!(q.settle_turn_steers(&key, TURN), 1);
 
         assert!(
             !q.record_delivered_steer(&key, &event_id, TURN, 0),
@@ -5783,16 +5850,16 @@ mod tests {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
         let key = SessionKey::ambient(ch);
-        steer(&mut q, &key, make_queued(ch, "mid-turn mention"), Some(0));
+        steer(&mut q, &key, make_queued(ch, "mid-turn mention"), true);
 
         assert_eq!(
-            q.settle_turn_steers(&key, "some-other-turn", 9),
+            q.settle_turn_steers(&key, "some-other-turn"),
             0,
             "a different turn's settlement must not touch this entry"
         );
         assert_eq!(pending_count(&q), 0, "still parked, not released");
         assert_eq!(
-            q.settle_turn_steers(&key, TURN, 0),
+            q.settle_turn_steers(&key, TURN),
             1,
             "its own turn settles it"
         );
@@ -5812,22 +5879,22 @@ mod tests {
             &mut q,
             &key_a,
             make_queued_in_thread(ch, "A", &root_a),
-            Some(0),
+            true,
         );
         steer(
             &mut q,
             &key_b,
             make_queued_in_thread(ch, "B", &root_b),
-            Some(0),
+            true,
         );
 
-        assert_eq!(q.settle_turn_steers(&key_a, TURN, 0), 1);
+        assert_eq!(q.settle_turn_steers(&key_a, TURN), 1);
         assert_eq!(
             q.queues.get(&key_b).map(|v| v.len()),
             None,
             "thread B's steer is still parked, untouched by A's settlement"
         );
-        assert_eq!(q.settle_turn_steers(&key_b, TURN, 0), 1);
+        assert_eq!(q.settle_turn_steers(&key_b, TURN), 1);
     }
 
     /// Expiry is the backstop for a turn that never reports a result: without
@@ -5837,7 +5904,7 @@ mod tests {
         let mut q = EventQueue::new(DedupMode::Queue);
         let ch = Uuid::new_v4();
         let key = SessionKey::ambient(ch);
-        let event_id = steer(&mut q, &key, make_queued(ch, "delivered"), Some(0));
+        let event_id = steer(&mut q, &key, make_queued(ch, "delivered"), true);
 
         q.in_flight_sessions.insert(key.clone());
         q.in_flight_batch_sizes.insert(key.clone(), 1);

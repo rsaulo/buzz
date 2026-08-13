@@ -2627,6 +2627,19 @@ async fn tokio_main() -> Result<()> {
                             }
 
                             if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
+                                // Our own message coming back off the relay is the
+                                // only first-hand evidence that a turn actually said
+                                // something to somebody — the agent publishes with the
+                                // `buzz` CLI, so nothing in the ACP stream distinguishes
+                                // answering from ordinary tool work. Count it before
+                                // dropping the event, so steer settlement can tell
+                                // "replied" from "kept working in silence".
+                                note_self_published(
+                                    &mut queue,
+                                    buzz_event.channel_id,
+                                    kind_u32,
+                                    &buzz_event.event,
+                                );
                                 tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
                                 continue;
                             }
@@ -3754,6 +3767,26 @@ fn apply_native_steer_result(
     }
 }
 
+/// Count one of our own messages coming back off the relay.
+///
+/// This is the only first-hand evidence that a turn said something to somebody:
+/// a managed agent answers by shelling out to `buzz messages send`, so nothing
+/// in the ACP stream tells replying apart from ordinary tool work.
+///
+/// A threaded reply credits both its thread *and* the channel's ambient
+/// conversation, because an ambient mention is answered by opening a thread
+/// rooted at it — crediting only the thread would leave the ambient session
+/// looking unanswered and requeue a message that was in fact replied to.
+fn note_self_published(queue: &mut EventQueue, channel_id: Uuid, kind: u32, event: &nostr::Event) {
+    if kind != buzz_core::kind::KIND_STREAM_MESSAGE {
+        return;
+    }
+    queue.note_published_message(&queue::SessionKey::ambient(channel_id));
+    if let Some(root) = queue::event_thread_root(event) {
+        queue.note_published_message(&queue::SessionKey::thread(channel_id, root));
+    }
+}
+
 /// Commit a successful steer only to the generation that accepted it.
 /// A stale success returns the withheld event to normal dispatch and leaves the
 /// replacement turn's deadline untouched.
@@ -3765,16 +3798,30 @@ fn settle_successful_steer_ack(
     event_id: &str,
     session_id: &str,
     turn_id: &str,
-    output_epoch: u64,
+    acp_output_epoch: u64,
     max_turn_duration_secs: u64,
 ) -> bool {
+    // The adapter's own output epoch rides along for diagnostics only. It
+    // cannot decide the verdict: the agent publishes by shelling out to
+    // `buzz messages send`, so at the ACP layer "answered the steer" and "kept
+    // working and ignored it" are the same completed tool call. What the
+    // ledger stamps is how many messages we had actually published.
+    let published_epoch = queue.published_epoch(session_key);
+    tracing::debug!(
+        session = %session_key,
+        event_id,
+        turn_id,
+        acp_output_epoch,
+        published_epoch,
+        "stamping steer delivery"
+    );
     // Prove the event is STILL pending for this exact turn before doing
     // anything else. A `Success` can be processed after the turn it belongs to
     // has already terminated — the ack and the prompt result travel on
     // different channels and the main loop polls results first — and by then
     // terminal settlement has released the event. Acting on that late ack would
     // remove the sole requeued copy, so it must change nothing at all.
-    if !queue.record_delivered_steer(session_key, event_id, turn_id, output_epoch) {
+    if !queue.record_delivered_steer(session_key, event_id, turn_id, published_epoch) {
         tracing::warn!(
             session = %session_key,
             event_id,
@@ -4137,7 +4184,7 @@ fn handle_prompt_result(
             // event the turn was handed gets a verdict here — answered, owed and
             // unanswered, or delivery-unknown — so none can outlive the turn
             // that accepted it.
-            queue.settle_turn_steers(key, &result.turn_id, result.final_output_epoch);
+            queue.settle_turn_steers(key, &result.turn_id);
             queue.mark_complete_turn(key, &result.turn_id);
         }
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
@@ -7572,7 +7619,6 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
             batch: None,
-            final_output_epoch: 0,
         };
 
         handle_prompt_result(
@@ -7647,7 +7693,6 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
             batch: None,
-            final_output_epoch: 0,
         };
 
         handle_prompt_result(
@@ -7731,6 +7776,196 @@ mod error_outcome_emission_tests {
         assert!(returned.state.deliveries[&key]
             .delivered_event_ids
             .is_empty());
+    }
+
+    /// The 2026-08-13 canary, exactly. The agent was told to ignore the steered
+    /// mention; it kept calling tools, published nothing, and ended the turn.
+    /// Its ACP output epoch had advanced, so an activity-based verdict read that
+    /// as "answered" and dropped the message — the same silent loss the ledger
+    /// was built to stop, one layer down. Only published messages may settle.
+    #[tokio::test]
+    async fn tool_activity_after_a_steer_does_not_count_as_an_answer() {
+        let channel_id = Uuid::new_v4();
+        let key = queue::SessionKey::ambient(channel_id);
+        let mut agent = dummy_agent(0).await;
+        agent.state.sessions.insert(key.clone(), "session-1".into());
+        agent
+            .state
+            .deliveries
+            .insert(key.clone(), Default::default());
+        agent
+            .state
+            .turn_generations
+            .insert(key.clone(), "turn-1".into());
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let queued = |content: &str| QueuedEvent {
+            channel_id,
+            event: EventBuilder::new(Kind::Custom(9), content)
+                .sign_with_keys(&Keys::generate())
+                .unwrap(),
+            received_at: std::time::Instant::now(),
+            requires_response: true,
+            prompt_tag: "test".into(),
+        };
+
+        // A turn is already running when the second mention arrives.
+        assert!(queue.push(queued("rode sleep 180 e encerre em silêncio")));
+        let batch = queue.flush_next().expect("the turn is in flight");
+        queue.bind_in_flight_turn(&batch.session_key(), "turn-1".into());
+
+        let steered = queued("qual é a capital da Austrália?");
+        let event_id = steered.event.id.to_hex();
+        assert!(queue.push(steered));
+        assert!(queue.mark_native_steer_pending(&key, &event_id, "turn-1"));
+
+        // The adapter reports plenty of activity. It is diagnostics, not proof.
+        assert!(settle_successful_steer_ack(
+            &mut pool,
+            &mut queue,
+            &key,
+            &event_id,
+            "session-1",
+            "turn-1",
+            99,
+            config::DEFAULT_MAX_TURN_DURATION_SECS,
+        ));
+
+        assert_eq!(
+            queue.settle_turn_steers(&key, "turn-1"),
+            1,
+            "a turn that never published anything has answered nobody"
+        );
+        assert_eq!(queue.queued_event_count(&key), 1);
+    }
+
+    /// The counterpart: a message we actually published after delivery retires
+    /// the steer, so the agent is not prompted twice with the same mention.
+    #[tokio::test]
+    async fn a_published_message_after_a_steer_settles_it() {
+        let channel_id = Uuid::new_v4();
+        let key = queue::SessionKey::ambient(channel_id);
+        let mut agent = dummy_agent(0).await;
+        agent.state.sessions.insert(key.clone(), "session-1".into());
+        agent
+            .state
+            .deliveries
+            .insert(key.clone(), Default::default());
+        agent
+            .state
+            .turn_generations
+            .insert(key.clone(), "turn-1".into());
+        let mut pool = AgentPool::from_slots(vec![Some(agent)]);
+
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let queued = |content: &str| QueuedEvent {
+            channel_id,
+            event: EventBuilder::new(Kind::Custom(9), content)
+                .sign_with_keys(&Keys::generate())
+                .unwrap(),
+            received_at: std::time::Instant::now(),
+            requires_response: true,
+            prompt_tag: "test".into(),
+        };
+
+        // A turn is already running when the second mention arrives.
+        assert!(queue.push(queued("rode sleep 180 e encerre em silêncio")));
+        let batch = queue.flush_next().expect("the turn is in flight");
+        queue.bind_in_flight_turn(&batch.session_key(), "turn-1".into());
+
+        let steered = queued("qual é a capital da Austrália?");
+        let event_id = steered.event.id.to_hex();
+        assert!(queue.push(steered));
+        assert!(queue.mark_native_steer_pending(&key, &event_id, "turn-1"));
+        assert!(settle_successful_steer_ack(
+            &mut pool,
+            &mut queue,
+            &key,
+            &event_id,
+            "session-1",
+            "turn-1",
+            0,
+            config::DEFAULT_MAX_TURN_DURATION_SECS,
+        ));
+
+        // "Canberra." reaches the channel, echoed back to us by the relay.
+        let reply = EventBuilder::new(Kind::Custom(9), "Canberra.")
+            .sign_with_keys(&Keys::generate())
+            .unwrap();
+        note_self_published(
+            &mut queue,
+            channel_id,
+            buzz_core::kind::KIND_STREAM_MESSAGE,
+            &reply,
+        );
+
+        assert_eq!(
+            queue.settle_turn_steers(&key, "turn-1"),
+            0,
+            "it was answered — redelivering would ask the same thing twice"
+        );
+        assert_eq!(queue.queued_event_count(&key), 0);
+    }
+
+    /// A threaded reply credits its own thread and the ambient conversation it
+    /// answers; a reaction or any other kind credits nothing.
+    #[tokio::test]
+    async fn only_published_messages_advance_the_epoch() {
+        let channel_id = Uuid::new_v4();
+        let root = "c".repeat(64);
+        let ambient = queue::SessionKey::ambient(channel_id);
+        let thread = queue::SessionKey::thread(channel_id, root.clone());
+        let sibling = queue::SessionKey::thread(channel_id, "d".repeat(64));
+        let in_thread = |root: Option<&str>, content: &str| {
+            let mut builder = EventBuilder::new(Kind::Custom(9), content);
+            if let Some(root) = root {
+                builder = builder.tags(vec![
+                    nostr::Tag::parse(["e", root, "", "root"]).expect("root tag")
+                ]);
+            }
+            builder.sign_with_keys(&Keys::generate()).unwrap()
+        };
+
+        // Only in-flight conversations are accounted, so seed a turn in each.
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        let sibling_root = sibling.root.clone().expect("sibling root");
+        for root in [None, Some(root.as_str()), Some(sibling_root.as_str())] {
+            assert!(queue.push(QueuedEvent {
+                channel_id,
+                event: in_thread(root, "seed"),
+                received_at: std::time::Instant::now(),
+                requires_response: true,
+                prompt_tag: "test".into(),
+            }));
+        }
+        while queue.flush_next().is_some() {}
+
+        let reply = in_thread(Some(&root), "Canberra.");
+        note_self_published(
+            &mut queue,
+            channel_id,
+            buzz_core::kind::KIND_STREAM_MESSAGE,
+            &reply,
+        );
+        note_self_published(
+            &mut queue,
+            channel_id,
+            buzz_core::kind::KIND_REACTION,
+            &reply,
+        );
+
+        assert_eq!(queue.published_epoch(&thread), 1, "its own thread");
+        assert_eq!(
+            queue.published_epoch(&ambient),
+            1,
+            "and the ambient mention it answers"
+        );
+        assert_eq!(
+            queue.published_epoch(&sibling),
+            0,
+            "but never a sibling thread"
+        );
     }
 
     #[tokio::test]
@@ -7887,7 +8122,6 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".into(),
             outcome: PromptOutcome::Ok(crate::acp::StopReason::EndTurn),
             batch: None,
-            final_output_epoch: 0,
         };
 
         handle_prompt_result(
@@ -7952,7 +8186,6 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".to_string(),
             outcome,
             batch: None,
-            final_output_epoch: 0,
         };
 
         handle_prompt_result(
@@ -8123,7 +8356,6 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: None,
-                final_output_epoch: 0,
             };
             handle_prompt_result(
                 &mut pool,
@@ -8218,7 +8450,6 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: Some(batch),
-                final_output_epoch: 0,
             };
             handle_prompt_result(
                 &mut pool,
@@ -8328,7 +8559,6 @@ mod error_outcome_emission_tests {
                 turn_id: "test-turn-id".to_string(),
                 outcome,
                 batch: Some(batch),
-                final_output_epoch: 0,
             };
             handle_prompt_result(
                 &mut pool,
@@ -8424,7 +8654,6 @@ mod error_outcome_emission_tests {
                 recently_active: true,
             }),
             batch: Some(batch),
-            final_output_epoch: 0,
         };
         handle_prompt_result(
             &mut pool,
@@ -8525,7 +8754,6 @@ mod error_outcome_emission_tests {
                 recently_active: true,
             }),
             batch: Some(batch),
-            final_output_epoch: 0,
         };
         handle_prompt_result(
             &mut pool,
@@ -8645,7 +8873,6 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::CancelDrainTimeout(grace),
             batch: Some(batch),
-            final_output_epoch: 0,
         };
 
         handle_prompt_result(
@@ -8780,7 +9007,6 @@ mod error_outcome_emission_tests {
             // `classify_control_cancel_failure` — `handle_prompt_result`
             // never sees one to requeue.
             batch: None,
-            final_output_epoch: 0,
         };
 
         handle_prompt_result(
@@ -8968,7 +9194,6 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(auth_error),
             batch: Some(batch),
-            final_output_epoch: 0,
         };
         handle_prompt_result(
             &mut pool,
@@ -9058,7 +9283,6 @@ mod error_outcome_emission_tests {
             turn_id: "test-turn-id".to_string(),
             outcome: PromptOutcome::Error(usage_error),
             batch: Some(batch),
-            final_output_epoch: 0,
         };
         handle_prompt_result(
             &mut pool,
