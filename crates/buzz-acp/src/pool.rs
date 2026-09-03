@@ -1784,7 +1784,7 @@ async fn create_session_and_apply_model(
             }
             None => {
                 tracing::warn!(
-                    target: "pool::model",
+                    target: "buzz_acp::pool::model",
                     "desired model {desired} not found in agent's available models — proceeding with agent default"
                 );
                 // Surface the miss so the desktop ModelPicker can reject a live
@@ -1940,7 +1940,7 @@ async fn apply_model_switch(
         // `session.configOptions` on a model change and returns them here).
         Ok(Ok(value)) => {
             tracing::info!(
-                target: "pool::model",
+                target: "buzz_acp::pool::model",
                 "applied model {desired} via {method_label} on session {session_id}"
             );
             Ok(ModelSwitchOutcome::Applied(value))
@@ -1953,7 +1953,7 @@ async fn apply_model_switch(
         | Ok(Err(e @ AcpError::Protocol(_)))
         | Ok(Err(e @ AcpError::AgentExited)) => {
             tracing::error!(
-                target: "pool::model",
+                target: "buzz_acp::pool::model",
                 "fatal error setting model {desired} via {method_label}: {e}"
             );
             Err(e)
@@ -1964,7 +1964,7 @@ async fn apply_model_switch(
         // the caller must preserve pre-switch capabilities here.
         Ok(Err(e)) => {
             tracing::warn!(
-                target: "pool::model",
+                target: "buzz_acp::pool::model",
                 "failed to set model {desired} via {method_label}: {e} — proceeding with agent default"
             );
             Ok(ModelSwitchOutcome::Rejected)
@@ -1973,7 +1973,7 @@ async fn apply_model_switch(
             // Outer timeout fired — the inner send_request may have left the
             // stream in an unknown state. Treat as transport error.
             tracing::error!(
-                target: "pool::model",
+                target: "buzz_acp::pool::model",
                 "model set via {method_label} timed out ({MODEL_SWITCH_TIMEOUT:?}) — treating as fatal"
             );
             Err(AcpError::Timeout(MODEL_SWITCH_TIMEOUT))
@@ -2011,7 +2011,7 @@ async fn apply_startup_effort(
     };
     let Some(config_id) = extract_thought_level_config_id(session_new_result) else {
         tracing::info!(
-            target: "pool::effort",
+            target: "buzz_acp::pool::effort",
             "startup effort {value} configured but model advertises no thought_level option — leaving agent default"
         );
         return Ok(None);
@@ -2028,7 +2028,7 @@ async fn apply_startup_effort(
     match result {
         Ok(Ok(_)) => {
             tracing::info!(
-                target: "pool::effort",
+                target: "buzz_acp::pool::effort",
                 "applied startup effort {value} via configId={config_id} on session {session_id}"
             );
             Ok(Some(StartupEffortOutcome::Applied { config_id, value }))
@@ -2041,7 +2041,7 @@ async fn apply_startup_effort(
         | Ok(Err(e @ AcpError::Protocol(_)))
         | Ok(Err(e @ AcpError::AgentExited)) => {
             tracing::error!(
-                target: "pool::effort",
+                target: "buzz_acp::pool::effort",
                 "fatal error applying startup effort {value} via configId={config_id}: {e}"
             );
             Err(e)
@@ -2049,7 +2049,7 @@ async fn apply_startup_effort(
         // Application-level rejection (e.g. Json) — agent is fine, uses default effort.
         Ok(Err(e)) => {
             tracing::warn!(
-                target: "pool::effort",
+                target: "buzz_acp::pool::effort",
                 "adapter rejected startup effort {value} via configId={config_id}: {e} — proceeding with agent default"
             );
             Ok(Some(StartupEffortOutcome::Rejected))
@@ -2058,7 +2058,7 @@ async fn apply_startup_effort(
             // Outer timeout fired — the inner send_request may have left the
             // stream in an unknown state. Treat as transport error.
             tracing::error!(
-                target: "pool::effort",
+                target: "buzz_acp::pool::effort",
                 "startup effort {value} via configId={config_id} timed out ({MODEL_SWITCH_TIMEOUT:?}) — treating as fatal"
             );
             Err(AcpError::Timeout(MODEL_SWITCH_TIMEOUT))
@@ -2134,7 +2134,7 @@ async fn apply_permission_mode(
     match result {
         Ok(Ok(_)) => {
             tracing::info!(
-                target: "pool::permission",
+                target: "buzz_acp::pool::permission",
                 "applied permission mode {wire:?} on session {session_id}"
             );
         }
@@ -2146,7 +2146,7 @@ async fn apply_permission_mode(
         | Ok(Err(e @ AcpError::Protocol(_)))
         | Ok(Err(e @ AcpError::AgentExited)) => {
             tracing::error!(
-                target: "pool::permission",
+                target: "buzz_acp::pool::permission",
                 "fatal error setting permission mode {wire:?}: {e}"
             );
             return Err(e);
@@ -2154,14 +2154,14 @@ async fn apply_permission_mode(
         // Application-level errors — agent is fine, just uses default permission mode.
         Ok(Err(e)) => {
             tracing::warn!(
-                target: "pool::permission",
+                target: "buzz_acp::pool::permission",
                 "failed to set permission mode {wire:?}: {e} — falling back to per-tool auto-approval"
             );
         }
         Err(_) => {
             // Outer timeout fired — stream may be in unknown state.
             tracing::error!(
-                target: "pool::permission",
+                target: "buzz_acp::pool::permission",
                 "permission mode set timed out ({PERMISSION_MODE_TIMEOUT:?}) — treating as fatal"
             );
             return Err(AcpError::Timeout(PERMISSION_MODE_TIMEOUT));
@@ -2515,7 +2515,7 @@ pub async fn run_prompt_task(
                     Ok(s) => s,
                     Err(_) => {
                         tracing::warn!(
-                            target: "engram::core",
+                            target: "buzz_acp::engram::core",
                             channel = %cid,
                             timeout_ms = CORE_FETCH_TIMEOUT.as_millis() as u64,
                             "core fetch timed out — emitting no section"
@@ -2525,7 +2525,7 @@ pub async fn run_prompt_task(
                 };
                 if let Some(rendered) = section {
                     tracing::info!(
-                        target: "engram::core",
+                        target: "buzz_acp::engram::core",
                         channel = %cid,
                         scope = %scope.telemetry_label(),
                         section_len = rendered.len(),
@@ -3102,7 +3102,7 @@ pub async fn run_prompt_task(
         slash_command = crate::queue::slash_command_for_batch(b, &known_names);
         if let Some(ref cmd) = slash_command {
             tracing::info!(
-                target: "pool::prompt",
+                target: "buzz_acp::pool::prompt",
                 channel = %b.channel_id,
                 command = %cmd,
                 "slash-command pass-through"
@@ -3171,7 +3171,7 @@ pub async fn run_prompt_task(
     let standing_context_included =
         !agent.has_system_prompt_support() && !standing_context_sent && has_standing_context;
     tracing::info!(
-        target: "pool::prompt",
+        target: "buzz_acp::pool::prompt",
         prompt_bytes,
         standing_context_included,
         delivered_event_delta = pending_delivered_event_ids.len(),
@@ -3193,7 +3193,7 @@ pub async fn run_prompt_task(
     // zero completions either way, so anything reading them afterwards has to
     // guess which happened.
     tracing::info!(
-        target: "pool::prompt",
+        target: "buzz_acp::pool::prompt",
         "turn starting for {}",
         prompt_label(&source)
     );
@@ -3332,12 +3332,12 @@ pub async fn run_prompt_task(
                             ControlSignal::Rotate | ControlSignal::SwitchModel { .. }
                         ) {
                             tracing::debug!(
-                                target: "pool::prompt",
+                                target: "buzz_acp::pool::prompt",
                                 "rotate/switch signal arrived but turn already completed — invalidating session"
                             );
                         } else {
                             tracing::debug!(
-                                target: "pool::prompt",
+                                target: "buzz_acp::pool::prompt",
                                 "control signal arrived but turn already completed — treating as success"
                             );
                         }
@@ -3457,7 +3457,7 @@ pub async fn run_prompt_task(
             );
         }
         Err(AcpError::AgentExited) => {
-            tracing::error!(target: "pool::prompt", "agent {} exited during prompt", agent.index);
+            tracing::error!(target: "buzz_acp::pool::prompt", "agent {} exited during prompt", agent.index);
             agent.state.invalidate_all();
             let usage = agent.acp.take_turn_usage();
             publish_agent_turn_metric(
@@ -3480,7 +3480,7 @@ pub async fn run_prompt_task(
         }
         Err(AcpError::IdleTimeout(_)) => {
             tracing::warn!(
-                target: "pool::prompt",
+                target: "buzz_acp::pool::prompt",
                 "idle timeout ({}s) — cancelling session {session_id}",
                 ctx.idle_timeout.as_secs()
             );
@@ -3514,7 +3514,7 @@ pub async fn run_prompt_task(
                 }
                 Err(AcpError::AgentExited) => {
                     tracing::error!(
-                        target: "pool::prompt",
+                        target: "buzz_acp::pool::prompt",
                         "agent {} exited during cancel_with_cleanup",
                         agent.index
                     );
@@ -3540,7 +3540,7 @@ pub async fn run_prompt_task(
                 }
                 Err(e) => {
                     tracing::error!(
-                        target: "pool::prompt",
+                        target: "buzz_acp::pool::prompt",
                         "cancel_with_cleanup error: {e} — invalidating session"
                     );
                     agent.state.invalidate(&source);
@@ -3568,7 +3568,7 @@ pub async fn run_prompt_task(
         Err(AcpError::HardTimeout { silence }) => {
             let recently_active = silence < RECENT_ACTIVITY_WINDOW;
             tracing::error!(
-                target: "pool::prompt",
+                target: "buzz_acp::pool::prompt",
                 "hard timeout ({}s cap, silence {silence:?}, recently_active={recently_active}) — agent process is unrecoverable, invalidating all sessions",
                 ctx.max_turn_duration.as_secs()
             );
@@ -3593,7 +3593,7 @@ pub async fn run_prompt_task(
             );
         }
         Err(e) => {
-            tracing::error!(target: "pool::prompt", "session_prompt error: {e}");
+            tracing::error!(target: "buzz_acp::pool::prompt", "session_prompt error: {e}");
             // AgentError means the agent caught a problem before mutating
             // session state (e.g. bad LLM response). The session is healthy —
             // don't invalidate it. Other errors may have corrupted state.
@@ -3858,7 +3858,7 @@ async fn fetch_canvas_section(channel_id: Uuid, rest: &RestClient) -> Option<Str
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             tracing::warn!(
-                target: "canvas::fetch",
+                target: "buzz_acp::canvas::fetch",
                 channel = %channel_id,
                 "canvas query failed: {e} — emitting no section"
             );
@@ -3866,7 +3866,7 @@ async fn fetch_canvas_section(channel_id: Uuid, rest: &RestClient) -> Option<Str
         }
         Err(_) => {
             tracing::warn!(
-                target: "canvas::fetch",
+                target: "buzz_acp::canvas::fetch",
                 channel = %channel_id,
                 timeout_ms = CANVAS_FETCH_TIMEOUT.as_millis() as u64,
                 "canvas fetch timed out — emitting no section"
@@ -3879,7 +3879,7 @@ async fn fetch_canvas_section(channel_id: Uuid, rest: &RestClient) -> Option<Str
         Some(arr) => arr,
         None => {
             tracing::warn!(
-                target: "canvas::fetch",
+                target: "buzz_acp::canvas::fetch",
                 channel = %channel_id,
                 "canvas query response is not a JSON array — emitting no section"
             );
@@ -3910,7 +3910,7 @@ pub(crate) fn canvas_section_from_query_response(
         Ok(ev) => ev,
         Err(err) => {
             tracing::warn!(
-                target: "canvas::fetch",
+                target: "buzz_acp::canvas::fetch",
                 channel = %channel_uuid,
                 %err,
                 "canvas query returned a malformed event — emitting no section",
@@ -3923,7 +3923,7 @@ pub(crate) fn canvas_section_from_query_response(
     // A structurally complete but tampered event must not supply trusted metadata.
     if let Err(err) = event.verify() {
         tracing::warn!(
-            target: "canvas::fetch",
+            target: "buzz_acp::canvas::fetch",
             channel = %channel_uuid,
             %err,
             "canvas event failed signature verification — emitting no section",
@@ -3934,7 +3934,7 @@ pub(crate) fn canvas_section_from_query_response(
     // Validate kind: must be KIND_CANVAS (40100).
     if event.kind != nostr::Kind::Custom(buzz_core::kind::KIND_CANVAS as u16) {
         tracing::warn!(
-            target: "canvas::fetch",
+            target: "buzz_acp::canvas::fetch",
             channel = %channel_uuid,
             kind = %event.kind.as_u16(),
             "canvas event has unexpected kind — emitting no section",
@@ -3951,7 +3951,7 @@ pub(crate) fn canvas_section_from_query_response(
     });
     if !h_tag_matches {
         tracing::warn!(
-            target: "canvas::fetch",
+            target: "buzz_acp::canvas::fetch",
             channel = %channel_uuid,
             "canvas event is missing expected h-tag — emitting no section",
         );
@@ -3961,7 +3961,7 @@ pub(crate) fn canvas_section_from_query_response(
     // Blank content means the canvas was cleared; do not fall back to older events.
     if event.content.trim().is_empty() {
         tracing::debug!(
-            target: "canvas::fetch",
+            target: "buzz_acp::canvas::fetch",
             channel = %channel_uuid,
             "latest canvas event has blank content — emitting no section"
         );
@@ -3978,7 +3978,7 @@ pub(crate) fn canvas_section_from_query_response(
         Ok(s) => s,
         Err(_) => {
             tracing::warn!(
-                target: "canvas::fetch",
+                target: "buzz_acp::canvas::fetch",
                 channel = %channel_uuid,
                 "canvas event created_at overflows i64 — emitting no section",
             );
@@ -3989,7 +3989,7 @@ pub(crate) fn canvas_section_from_query_response(
         Some(dt) => dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
         None => {
             tracing::warn!(
-                target: "canvas::fetch",
+                target: "buzz_acp::canvas::fetch",
                 channel = %channel_uuid,
                 ts_secs,
                 "canvas event has out-of-range created_at — emitting no section",
@@ -3999,7 +3999,7 @@ pub(crate) fn canvas_section_from_query_response(
     };
 
     tracing::info!(
-        target: "canvas::fetch",
+        target: "buzz_acp::canvas::fetch",
         channel = %channel_uuid,
         event_id = %id,
         "injected channel canvas metadata section into system prompt"
@@ -4902,19 +4902,19 @@ fn log_stop_reason(source: &PromptSource, stop_reason: &StopReason) {
     let label = prompt_label(source);
     match stop_reason {
         StopReason::EndTurn => {
-            tracing::info!(target: "pool::prompt", "turn complete for {label}: end_turn");
+            tracing::info!(target: "buzz_acp::pool::prompt", "turn complete for {label}: end_turn");
         }
         StopReason::Cancelled => {
-            tracing::warn!(target: "pool::prompt", "turn cancelled for {label}");
+            tracing::warn!(target: "buzz_acp::pool::prompt", "turn cancelled for {label}");
         }
         StopReason::MaxTokens => {
-            tracing::warn!(target: "pool::prompt", "turn hit max_tokens for {label} — session will be rotated");
+            tracing::warn!(target: "buzz_acp::pool::prompt", "turn hit max_tokens for {label} — session will be rotated");
         }
         StopReason::MaxTurnRequests => {
-            tracing::warn!(target: "pool::prompt", "turn hit max_turn_requests for {label} — session will be rotated");
+            tracing::warn!(target: "buzz_acp::pool::prompt", "turn hit max_turn_requests for {label} — session will be rotated");
         }
         StopReason::Refusal => {
-            tracing::warn!(target: "pool::prompt", "turn refused for {label}");
+            tracing::warn!(target: "buzz_acp::pool::prompt", "turn refused for {label}");
         }
     }
 }
@@ -4935,7 +4935,7 @@ fn record_scope_delivery_success(
     event_ids: &HashSet<String>,
 ) {
     tracing::info!(
-        target: "pool::prompt",
+        target: "buzz_acp::pool::prompt",
         "{}",
         delivery_receipt_line(scope.channel_id(), event_ids)
     );
@@ -5289,7 +5289,7 @@ async fn publish_agent_turn_metric(
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(
-                target: "pool::metrics",
+                target: "buzz_acp::pool::metrics",
                 session_id,
                 turn_id,
                 "NIP-AM: encrypt failed: {e}"
@@ -5312,7 +5312,7 @@ async fn publish_agent_turn_metric(
         Ok(e) => e,
         Err(e) => {
             tracing::warn!(
-                target: "pool::metrics",
+                target: "buzz_acp::pool::metrics",
                 session_id,
                 turn_id,
                 "NIP-AM: sign failed: {e}"
@@ -5324,13 +5324,13 @@ async fn publish_agent_turn_metric(
     match tokio::time::timeout(METRIC_TIMEOUT, ctx.rest_client.submit_event(&event)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => tracing::warn!(
-            target: "pool::metrics",
+            target: "buzz_acp::pool::metrics",
             session_id,
             turn_id,
             "NIP-AM: publish failed: {e}"
         ),
         Err(_) => tracing::warn!(
-            target: "pool::metrics",
+            target: "buzz_acp::pool::metrics",
             session_id,
             turn_id,
             "NIP-AM: publish timed out"
