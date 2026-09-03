@@ -2774,7 +2774,14 @@ async fn tokio_main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("buzz_acp=info")),
+            // `pool::session` / `pool::evict` are custom targets, so they do NOT
+            // match a `buzz_acp` prefix filter — under the old default the
+            // harness logged which channels it subscribed to but never which
+            // directory a session opened in, nor which sessions were reclaimed.
+            // Those are the two questions an operator actually asks when an
+            // agent answers from the wrong project.
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("buzz_acp=info,pool=info")),
         )
         .compact()
         .init();
