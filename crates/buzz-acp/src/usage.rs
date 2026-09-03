@@ -295,6 +295,33 @@ impl StandardUsageTracker {
         self.pending_prompt = None;
     }
 
+    /// Forget a closed session's accounting state. See the same method on
+    /// [`UsageTracker`] for why an in-flight or pending session is refused.
+    pub(crate) fn remove_session(&mut self, session_id: &str) {
+        if self.in_flight_session.as_deref() == Some(session_id) {
+            debug_assert!(false, "cannot remove usage for an in-flight session");
+            return;
+        }
+        if self
+            .pending_prompt
+            .as_ref()
+            .is_some_and(|(pending, _, _)| pending == session_id)
+            || self
+                .pending_cost
+                .as_ref()
+                .is_some_and(|(pending, _)| pending == session_id)
+        {
+            debug_assert!(false, "cannot remove pending standard usage");
+            return;
+        }
+        self.sessions.remove(session_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_session(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id)
+    }
+
     /// Claude's `usage_update.cost.amount` is a raw session-cumulative total.
     pub(crate) fn record_cost(&mut self, session_id: &str, cost: f64) {
         if cost.is_finite() && cost >= 0.0 && self.in_flight_session.as_deref() == Some(session_id)
@@ -862,6 +889,39 @@ impl UsageTracker {
                 input_ever_poisoned: false,
                 output_ever_poisoned: false,
             });
+    }
+
+    /// Forget a closed session's accounting state.
+    ///
+    /// Called when the harness closes a session for real. Keeping the entry
+    /// would leak one map entry per conversation ever opened, and would let an
+    /// adapter that reuses a session ID inherit the closed generation's
+    /// counters — the next turn would then publish a delta measured against
+    /// someone else's cumulative total.
+    ///
+    /// Removing an in-flight or pending session would discard usage the current
+    /// turn is about to publish, so both are refused. The only caller closes
+    /// idle sessions, where neither holds; the guards keep this safe if that
+    /// caller set ever changes.
+    pub(crate) fn remove_session(&mut self, session_id: &str) {
+        if self.in_flight_session.as_deref() == Some(session_id) {
+            debug_assert!(false, "cannot remove usage for an in-flight session");
+            return;
+        }
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|usage| usage.session_id == session_id)
+        {
+            debug_assert!(false, "pending usage must belong to the in-flight session");
+            return;
+        }
+        self.sessions.remove(session_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn contains_session(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id)
     }
 
     /// Consume and return the most recently computed turn usage record, then

@@ -1,8 +1,19 @@
 //! MCP server construction and per-session environment stamping.
 //!
-//! Buzz's own MCP server receives the agent's signing identity. Operator-added
-//! servers never receive those credentials; they get only non-secret session
-//! context when the ACP session is created.
+//! Buzz's own MCP server is handed the agent's signing identity explicitly.
+//! Operator-added servers are not: their declared environment carries only
+//! non-secret session context, attached when the ACP session is created.
+//!
+//! ⚠️ That is a narrower guarantee than "extra servers cannot see Buzz
+//! credentials", and the difference is load-bearing. These entries describe
+//! servers that a *third-party ACP adapter* spawns on our behalf, and
+//! `AcpClient::spawn` does not `env_clear` the adapter — so the adapter
+//! inherits the harness environment, `BUZZ_PRIVATE_KEY` included, and whatever
+//! it spawns inherits from it. Declaring no environment here keeps the
+//! credential out of the *declaration*; it does not keep it out of the
+//! *process*. Closing that would mean clearing the environment at the adapter
+//! spawn boundary, which affects every adapter, not just extra MCP servers.
+//! Upstream reached the same conclusion on the same code in block/buzz#6651.
 
 use std::path::Path;
 
@@ -19,8 +30,18 @@ pub(crate) fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
         servers.push(build_buzz_mcp_server(config));
     }
 
-    // Extra servers intentionally start with an empty environment. In
-    // particular, the Buzz signing key and auth tag stay confined to buzz-mcp.
+    // Extra servers declare no environment of their own: the Buzz signing key
+    // and auth tag are never handed to them. See the module docs for what that
+    // does and does not guarantee once an adapter spawns them.
+    //
+    // Upstream is landing the same capability as `BUZZ_ACP_EXTRA_MCP_COMMANDS`
+    // (block/buzz#6651), with two things this does not have: shell-aware argv
+    // parsing, and a newline entry delimiter so a comma inside an argument
+    // survives. It is deliberately not adopted yet — the nine managed agents
+    // configure `BUZZ_ACP_MCP_EXTRA` today, so switching names is a production
+    // config change, not a code change. When that PR merges, the right move is
+    // to delete this loop and keep only `for_session` below, which upstream
+    // explicitly scoped out of the PR.
     for entry in config
         .mcp_extra
         .iter()
@@ -85,25 +106,81 @@ fn upsert_env(env: &mut Vec<EnvVar>, name: &str, value: String) {
     }
 }
 
+/// Split an entry into `(name, command)`.
+///
+/// Accepts `name=/path/to/server` and a bare `/path/to/server`, the latter named
+/// after its file stem. The explicit form exists because a derived name depends
+/// on the entry's position in the list, so reordering silently renames a server
+/// and the agent loses those tools with no error.
+///
+/// The `=` only separates when the left side is a plausible server name: ASCII
+/// alphanumeric plus `-` and `_`. Anything else is part of the command, which is
+/// what keeps a URL like `https://host/mcp/?apiKey=x` from being read as a
+/// server named `https://host/mcp/?apiKey`.
 fn parse_extra_mcp_entry(entry: &str) -> (String, String) {
     if let Some((name, command)) = entry.split_once('=') {
         let name = name.trim();
         let command = command.trim();
-        // A slash identifies a command path, where '=' is legal, rather than
-        // the optional `name=command` syntax.
-        if !name.is_empty() && !command.is_empty() && !name.contains('/') {
+        if !name.is_empty() && !command.is_empty() && is_valid_server_name(name) {
             return (name.to_string(), command.to_string());
         }
     }
     (mcp_server_name(entry), entry.to_string())
 }
 
+fn is_valid_server_name(name: &str) -> bool {
+    name.chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
+/// Name a server after its command, since the protocol wants a stable id.
+///
+/// A remote endpoint is identified by its host, not by its last path segment:
+/// that segment is usually a query string, which is both unusable as a name and
+/// frequently carries an API key — `?apiKey=secret` would put the credential in
+/// the server's name, and from there into every log line that mentions it.
+///
+/// Whatever the source, the result is reduced to the characters a name may
+/// contain, falling back to `mcp` when nothing usable is left.
 fn mcp_server_name(command: &str) -> String {
-    Path::new(command)
+    if let Some((_scheme, rest)) = command.split_once("://") {
+        let host = rest
+            .split(['/', '?', '#'])
+            .next()
+            .unwrap_or_default()
+            // Strip userinfo, which is another place a credential hides.
+            .rsplit('@')
+            .next()
+            .unwrap_or_default();
+        let host = sanitize_server_name(host);
+        if !host.is_empty() {
+            return host;
+        }
+    }
+    let stem = Path::new(command)
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .unwrap_or("mcp")
-        .to_string()
+        .unwrap_or_default();
+    let stem = sanitize_server_name(stem);
+    if stem.is_empty() {
+        "mcp".to_string()
+    } else {
+        stem
+    }
+}
+
+/// Reduce a derived name to `is_valid_server_name`'s alphabet, collapsing runs
+/// of rejected characters into a single `-`.
+fn sanitize_server_name(raw: &str) -> String {
+    let mut name = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        if c.is_ascii_alphanumeric() || c == '_' {
+            name.push(c);
+        } else if !name.ends_with('-') {
+            name.push('-');
+        }
+    }
+    name.trim_matches('-').to_string()
 }
 
 fn build_buzz_mcp_server(config: &Config) -> McpServer {
@@ -172,6 +249,89 @@ mod tests {
             parse_extra_mcp_entry("/opt/a=b/server.js"),
             ("server".into(), "/opt/a=b/server.js".into())
         );
+    }
+
+    /// A remote MCP endpoint carries `=` inside a query parameter. Reading that
+    /// as `name=command` would name the server after half a URL and truncate
+    /// the command to the key's value.
+    #[test]
+    fn a_url_with_equals_in_a_query_param_is_not_a_name_prefix() {
+        let url = "https://mcp.example.com/mcp/?apiKey=test-key";
+        let (name, command) = parse_extra_mcp_entry(url);
+        assert_eq!(command, url, "the whole URL is the command");
+        assert_eq!(name, "mcp-example-com", "named after the host");
+    }
+
+    /// The derived name reaches logs and telemetry, so it must not be able to
+    /// carry a secret — and the last path segment of an MCP URL routinely is
+    /// one.
+    #[test]
+    fn a_derived_name_never_carries_url_credentials() {
+        for (url, expected) in [
+            (
+                "https://mcp.example.com/mcp/?apiKey=super-secret",
+                "mcp-example-com",
+            ),
+            (
+                "https://user:super-secret@mcp.example.com/mcp",
+                "mcp-example-com",
+            ),
+            (
+                "http://127.0.0.1:8080/mcp?token=super-secret",
+                "127-0-0-1-8080",
+            ),
+        ] {
+            let (name, _) = parse_extra_mcp_entry(url);
+            assert_eq!(name, expected, "for {url}");
+            assert!(
+                !name.contains("super-secret"),
+                "{url} leaked its credential into the server name: {name}"
+            );
+            assert!(
+                is_valid_server_name(&name),
+                "{url} derived a name the explicit syntax would reject: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_local_path_is_still_named_after_its_file_stem() {
+        assert_eq!(
+            mcp_server_name("/opt/tools/hindsight-mcp.js"),
+            "hindsight-mcp"
+        );
+        assert_eq!(mcp_server_name(""), "mcp", "nothing usable falls back");
+    }
+
+    /// An explicit name is what makes a server's identity independent of its
+    /// position in the list: a derived name shifts when entries are reordered,
+    /// silently renaming the server and taking its tools away from the agent.
+    #[test]
+    fn explicit_names_are_stable_across_reordering() {
+        let memory = "memory=/opt/memory-mcp.js";
+        let search = "search=/opt/search-mcp.js";
+        let forward = [parse_extra_mcp_entry(memory), parse_extra_mcp_entry(search)];
+        let reversed = [parse_extra_mcp_entry(search), parse_extra_mcp_entry(memory)];
+        assert_eq!(forward[0].0, "memory");
+        assert_eq!(forward[1].0, "search");
+        assert_eq!(reversed[0].0, "search");
+        assert_eq!(reversed[1].0, "memory");
+    }
+
+    #[test]
+    fn a_left_side_that_cannot_be_a_server_name_stays_part_of_the_command() {
+        for entry in [
+            "not a name=/opt/server.js",
+            "quote\"=/opt/server.js",
+            "a/b=/opt/server.js",
+        ] {
+            let (name, command) = parse_extra_mcp_entry(entry);
+            assert_eq!(command, entry, "{entry} must be taken whole as a command");
+            assert!(
+                !name.contains('=') && !name.contains('/'),
+                "{entry} derived an unusable name: {name}"
+            );
+        }
     }
 
     #[test]
