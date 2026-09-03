@@ -2483,14 +2483,11 @@ async fn tokio_main() -> Result<()> {
 
     tracing_subscriber::fmt()
         .with_env_filter(
-            // `pool::session` / `pool::evict` are custom targets, so they do NOT
-            // match a `buzz_acp` prefix filter — under the old default the
-            // harness logged which channels it subscribed to but never which
-            // directory a session opened in, nor which sessions were reclaimed.
-            // Those are the two questions an operator actually asks when an
-            // agent answers from the wrong project.
-            EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| EnvFilter::new("buzz_acp=info,pool=info")),
+            // Session and eviction decisions log under `buzz_acp::pool::*` rather
+            // than a bare `pool::*` target, so they survive this filter — and
+            // the `RUST_LOG=buzz_acp=info` that Buzz Desktop injects, which
+            // overrides whatever default is set here. See `pool.rs`.
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("buzz_acp=info")),
         )
         .compact()
         .init();
@@ -4598,6 +4595,18 @@ fn note_self_published(queue: &mut EventQueue, channel_id: Uuid, kind: u32, even
     // agent's own bookkeeping; counting them would settle a steer the user
     // never received a reply to.
     if kind != KIND_STREAM_MESSAGE {
+        return;
+    }
+    // An empty message is not an answer either. Observed in production on
+    // 2026-09-03: a Codex turn published a blank message and then said
+    // "correcting the previous message, which came out empty". Counting that
+    // would settle a steered mention against a message nobody could read —
+    // and the settled event is dropped, so the question would be gone.
+    if event.content.trim().is_empty() {
+        tracing::debug!(
+            channel_id = %channel_id,
+            "ignoring self-published empty message for steer settlement"
+        );
         return;
     }
     queue.note_published_message(scope::SessionScope::Conversation { channel_id });
@@ -11402,6 +11411,25 @@ mod self_published_accounting_tests {
     /// Reactions and other self-authored events are the agent's own
     /// bookkeeping. Counting them would settle a mention the user never got an
     /// answer to — the exact failure the ledger exists to prevent.
+    /// Seen in production: a turn published a blank message and then corrected
+    /// itself. Crediting that would settle the steered mention — and a settled
+    /// event is dropped, so the user's question would be gone for good.
+    #[test]
+    fn an_empty_message_credits_nothing() {
+        let channel_id = Uuid::new_v4();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+
+        assert!(
+            !steer_was_settled_by(&mut queue, &conv(channel_id), |queue| {
+                let blank = EventBuilder::new(Kind::Custom(9), "   \n  ")
+                    .sign_with_keys(&Keys::generate())
+                    .expect("sign blank event");
+                note_self_published(queue, channel_id, KIND_STREAM_MESSAGE, &blank);
+            }),
+            "a blank message must leave the mention owed"
+        );
+    }
+
     #[test]
     fn a_non_message_event_credits_nothing() {
         let channel_id = Uuid::new_v4();

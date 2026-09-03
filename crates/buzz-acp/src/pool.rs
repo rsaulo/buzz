@@ -46,6 +46,17 @@ use crate::relay::{ChannelInfo, RestClient};
 use crate::scope::SessionScope;
 use crate::session_workspace::{SessionCwdDecision, SessionCwdResolver};
 
+// Session and eviction decisions log under `buzz_acp::pool::session` and
+// `buzz_acp::pool::evict`, not a bare `pool::*`.
+//
+// The prefix is load-bearing, not decoration: `EnvFilter` matches targets by
+// `::`-separated prefix, so a bare `pool::session` is invisible under any
+// `buzz_acp` filter — including the `RUST_LOG=buzz_acp=info` that Buzz Desktop
+// injects into every managed agent, which overrides the harness default. With a
+// bare target the log could say which channels an agent subscribed to but never
+// which directory a session opened in, which is the one question worth asking
+// when an agent answers from the wrong project.
+
 /// Window within which agent activity before a hard-cap death qualifies
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
 const RECENT_ACTIVITY_WINDOW: Duration = Duration::from_secs(60);
@@ -497,14 +508,14 @@ async fn evict_idle_sessions_with_budget(
         if !agent.session_close_supported {
             if !retired.is_empty() {
                 tracing::warn!(
-                    target: "pool::evict",
+                    target: "buzz_acp::pool::evict",
                     agent = agent.index,
                     retired = retired.len(),
                     "adapter cannot close retired sessions; process replacement required"
                 );
             } else if !victims.is_empty() {
                 tracing::debug!(
-                    target: "pool::evict",
+                    target: "buzz_acp::pool::evict",
                     agent = agent.index,
                     candidates = victims.len(),
                     "adapter cannot close sessions — skipping eviction"
@@ -555,7 +566,7 @@ async fn evict_idle_sessions_with_budget(
                         CloseCandidate::Retired(session_id) => {
                             agent.state.retired_sessions.remove(&session_id);
                             tracing::info!(
-                                target: "pool::evict",
+                                target: "buzz_acp::pool::evict",
                                 agent = agent.index,
                                 session_id = %session_id,
                                 "closed retired session"
@@ -564,7 +575,7 @@ async fn evict_idle_sessions_with_budget(
                         CloseCandidate::Live(scope, session_id) => {
                             agent.state.forget_closed_session(&scope);
                             tracing::info!(
-                                target: "pool::evict",
+                                target: "buzz_acp::pool::evict",
                                 agent = agent.index,
                                 scope = %scope.telemetry_label(),
                                 session_id = %session_id,
@@ -577,7 +588,7 @@ async fn evict_idle_sessions_with_budget(
                     closed += 1;
                 }
                 Ok(Err(error)) => tracing::warn!(
-                    target: "pool::evict",
+                    target: "buzz_acp::pool::evict",
                     agent = agent.index,
                     scope = ?live_scope.as_ref().map(SessionScope::telemetry_label),
                     session_id,
@@ -585,7 +596,7 @@ async fn evict_idle_sessions_with_budget(
                     "session close failed; keeping state to retry next sweep"
                 ),
                 Err(_) => tracing::warn!(
-                    target: "pool::evict",
+                    target: "buzz_acp::pool::evict",
                     agent = agent.index,
                     scope = ?live_scope.as_ref().map(SessionScope::telemetry_label),
                     session_id,
@@ -1181,7 +1192,7 @@ impl AgentPool {
             .take()
             .expect("selected occupied agent slot");
         tracing::warn!(
-            target: "pool::evict",
+            target: "buzz_acp::pool::evict",
             agent = index,
             retired = agent.state.retired_sessions.len(),
             "replacing adapter process to reclaim uncloseable sessions"
@@ -1579,7 +1590,7 @@ struct NewSessionChannelContext<'a> {
 /// eviction sweep, which closes it like any other retired session.
 fn retire_unusable_session(agent: &mut OwnedAgent, session_id: &str, error: AcpError) -> AcpError {
     tracing::warn!(
-        target: "pool::session",
+        target: "buzz_acp::pool::session",
         agent = agent.index,
         session_id,
         error = %error,
@@ -1662,7 +1673,7 @@ async fn create_session_and_apply_model(
                 Err(AcpError::AgentError { code: -32601, .. }) => {
                     agent.goose_system_prompt_supported = Some(false);
                     tracing::warn!(
-                        target: "pool::session",
+                        target: "buzz_acp::pool::session",
                         "Goose does not support its system-prompt extension; using user-message framing"
                     );
                 }
@@ -2596,7 +2607,7 @@ pub async fn run_prompt_task(
             } else {
                 if agent.state.sessions.contains_key(scope) {
                     tracing::warn!(
-                        target: "pool::session",
+                        target: "buzz_acp::pool::session",
                         scope = %scope.telemetry_label(),
                         "session missing its cwd decision; rotating before prompt"
                     );
@@ -2605,7 +2616,7 @@ pub async fn run_prompt_task(
                 let workspace = match ctx.session_cwd.resolve_channel(cid) {
                     SessionCwdDecision::Pinned(path) => {
                         tracing::info!(
-                            target: "pool::session",
+                            target: "buzz_acp::pool::session",
                             channel = %cid,
                             cwd = %path.display(),
                             decision = "pinned",
@@ -2615,7 +2626,7 @@ pub async fn run_prompt_task(
                     }
                     SessionCwdDecision::Workspace(path) => {
                         tracing::info!(
-                            target: "pool::session",
+                            target: "buzz_acp::pool::session",
                             channel = %cid,
                             cwd = %path.display(),
                             decision = "workspace",
@@ -2625,7 +2636,7 @@ pub async fn run_prompt_task(
                     }
                     SessionCwdDecision::RootMode(path) => {
                         tracing::info!(
-                            target: "pool::session",
+                            target: "buzz_acp::pool::session",
                             channel = %cid,
                             cwd = %path.display(),
                             decision = "root_mode",
@@ -2635,7 +2646,7 @@ pub async fn run_prompt_task(
                     }
                     SessionCwdDecision::Refused(reason) => {
                         tracing::error!(
-                            target: "pool::session",
+                            target: "buzz_acp::pool::session",
                             channel = %cid,
                             reason = %reason,
                             "channel session working directory refused"
@@ -2683,7 +2694,7 @@ pub async fn run_prompt_task(
                 {
                     Ok(sid) => {
                         tracing::info!(
-                            target: "pool::session",
+                            target: "buzz_acp::pool::session",
                             "created session {sid} for channel {cid} (scope {})",
                             scope.telemetry_label()
                         );
@@ -2759,7 +2770,7 @@ pub async fn run_prompt_task(
                 {
                     Ok(sid) => {
                         tracing::info!(
-                            target: "pool::session",
+                            target: "buzz_acp::pool::session",
                             "created heartbeat session {sid} for agent {}",
                             agent.index
                         );
@@ -2821,7 +2832,7 @@ pub async fn run_prompt_task(
         }),
     );
     tracing::debug!(
-        target: "pool::session",
+        target: "buzz_acp::pool::session",
         session_id,
         cwd = %session_workspace.display(),
         "using session working directory"
@@ -2860,7 +2871,7 @@ pub async fn run_prompt_task(
         {
             let cid = &scope.channel_id();
             tracing::info!(
-                target: "pool::session",
+                target: "buzz_acp::pool::session",
                 "sending initial_message to session {session_id} for channel {cid}"
             );
             let init_msg = prepend_standing_for_legacy(
@@ -2885,7 +2896,7 @@ pub async fn run_prompt_task(
             match init_result {
                 Ok(stop_reason) => {
                     tracing::info!(
-                        target: "pool::session",
+                        target: "buzz_acp::pool::session",
                         "initial_message complete for channel {cid}: {stop_reason:?}"
                     );
                     // The legacy agent has its standing context now; the turn
@@ -2921,7 +2932,7 @@ pub async fn run_prompt_task(
                 }
                 Err(AcpError::IdleTimeout(_)) => {
                     tracing::warn!(
-                        target: "pool::session",
+                        target: "buzz_acp::pool::session",
                         "initial_message idle timeout ({}s) for channel {cid} — cancelling",
                         ctx.idle_timeout.as_secs()
                     );
@@ -2957,7 +2968,7 @@ pub async fn run_prompt_task(
                         }
                         Err(e) => {
                             tracing::error!(
-                                target: "pool::session",
+                                target: "buzz_acp::pool::session",
                                 "cancel_with_cleanup failed during initial_message timeout: {e}"
                             );
                             agent.state.invalidate(&source);
@@ -2976,7 +2987,7 @@ pub async fn run_prompt_task(
                 Err(AcpError::HardTimeout { silence }) => {
                     let recently_active = silence < RECENT_ACTIVITY_WINDOW;
                     tracing::error!(
-                        target: "pool::session",
+                        target: "buzz_acp::pool::session",
                         "hard timeout ({}s cap, silence {silence:?}, recently_active={recently_active}) during initial_message for channel {cid} — agent process is unrecoverable",
                         ctx.max_turn_duration.as_secs()
                     );
@@ -2993,7 +3004,7 @@ pub async fn run_prompt_task(
                 }
                 Err(e) => {
                     tracing::error!(
-                        target: "pool::session",
+                        target: "buzz_acp::pool::session",
                         "initial_message failed for channel {cid}: {e} — invalidating session"
                     );
                     agent.state.invalidate(&source);
@@ -3418,7 +3429,7 @@ pub async fn run_prompt_task(
 
             if should_rotate {
                 tracing::info!(
-                    target: "pool::session",
+                    target: "buzz_acp::pool::session",
                     "rotating session for {source:?} after {stop_reason:?}",
                 );
                 agent.state.invalidate(&source);
