@@ -1,9 +1,11 @@
 #![deny(unsafe_code)]
 
 mod acp;
+mod agent_isolation;
 mod config;
 mod engram_fetch;
 mod filter;
+mod mcp_config;
 mod observer;
 mod pool;
 mod pool_lifecycle;
@@ -12,8 +14,10 @@ mod prompt_project;
 mod queue;
 mod relay;
 mod scope;
+mod session_workspace;
 mod setup_mode;
 mod usage;
+mod workspace_index;
 
 pub use usage::TurnUsage;
 
@@ -21,8 +25,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 
-use acp::{AcpClient, EnvVar, McpServer};
-use anyhow::{ensure, Context, Result};
+use acp::{AcpClient, McpServer};
+use anyhow::Result;
 use buzz_core::kind::{
     KIND_MEMBER_ADDED_NOTIFICATION, KIND_MEMBER_REMOVED_NOTIFICATION, KIND_STREAM_MESSAGE,
     KIND_STREAM_REMINDER, KIND_WORKFLOW_APPROVAL_REQUESTED,
@@ -38,7 +42,7 @@ use config::{
 };
 use filter::SubscriptionRule;
 use futures_util::FutureExt;
-use nostr::{PublicKey, ToBech32};
+use nostr::PublicKey;
 use pool::{
     AgentPool, ControlSignal, IdleSwitchResult, OwnedAgent, PromptContext, PromptOutcome,
     PromptResult, PromptSource, SessionState, TimeoutKind,
@@ -68,22 +72,6 @@ const MODELS_TIMEOUT: Duration = Duration::from_secs(10);
 /// Timeout for `buzz-acp authenticate`. Browser-based vendor auth can require
 /// human interaction, so it must not share the short probe timeout.
 const AUTHENTICATE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
-
-/// Resolve the process working directory for ACP session metadata and prompts.
-///
-/// `std::env::current_dir()` returns an absolute path on every supported
-/// platform. Keep the explicit invariant check so a future source cannot
-/// silently introduce a relative path, and surface resolution failures instead
-/// of substituting a misleading Unix-specific fallback.
-fn current_working_directory() -> Result<String> {
-    let cwd = std::env::current_dir().context("failed to resolve current working directory")?;
-    ensure!(
-        cwd.is_absolute(),
-        "current working directory is not absolute: {}",
-        cwd.display()
-    );
-    Ok(cwd.to_string_lossy().into_owned())
-}
 
 /// Publish a kind:20001 presence update event via the WebSocket connection.
 ///
@@ -2759,7 +2747,19 @@ async fn tokio_main() -> Result<()> {
     }
 
     let base_prompt_content = config.base_prompt_content.take();
-    let cwd = current_working_directory()?;
+    let startup_cwds = session_workspace::resolve_startup_cwds()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let workspace_index = workspace_index::WorkspaceIndex::from_env();
+    if let Some(path) = &startup_cwds.pinned {
+        tracing::info!(cwd = %path.display(), "channel sessions pinned by AGENT_CWD");
+    } else {
+        tracing::info!(
+            process_cwd = %startup_cwds.process.display(),
+            repositories = workspace_index.repository_count(),
+            channels = workspace_index.channel_count(),
+            "channel sessions use local workspace resolution"
+        );
+    }
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
@@ -2785,7 +2785,11 @@ async fn tokio_main() -> Result<()> {
             )
         },
         heartbeat_prompt: config.heartbeat_prompt.clone(),
-        cwd,
+        session_cwd: session_workspace::SessionCwdResolver::new(
+            startup_cwds,
+            workspace_index,
+            config.unindexed_channel_policy,
+        ),
         rest_client: relay.rest_client(),
         channel_info: pool::ChannelInfoResolver::new(channel_info_map, relay.rest_client()),
         context_message_limit: config.context_message_limit,
@@ -3035,10 +3039,13 @@ async fn tokio_main() -> Result<()> {
                 let args = config.agent_args.clone();
                 let env = config.persona_env_vars.clone();
                 let has_codex = config.has_generated_codex_config;
+                let isolate_claude = config.claude_isolate_user_config;
                 let observer = observer.clone();
                 let guard = RespawnGuard::new(idx, respawn_tx.clone());
                 respawn_tasks.spawn(async move {
-                    let result = spawn_and_init(&cmd, &args, &env, has_codex, idx, observer).await;
+                    let result =
+                        spawn_and_init(&cmd, &args, &env, has_codex, isolate_claude, idx, observer)
+                            .await;
                     guard.send(result);
                 });
             }
@@ -5023,12 +5030,14 @@ fn recover_panicked_agent(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let isolate_claude = config.claude_isolate_user_config;
     let guard = RespawnGuard::new(i, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         if !delay.is_zero() {
             tokio::time::sleep(delay).await;
         }
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, i, observer).await;
+        let result =
+            spawn_and_init(&cmd, &args, &env, has_codex, isolate_claude, i, observer).await;
         guard.send(result);
     });
 }
@@ -5251,6 +5260,7 @@ fn spawn_respawn_task(
     let args = config.agent_args.clone();
     let env = config.persona_env_vars.clone();
     let has_codex = config.has_generated_codex_config;
+    let isolate_claude = config.claude_isolate_user_config;
     let guard = RespawnGuard::new(index, respawn_tx.clone());
     respawn_tasks.spawn(async move {
         // Shutdown old agent (reap child, prevent zombie).
@@ -5262,7 +5272,16 @@ fn spawn_respawn_task(
             tokio::time::sleep(delay).await;
         }
 
-        let result = spawn_and_init(&cmd, &args, &env, has_codex, index, observer).await;
+        let result = spawn_and_init(
+            &cmd,
+            &args,
+            &env,
+            has_codex,
+            isolate_claude,
+            index,
+            observer,
+        )
+        .await;
         guard.send(result);
     });
 
@@ -5306,6 +5325,7 @@ struct PoolStartup {
     args: Vec<String>,
     extra_env: Vec<(String, String)>,
     has_generated_codex_config: bool,
+    isolate_claude_user_config: bool,
     model: Option<String>,
     effort_level: Option<String>,
     observer: Option<observer::ObserverHandle>,
@@ -5319,6 +5339,7 @@ impl PoolStartup {
             args: config.agent_args.clone(),
             extra_env: config.persona_env_vars.clone(),
             has_generated_codex_config: config.has_generated_codex_config,
+            isolate_claude_user_config: config.claude_isolate_user_config,
             model: config.model.clone(),
             effort_level: config.effort_level.clone(),
             observer,
@@ -5381,6 +5402,10 @@ async fn initialize_agent_pool(
                             }),
                         );
                         let agent_name = normalized_agent_name(&init_result);
+                        acp.set_session_meta_options(agent_isolation::session_meta_options(
+                            &agent_name,
+                            startup.isolate_claude_user_config,
+                        ));
                         agent_slots.push(Some(OwnedAgent {
                             index: i,
                             acp,
@@ -5442,6 +5467,7 @@ async fn spawn_and_init(
     args: &[String],
     extra_env: &[(String, String)],
     has_generated_codex_config: bool,
+    isolate_claude_user_config: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
 ) -> Result<(AcpClient, u32, String)> {
@@ -5462,6 +5488,13 @@ async fn spawn_and_init(
                 }),
             );
             let agent_name = normalized_agent_name(&init_result);
+            // Adapter identity is only known now, and it is fixed for the life
+            // of this process — so the isolation decision is made once here
+            // rather than re-derived at every session/new.
+            acp.set_session_meta_options(agent_isolation::session_meta_options(
+                &agent_name,
+                isolate_claude_user_config,
+            ));
             Ok((acp, protocol_version, agent_name))
         }
         Err(e) => {
@@ -5598,7 +5631,13 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
     use acp::{extract_model_config_options, extract_model_state};
 
     let agent_args = config::normalize_agent_args(&args.agent.agent_command, args.agent.agent_args);
-    let cwd = current_working_directory()?;
+    let startup_cwds = session_workspace::resolve_startup_cwds()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let cwd = startup_cwds
+        .pinned
+        .unwrap_or(startup_cwds.process)
+        .to_string_lossy()
+        .into_owned();
 
     // Spawn outside the timeout so we always own the child for cleanup.
     // `models` subcommand doesn't use persona packs — no extra env, no codex config.
@@ -5728,60 +5767,7 @@ async fn run_models(args: ModelsArgs) -> Result<()> {
 }
 
 fn build_mcp_servers(config: &Config) -> Vec<McpServer> {
-    if config.mcp_command.is_empty() {
-        return vec![];
-    }
-    vec![McpServer {
-        name: std::path::Path::new(&config.mcp_command)
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("mcp")
-            .to_string(),
-        command: config.mcp_command.clone(),
-        args: vec![],
-        env: {
-            let mut env = vec![
-                EnvVar {
-                    name: "BUZZ_RELAY_URL".into(),
-                    value: config.relay_url.clone(),
-                },
-                EnvVar {
-                    name: "BUZZ_PRIVATE_KEY".into(),
-                    // bech32 encoding of a valid secret key is infallible.
-                    // Panic here is correct: injecting a bogus secret would cause
-                    // delayed, hard-to-diagnose agent failures downstream.
-                    value: config
-                        .keys
-                        .secret_key()
-                        .to_bech32()
-                        .expect("secret key bech32 encoding should never fail"),
-                },
-            ];
-            // Forward BUZZ_AUTH_TAG (NIP-OA owner attestation credential)
-            // so the MCP server can attach it to every signed event.
-            if let Ok(auth_tag) = std::env::var("BUZZ_AUTH_TAG") {
-                if !auth_tag.is_empty() {
-                    env.push(EnvVar {
-                        name: "BUZZ_AUTH_TAG".into(),
-                        value: auth_tag,
-                    });
-                }
-            }
-            // Forward the agent's display name so dev-mcp can use it as the git
-            // author name instead of the raw npub. Read from the process env
-            // rather than Config: this is a pass-through of a contract owned
-            // upstream, and absent simply means dev-mcp falls back to the npub.
-            if let Ok(display_name) = std::env::var("BUZZ_ACP_DISPLAY_NAME") {
-                if !display_name.is_empty() {
-                    env.push(EnvVar {
-                        name: "BUZZ_ACP_DISPLAY_NAME".into(),
-                        value: display_name,
-                    });
-                }
-            }
-            env
-        },
-    }]
+    mcp_config::build_mcp_servers(config)
 }
 
 #[cfg(test)]
@@ -8897,6 +8883,7 @@ mod build_mcp_servers_tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "test-mcp-server".into(),
+            mcp_extra: Vec::new(),
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -8909,6 +8896,7 @@ mod build_mcp_servers_tests {
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
+            unindexed_channel_policy: config::UnindexedChannelPolicy::Refuse,
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,
@@ -8923,6 +8911,7 @@ mod build_mcp_servers_tests {
             model: None,
             effort_level: None,
             session_title: None,
+            claude_isolate_user_config: true,
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: std::collections::HashSet::new(),
@@ -9064,6 +9053,21 @@ mod build_mcp_servers_tests {
     }
 
     #[test]
+    fn extra_mcp_server_is_appended_without_buzz_credentials() {
+        let mut config = test_config();
+        config.mcp_extra = vec!["hindsight=/opt/hindsight-mcp.js".into()];
+        let servers = build_mcp_servers(&config);
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].name, "test-mcp-server");
+        assert_eq!(servers[1].name, "hindsight");
+        assert_eq!(servers[1].command, "/opt/hindsight-mcp.js");
+        assert!(
+            servers[1].env.is_empty(),
+            "operator MCP must not receive Buzz credentials before session stamping"
+        );
+    }
+
+    #[test]
     fn mcp_command_with_no_stem_falls_back_to_mcp() {
         // Path::new("").file_stem() returns None — exercises the unwrap_or("mcp") path.
         let mut config = test_config();
@@ -9123,6 +9127,7 @@ mod error_outcome_emission_tests {
             agent_command: "true".into(),
             agent_args: vec![],
             mcp_command: "test-mcp-server".into(),
+            mcp_extra: Vec::new(),
             idle_timeout_secs: config::DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: config::DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -9135,6 +9140,7 @@ mod error_outcome_emission_tests {
             subscribe_mode: config::SubscribeMode::All,
             dedup_mode: config::DedupMode::Queue,
             session_policy: scope::SessionPolicy::Channel,
+            unindexed_channel_policy: config::UnindexedChannelPolicy::Refuse,
             multiple_event_handling: config::MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,
@@ -9149,6 +9155,7 @@ mod error_outcome_emission_tests {
             model: None,
             effort_level: None,
             session_title: None,
+            claude_isolate_user_config: true,
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
