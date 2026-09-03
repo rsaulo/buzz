@@ -60,6 +60,15 @@ pub enum DedupMode {
     Queue,
 }
 
+/// Policy for channels absent from the local workspace index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum UnindexedChannelPolicy {
+    /// Refuse to create a session outside a declared workspace.
+    Refuse,
+    /// Explicitly allow the harness process directory as the session cwd.
+    Root,
+}
+
 /// How to handle new @mentions while a turn is already in-flight for that channel.
 #[derive(Debug, Clone, Copy, PartialEq, clap::ValueEnum)]
 pub enum MultipleEventHandling {
@@ -267,6 +276,16 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_MCP_COMMAND", default_value = "")]
     pub mcp_command: String,
 
+    /// Additional MCP servers, comma-separated, each `name=/path` or `/path`.
+    /// They receive no Buzz identity credentials.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_MCP_EXTRA",
+        default_value = "",
+        value_delimiter = ','
+    )]
+    pub mcp_extra: Vec<String>,
+
     /// Idle timeout: max seconds of silence before killing a turn.
     /// Resets on any agent stdout activity.
     #[arg(long, env = "BUZZ_ACP_IDLE_TIMEOUT")]
@@ -363,6 +382,15 @@ pub struct CliArgs {
     )]
     pub session_policy: crate::scope::SessionPolicy,
 
+    /// Policy for channels not declared by a local `.buzz/workspace.json`.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_UNINDEXED_CHANNEL_POLICY",
+        default_value = "refuse",
+        value_enum
+    )]
+    pub unindexed_channel_policy: UnindexedChannelPolicy,
+
     /// How to handle new @mentions while a turn is already in-flight.
     /// steer (default): cancel+re-prompt, framing the new mention as a message
     /// that arrived mid-task — the agent keeps working and weaves it in.
@@ -456,6 +484,16 @@ pub struct CliArgs {
     #[arg(long, env = "BUZZ_ACP_SESSION_TITLE")]
     pub session_title: Option<String>,
 
+    /// Isolate Claude ACP sessions from user-scoped settings, hooks, MCP
+    /// servers, and personal instructions. Project and local settings remain.
+    #[arg(
+        long,
+        env = "BUZZ_ACP_CLAUDE_ISOLATE_USER_CONFIG",
+        default_value_t = true,
+        action = clap::ArgAction::Set
+    )]
+    pub claude_isolate_user_config: bool,
+
     /// Permission mode for agents that support `session/set_config_option`
     /// with `configId: "mode"` (e.g. `claude-agent-acp`).
     ///
@@ -543,6 +581,7 @@ pub struct Config {
     pub agent_command: String,
     pub agent_args: Vec<String>,
     pub mcp_command: String,
+    pub mcp_extra: Vec<String>,
     pub idle_timeout_secs: u64,
     pub max_turn_duration_secs: u64,
     pub agents: u32,
@@ -560,6 +599,7 @@ pub struct Config {
     pub dedup_mode: DedupMode,
     /// How ACP provider sessions are scoped in channels (channel vs thread).
     pub session_policy: crate::scope::SessionPolicy,
+    pub unindexed_channel_policy: UnindexedChannelPolicy,
     pub multiple_event_handling: MultipleEventHandling,
     pub ignore_self: bool,
     pub kinds_override: Option<Vec<u32>>,
@@ -587,6 +627,9 @@ pub struct Config {
     /// Sanitized session title, sent as `_meta.sessionTitle` on `session/new`.
     /// `None` when unset or when the configured value sanitized to empty.
     pub session_title: Option<String>,
+    /// Whether Claude ACP sessions exclude user-scoped settings, hooks, MCP
+    /// servers, and personal instructions. Enabled by default.
+    pub claude_isolate_user_config: bool,
     /// Permission mode to apply after session creation. `Default` = skip.
     pub permission_mode: PermissionMode,
     /// Inbound author gate mode.
@@ -811,7 +854,7 @@ fn default_agent_args(command: &str) -> Option<Vec<String>> {
 pub(crate) fn default_agent_env(command: &str) -> &'static [(&'static str, &'static str)] {
     match normalize_agent_command_identity(command).as_str() {
         "hermes" | "hermes-agent" | "hermes-acp" => &[("HERMES_ACP_SKIP_CONFIGURED_MCP", "1")],
-        _ => &[],
+        identity => crate::agent_isolation::command_env_defaults(identity),
     }
 }
 
@@ -1156,6 +1199,7 @@ impl Config {
             agent_command,
             agent_args,
             mcp_command: args.mcp_command,
+            mcp_extra: args.mcp_extra,
             idle_timeout_secs,
             max_turn_duration_secs,
             agents: args.agents,
@@ -1173,6 +1217,7 @@ impl Config {
             subscribe_mode: args.subscribe,
             dedup_mode: args.dedup,
             session_policy: args.session_policy,
+            unindexed_channel_policy: args.unindexed_channel_policy,
             multiple_event_handling: args.multiple_event_handling,
             ignore_self: !args.no_ignore_self,
             kinds_override: args.kinds,
@@ -1190,6 +1235,7 @@ impl Config {
                 .session_title
                 .as_deref()
                 .and_then(sanitize_session_title),
+            claude_isolate_user_config: args.claude_isolate_user_config,
             permission_mode: args.permission_mode,
             respond_to: args.respond_to,
             respond_to_allowlist,
@@ -1225,7 +1271,7 @@ impl Config {
             format!(" allowed_respond_to=[{}]", modes.join(","))
         };
         format!(
-            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} permission_mode={} {}{}",
+            "relay={} pubkey={} agent_cmd={} {} mcp_cmd={} idle_timeout={}s max_turn={}s agents={} heartbeat={}s subscribe={:?} dedup={:?} session_policy={} unindexed_channel_policy={:?} meh={:?} ignore_self={} context_limit={} max_turns_per_session={} presence={} typing={} memory={} model={} claude_isolate_user_config={} permission_mode={} {}{}",
             self.relay_url,
             self.keys.public_key().to_hex(),
             self.agent_command,
@@ -1238,6 +1284,7 @@ impl Config {
             self.subscribe_mode,
             self.dedup_mode,
             self.session_policy,
+            self.unindexed_channel_policy,
             self.multiple_event_handling,
             self.ignore_self,
             self.context_message_limit,
@@ -1246,6 +1293,7 @@ impl Config {
             self.typing_enabled,
             self.memory_enabled,
             self.model.as_deref().unwrap_or("(agent default)"),
+            self.claude_isolate_user_config,
             self.permission_mode,
             respond_to_detail,
             allowed_respond_to_detail,
@@ -1540,6 +1588,7 @@ mod tests {
             agent_command: "goose".into(),
             agent_args: vec!["acp".into()],
             mcp_command: "".into(),
+            mcp_extra: Vec::new(),
             idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
             max_turn_duration_secs: DEFAULT_MAX_TURN_DURATION_SECS,
             agents: 1,
@@ -1552,6 +1601,7 @@ mod tests {
             subscribe_mode: mode,
             dedup_mode: DedupMode::Queue,
             session_policy: crate::scope::SessionPolicy::Channel,
+            unindexed_channel_policy: UnindexedChannelPolicy::Refuse,
             multiple_event_handling: MultipleEventHandling::Queue,
             ignore_self: true,
             kinds_override: None,
@@ -1566,6 +1616,7 @@ mod tests {
             model: None,
             effort_level: None,
             session_title: None,
+            claude_isolate_user_config: true,
             permission_mode: PermissionMode::BypassPermissions,
             respond_to: RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
@@ -1755,7 +1806,9 @@ mod tests {
                 "unexpected env defaults for {command}"
             );
         }
-        for command in ["goose", "codex-acp", "claude-agent-acp", "buzz-agent", ""] {
+        // Claude has its own defaults — see
+        // `default_agent_env_recognizes_claude_identities_by_command_path`.
+        for command in ["goose", "codex-acp", "buzz-agent", ""] {
             assert!(
                 default_agent_env(command).is_empty(),
                 "non-Hermes command must have no env defaults: {command}"
@@ -2716,6 +2769,91 @@ channels = "ALL"
         ]);
         assert_eq!(args.session_policy, crate::scope::SessionPolicy::Thread);
         assert_eq!(args.session_policy.to_string(), "thread");
+    }
+
+    #[test]
+    fn unindexed_channel_policy_defaults_closed_and_accepts_root_opt_in() {
+        let default = CliArgs::parse_from(["buzz-acp", "--private-key", &"0".repeat(64)]);
+        assert_eq!(
+            default.unindexed_channel_policy,
+            UnindexedChannelPolicy::Refuse
+        );
+
+        let root = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &"0".repeat(64),
+            "--unindexed-channel-policy=root",
+        ]);
+        assert_eq!(root.unindexed_channel_policy, UnindexedChannelPolicy::Root);
+    }
+
+    #[test]
+    fn extra_mcp_entries_parse_without_replacing_primary_server() {
+        let args = CliArgs::parse_from([
+            "buzz-acp",
+            "--private-key",
+            &"0".repeat(64),
+            "--mcp-command=/opt/buzz-mcp",
+            "--mcp-extra=hindsight=/opt/hindsight.js,/opt/other-mcp",
+        ]);
+        assert_eq!(args.mcp_command, "/opt/buzz-mcp");
+        assert_eq!(
+            args.mcp_extra,
+            ["hindsight=/opt/hindsight.js", "/opt/other-mcp"]
+        );
+    }
+
+    // ── Claude user-config isolation ──────────────────────────────────────────
+
+    #[test]
+    fn claude_user_config_isolation_defaults_on_and_can_be_disabled() {
+        let key = "0".repeat(64);
+        assert!(
+            CliArgs::parse_from(["buzz-acp", "--private-key", &key]).claude_isolate_user_config
+        );
+        assert!(
+            !CliArgs::parse_from([
+                "buzz-acp",
+                "--private-key",
+                &key,
+                "--claude-isolate-user-config=false",
+            ])
+            .claude_isolate_user_config
+        );
+    }
+
+    #[test]
+    fn summary_reports_claude_user_config_isolation() {
+        let config = test_config(SubscribeMode::Mentions);
+        assert!(config.summary().contains("claude_isolate_user_config=true"));
+    }
+
+    #[test]
+    fn default_agent_env_recognizes_claude_identities_by_command_path() {
+        // Identity normalization is what makes the wrapper paths an operator
+        // actually configures (absolute path, Windows casing) resolve here.
+        for command in [
+            "claude-agent-acp",
+            "claude-code-acp",
+            "/opt/claude/bin/claude-agent-acp",
+            r"C:\Users\test\bin\Claude_Code_ACP.CMD",
+        ] {
+            assert_eq!(
+                default_agent_env(command),
+                &[
+                    ("CLAUDE_CODE_DISABLE_CLAUDE_MDS", "1"),
+                    ("CLAUDE_CODE_DISABLE_AUTO_MEMORY", "1"),
+                ],
+                "unexpected env defaults for {command}"
+            );
+        }
+        for command in ["goose", "codex-acp", "buzz-agent", ""] {
+            assert!(
+                default_agent_env(command).is_empty(),
+                "unrecognized command must have no env defaults: {command}"
+            );
+        }
     }
 
     // ── Multiple-event-handling validation + default ──────────────────────────
