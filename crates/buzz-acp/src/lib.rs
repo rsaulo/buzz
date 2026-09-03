@@ -3076,7 +3076,7 @@ async fn run_harness(
 
     if !config.memory_enabled {
         tracing::info!(
-            target: "engram::core",
+            target: "buzz_acp::engram::core",
             "NIP-AE core memory injection disabled (re-enable by removing --no-memory / BUZZ_ACP_NO_MEMORY)"
         );
     }
