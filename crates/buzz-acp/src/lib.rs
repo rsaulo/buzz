@@ -2521,6 +2521,29 @@ async fn tokio_main() -> Result<()> {
         return setup_mode::run_setup_listener(config, payload).await;
     }
 
+    // Resolve where sessions will run BEFORE anything is spawned, and after the
+    // setup-mode branch above.
+    //
+    // Before the pool: a mistyped `AGENT_CWD` is an operator error that must
+    // surface as itself, immediately — not after N adapter processes have been
+    // started, and never as a session opened somewhere the operator did not
+    // choose. After setup mode: an agent that is already missing credentials
+    // must still be fixable, and a workspace typo cannot be allowed to block
+    // that.
+    let startup_cwds = session_workspace::resolve_startup_cwds()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let workspace_index = workspace_index::WorkspaceIndex::from_env();
+    if let Some(path) = &startup_cwds.pinned {
+        tracing::info!(cwd = %path.display(), "channel sessions pinned by AGENT_CWD");
+    } else {
+        tracing::info!(
+            process_cwd = %startup_cwds.process.display(),
+            repositories = workspace_index.repository_count(),
+            channels = workspace_index.channel_count(),
+            "channel sessions use local workspace resolution"
+        );
+    }
+
     tracing::info!("buzz-acp starting: {}", config.summary());
 
     let cwd = current_working_directory()?;
@@ -2814,21 +2837,6 @@ async fn tokio_main() -> Result<()> {
         );
     }
 
-    // `base_prompt_content` is taken upstream, before the Pi launcher runs
-    // (#7335). Taking it again here would yield None and drop the base prompt.
-    let startup_cwds = session_workspace::resolve_startup_cwds()
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let workspace_index = workspace_index::WorkspaceIndex::from_env();
-    if let Some(path) = &startup_cwds.pinned {
-        tracing::info!(cwd = %path.display(), "channel sessions pinned by AGENT_CWD");
-    } else {
-        tracing::info!(
-            process_cwd = %startup_cwds.process.display(),
-            repositories = workspace_index.repository_count(),
-            channels = workspace_index.channel_count(),
-            "channel sessions use local workspace resolution"
-        );
-    }
     let ctx = Arc::new(PromptContext {
         mcp_servers: build_mcp_servers(&config),
         initial_message: config.initial_message.clone(),
@@ -11402,6 +11410,45 @@ mod observer_payload_trim_tests {
         assert!(leaf.starts_with('…'));
         assert!(leaf.ends_with('…'));
         assert!(leaf.contains("[elided"));
+    }
+}
+
+#[cfg(test)]
+mod startup_order_tests {
+    /// `AGENT_CWD` must be resolved before any adapter is spawned, and after the
+    /// setup-mode branch.
+    ///
+    /// Order is the whole contract here and it is invisible at the type level:
+    /// resolving after the pool means a mistyped workspace surfaces only once N
+    /// adapter processes are already running — or worse, as a session opened in
+    /// the process directory the operator did not choose. Resolving before the
+    /// setup branch means a workspace typo blocks an operator from fixing the
+    /// very credentials that put the agent into setup mode.
+    ///
+    /// A source-order assertion is crude, but it fails loudly the moment someone
+    /// moves either call — which is exactly what happened once already, and was
+    /// caught by running the binary, not by the suite.
+    #[test]
+    fn agent_cwd_resolves_after_setup_mode_and_before_the_pool() {
+        let source = include_str!("lib.rs");
+        let setup_branch = source
+            .find("setup_mode::run_setup_listener")
+            .expect("setup-mode branch");
+        let resolution = source
+            .find("session_workspace::resolve_startup_cwds()")
+            .expect("startup cwd resolution");
+        let pool = source
+            .find("initialize_agent_pool(&PoolStartup::from_config")
+            .expect("initial pool startup");
+
+        assert!(
+            setup_branch < resolution,
+            "cwd resolution must come after the setup-mode branch"
+        );
+        assert!(
+            resolution < pool,
+            "cwd resolution must come before the agent pool is started"
+        );
     }
 }
 
