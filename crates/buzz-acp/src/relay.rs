@@ -3338,6 +3338,19 @@ async fn wait_for_reconnect(
 /// - On first subscribe (`since` is `None`) adds `since=now` to avoid replaying
 ///   history. On reconnect (`since` is `Some`) subtracts [`SINCE_SKEW_SECS`].
 ///
+/// When `require_mention` is set, a second filter is appended so our OWN
+/// kind:9 messages come back. They carry `p` = whoever we answered, never
+/// ourselves, so the `#p` filter would hide them — and then the only evidence
+/// that a turn actually said something to somebody would never arrive. They are
+/// counted and dropped by the `ignore_self` gate; the extra filter exists purely
+/// so steer settlement can tell "replied" from "kept working in silence".
+///
+/// Both filters ride the same REQ and subscription id, so every path that
+/// (re)subscribes a channel — first subscribe, reconnect, rate-limit retry and
+/// targeted overflow recovery — carries them together with one `since` floor.
+/// The relay sends an event once per subscription even when it matches both
+/// filters, and `BgState::record_event` dedupes by id on our side regardless.
+///
 /// Returns `true` if the REQ was successfully written to the WebSocket.
 async fn send_subscribe(
     ws: &mut WsStream,
@@ -3375,7 +3388,25 @@ async fn send_subscribe(
     };
     req_filter.insert("since".into(), json!(since_ts));
 
-    let req = json!(["REQ", sub_id, Value::Object(req_filter)]);
+    let mut req = vec![json!("REQ"), json!(sub_id), Value::Object(req_filter)];
+
+    // Self-authored messages: only needed when `#p` above would exclude them.
+    // Scoped to kind:9 in this channel — that is the only kind settlement
+    // counts, and anything wider would replay our own reactions and receipts.
+    // An unfiltered subscription already delivers our own messages.
+    if filter.require_mention {
+        let mut self_filter = serde_json::Map::new();
+        self_filter.insert(
+            "kinds".into(),
+            json!([buzz_core::kind::KIND_STREAM_MESSAGE]),
+        );
+        self_filter.insert("#h".into(), json!([channel_id.to_string()]));
+        self_filter.insert("authors".into(), json!([agent_pubkey_hex]));
+        self_filter.insert("since".into(), json!(since_ts));
+        req.push(Value::Object(self_filter));
+    }
+
+    let req = Value::Array(req);
 
     match serde_json::to_string(&req) {
         Ok(text) => {
@@ -4783,6 +4814,126 @@ mod tests {
             None,
         )
         .await
+    }
+
+    /// A `#p`-filtered subscription hides our own messages: we publish with
+    /// `p` = whoever we answered. Without a second filter the settlement side
+    /// never sees an answer and requeues every steered mention — a duplicate
+    /// on every ordinary reply.
+    #[tokio::test]
+    async fn mention_subscription_also_requests_self_authored_messages() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let state = BgState::new();
+        let channel_id = Uuid::new_v4();
+        let filter = ChannelFilter {
+            kinds: Some(vec![9]),
+            require_mention: true,
+        };
+
+        assert!(
+            send_subscribe(
+                &mut client,
+                &state,
+                channel_id,
+                "agent-pubkey",
+                Some(2_000),
+                &filter
+            )
+            .await
+        );
+
+        let frame = next_test_frame(&mut server).await;
+        let filters = frame.as_array().expect("REQ frame is an array");
+        assert_eq!(filters.len(), 4, "REQ must carry two filters: {frame}");
+        assert_eq!(filters[1], json!(channel_sub_id(channel_id)));
+
+        let mentions = &filters[2];
+        assert_eq!(mentions["#p"], json!(["agent-pubkey"]));
+        assert!(mentions.get("authors").is_none());
+
+        let own = &filters[3];
+        assert_eq!(own["authors"], json!(["agent-pubkey"]));
+        assert_eq!(
+            own["kinds"],
+            json!([buzz_core::kind::KIND_STREAM_MESSAGE]),
+            "self filter must stay on messages — reactions and receipts are not answers"
+        );
+        assert_eq!(own["#h"], json!([channel_id.to_string()]));
+        assert!(
+            own.get("#p").is_none(),
+            "the self filter must not inherit the mention constraint that hides it"
+        );
+        assert_eq!(
+            own["since"], mentions["since"],
+            "both filters must share the reconnect floor"
+        );
+    }
+
+    /// Without `#p` our own messages already arrive on the channel filter, so
+    /// the extra filter would only duplicate the stream.
+    #[tokio::test]
+    async fn wildcard_subscription_stays_a_single_filter() {
+        let (mut client, mut server) = test_ws_pair().await;
+        let state = BgState::new();
+        let channel_id = Uuid::new_v4();
+
+        assert!(
+            send_subscribe(
+                &mut client,
+                &state,
+                channel_id,
+                "agent-pubkey",
+                Some(2_000),
+                &test_channel_filter()
+            )
+            .await
+        );
+
+        let frame = next_test_frame(&mut server).await;
+        assert_eq!(
+            frame.as_array().expect("REQ frame is an array").len(),
+            3,
+            "unfiltered subscriptions already see our own messages: {frame}"
+        );
+    }
+
+    /// The echo of our own reply reaches the harness exactly once — that is
+    /// what `note_self_published` counts before `ignore_self` drops it — even
+    /// if the relay or a recovery replay delivers it again.
+    #[tokio::test]
+    async fn own_message_echo_is_forwarded_once() {
+        let (mut client, _server) = test_ws_pair().await;
+        let (event_tx, mut event_rx) = mpsc::channel(4);
+        let (observer_control_tx, _observer_control_rx) = mpsc::channel(4);
+        let mut state = BgState::new();
+        let channel_id = Uuid::new_v4();
+        let agent = Keys::generate();
+        let reply = make_signed_channel_event(&agent, "the answer", 2_000);
+
+        for _ in 0..2 {
+            assert!(
+                handle_test_relay_event(
+                    &mut client,
+                    &event_tx,
+                    &observer_control_tx,
+                    &mut state,
+                    &channel_sub_id(channel_id),
+                    &reply,
+                )
+                .await
+            );
+        }
+
+        let echoed = event_rx
+            .try_recv()
+            .expect("own reply was forwarded")
+            .expect("not a shutdown marker");
+        assert_eq!(echoed.event.id, reply.id);
+        assert_eq!(echoed.event.pubkey, agent.public_key());
+        assert!(
+            event_rx.try_recv().is_err(),
+            "a re-delivered echo must be deduplicated by event id"
+        );
     }
 
     #[tokio::test]

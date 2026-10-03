@@ -12702,6 +12702,68 @@ mod self_published_accounting_tests {
         queue.queued_event_count(scope.clone()) == 0
     }
 
+    /// The shape the self-echo REQ filter brings back: signed by the agent,
+    /// `p`-tagging the person it answered (never the agent), threaded under
+    /// the mention. It must settle the thread's steer — this is the case that
+    /// requeued and answered twice while the echo was missing.
+    #[test]
+    fn an_echoed_reply_to_the_asker_settles_the_steer() {
+        let channel_id = Uuid::new_v4();
+        let root = "c".repeat(64);
+        let agent = Keys::generate();
+        let asker = Keys::generate();
+        let echoed = EventBuilder::new(Kind::Custom(9), "here is the answer")
+            .tags([
+                Tag::parse(["h", &channel_id.to_string()]).expect("h tag"),
+                Tag::parse(["e", &root, "", "root"]).expect("root tag"),
+                Tag::parse(["e", &root, "", "reply"]).expect("reply tag"),
+                Tag::parse(["p", &asker.public_key().to_hex()]).expect("p tag"),
+            ])
+            .sign_with_keys(&agent)
+            .expect("sign echoed reply");
+        assert!(
+            !echoed
+                .tags
+                .iter()
+                .any(|tag| tag.as_slice().get(1) == Some(&agent.public_key().to_hex())),
+            "fixture must not mention the agent, or the #p filter alone would deliver it"
+        );
+
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        assert!(steer_was_settled_by(
+            &mut queue,
+            &thread(channel_id, &root),
+            |queue| {
+                note_self_published(queue, channel_id, KIND_STREAM_MESSAGE, &echoed);
+            }
+        ));
+    }
+
+    /// Our own echoed messages must be counted and then dropped before any
+    /// subscription rule sees them: dispatching them would prompt the agent
+    /// with its own reply. Order is invisible to the type system, so assert it
+    /// on the source.
+    #[test]
+    fn self_echo_is_counted_then_dropped_before_dispatch_rules() {
+        let source = include_str!("lib.rs");
+        let gate = source
+            .find("if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex")
+            .expect("ignore_self gate");
+        let counted = gate
+            + source[gate..]
+                .find("note_self_published(")
+                .expect("self echo is counted");
+        let dropped = gate
+            + source[gate..]
+                .find("continue;")
+                .expect("self echo is dropped");
+        let rules = source
+            .find(".match_subscription(&rules, &pubkey_hex)")
+            .expect("subscription rules");
+        assert!(counted < dropped, "count before dropping");
+        assert!(dropped < rules, "drop before subscription rules dispatch");
+    }
+
     #[test]
     fn a_top_level_reply_credits_the_ambient_conversation() {
         let channel_id = Uuid::new_v4();
