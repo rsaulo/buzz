@@ -1,8 +1,8 @@
 //! Shared agent capabilities. Intake and scheduling belong to each entry point;
 //! environment, credentials, adapter settings and prompt equipment belong here.
 use crate::{
-    build_mcp_servers, config::Config, current_working_directory, git, observer, pool, relay,
-    resolve_agent_owner, PromptContext,
+    build_mcp_servers, config::Config, git, observer, pool, relay, resolve_agent_owner,
+    session_workspace, workspace_index, PromptContext,
 };
 use anyhow::Result;
 use std::{collections::HashMap, time::Duration};
@@ -54,6 +54,7 @@ pub(crate) struct PoolStartup {
     pub(crate) args: Vec<String>,
     pub(crate) extra_env: Vec<(String, String)>,
     pub(crate) has_generated_codex_config: bool,
+    pub(crate) isolate_claude_user_config: bool,
     pub(crate) model: Option<String>,
     pub(crate) effort_level: Option<String>,
     pub(crate) observer: Option<observer::ObserverHandle>,
@@ -67,6 +68,7 @@ impl PoolStartup {
             args: config.agent_args.clone(),
             extra_env: config.persona_env_vars.clone(),
             has_generated_codex_config: config.has_generated_codex_config,
+            isolate_claude_user_config: config.claude_isolate_user_config,
             model: config.model.clone(),
             effort_level: config.effort_level.clone(),
             observer,
@@ -81,7 +83,21 @@ fn make_prompt_context(
     mode: SessionMode,
 ) -> Result<PromptContext> {
     let base_prompt_content = config.base_prompt_content.as_ref();
-    let cwd = current_working_directory()?;
+    // Where sessions open is resolved per channel at session creation; this
+    // only fixes the inputs (AGENT_CWD pin, harness directory, workspace index).
+    let startup_cwds = session_workspace::resolve_startup_cwds()
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+    let workspace_index = workspace_index::WorkspaceIndex::from_env();
+    if let Some(path) = &startup_cwds.pinned {
+        tracing::info!(cwd = %path.display(), "channel sessions pinned by AGENT_CWD");
+    } else {
+        tracing::info!(
+            process_cwd = %startup_cwds.process.display(),
+            repositories = workspace_index.repository_count(),
+            channels = workspace_index.channel_count(),
+            "channel sessions use local workspace resolution"
+        );
+    }
     Ok(PromptContext {
         mcp_servers: build_mcp_servers(config),
         initial_message: config.initial_message.clone(),
@@ -108,7 +124,11 @@ fn make_prompt_context(
             })
         },
         heartbeat_prompt: config.heartbeat_prompt.clone(),
-        cwd,
+        session_cwd: session_workspace::SessionCwdResolver::new(
+            startup_cwds,
+            workspace_index,
+            config.unindexed_channel_policy,
+        ),
         rest_client: rest_client.clone(),
         channel_info: pool::ChannelInfoResolver::new(channels, rest_client),
         context_message_limit: config.context_message_limit,

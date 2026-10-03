@@ -115,6 +115,10 @@ pub enum AcpError {
 
     #[error("Agent reported error (code {code}): {message}")]
     AgentError { code: i64, message: String },
+
+    /// The harness refused session creation before writing to the ACP pipe.
+    #[error("Session creation refused by local policy: {0}")]
+    SessionRefused(String),
 }
 
 /// Build an [`AcpError::AgentError`] from a JSON-RPC error object,
@@ -207,6 +211,13 @@ pub struct AcpClient {
     /// a JSON-RPC *success*, not `-32601` — which the main loop would read as
     /// a delivered steer and drop the user's message from the queue.
     steering_supported: bool,
+    /// Adapter-specific `_meta` members to merge into every `session/new` on
+    /// this process. Resolved once from the name the adapter reported at
+    /// `initialize` (see `agent_isolation::session_meta_options`) and installed
+    /// by [`set_session_meta_options`](Self::set_session_meta_options), because
+    /// adapter identity is a property of the process, not of the session.
+    /// `None` leaves `session/new` byte-identical to the un-isolated form.
+    session_meta_options: Option<serde_json::Value>,
     /// Per-turn channel for receiving goose-native non-cancelling steer
     /// requests from the main loop. Installed by
     /// [`install_steer_rx`](Self::install_steer_rx) at dispatch and
@@ -576,6 +587,22 @@ impl AcpClient {
             }
         }
 
+        // The command inherits the parent environment by default, and the `env`
+        // entries above only replace individual inherited keys. Strip the
+        // Hindsight bank selectors after every merge layer, so neither the
+        // parent environment nor a persona pack can override repository-local
+        // bank selection. See `agent_isolation::REMOVED_BANK_ENV`.
+        let shadowed_bank_env = crate::agent_isolation::shadowed_bank_env(extra_env);
+        for key in crate::agent_isolation::REMOVED_BANK_ENV {
+            cmd.env_remove(key);
+        }
+        if !shadowed_bank_env.is_empty() {
+            tracing::info!(
+                variables = ?shadowed_bank_env,
+                "removed Hindsight bank overrides from agent subprocess environment"
+            );
+        }
+
         // Spawn the agent in its own process group so SIGKILL doesn't propagate
         // to the harness's own process group on Unix.
         // tokio::process::Command::process_group is a stable tokio API (no extra imports needed).
@@ -629,12 +656,19 @@ impl AcpClient {
             observer_context: ObserverContext::default(),
             active_run_id: None,
             steering_supported: false,
+            session_meta_options: None,
             steer_rx: None,
             goose_usage: UsageTracker::default(),
             standard_usage: StandardUsageTracker::default(),
             standard_adapter,
             claude_thinking_summaries,
         })
+    }
+
+    /// Install the adapter-specific `session/new` `_meta` members for this
+    /// process. Call after `initialize`, once the adapter has named itself.
+    pub fn set_session_meta_options(&mut self, options: Option<serde_json::Value>) {
+        self.session_meta_options = options;
     }
 
     /// Attach a local observer feed to this ACP client.
@@ -716,7 +750,9 @@ impl AcpClient {
     ///
     /// `session_title` rides in `_meta.sessionTitle` when `Some`, and a Claude
     /// CLI that supports it gets `_meta.claudeCode.options.extraArgs` asking
-    /// for summarized thinking. These and the metadata prompt transports merge
+    /// for summarized thinking. These, the metadata prompt transports and any
+    /// adapter options installed via
+    /// [`set_session_meta_options`](Self::set_session_meta_options) merge
     /// into a single object; with none of them, `_meta` is omitted entirely,
     /// since adapters may distinguish an absent member from a null one.
     ///
@@ -754,6 +790,20 @@ impl AcpClient {
             // Merge — claude-agent-acp spreads these into the CLI's argv.
             params["_meta"]["claudeCode"]["options"]["extraArgs"]["thinking-display"] =
                 serde_json::Value::String("summarized".to_owned());
+        }
+        // Adapter options merge as further `_meta` members, never as a
+        // replacement: systemPrompt, sessionTitle and the thinking extraArgs
+        // above must survive. Isolation and thinking summaries both live under
+        // `claudeCode.options`, so the merge recurses into objects instead of
+        // replacing a top-level member.
+        if let Some(options) = self
+            .session_meta_options
+            .as_ref()
+            .and_then(|v| v.as_object())
+        {
+            for (key, value) in options {
+                merge_json_objects(&mut params["_meta"][key], value);
+            }
         }
         let result = self.send_request("session/new", params).await?;
         let session_id = result["sessionId"]
@@ -2469,6 +2519,21 @@ async fn claude_cli_accepts_thinking_display(cmd: &tokio::process::Command) -> b
     accepts
 }
 
+/// Merge `src` into `dst` member by member, recursing where both sides hold an
+/// object, so a nested option (`claudeCode.options.settingSources`) joins a
+/// sibling already present (`claudeCode.options.extraArgs`) instead of
+/// replacing the whole parent. A non-object `src` replaces `dst` outright.
+fn merge_json_objects(dst: &mut serde_json::Value, src: &serde_json::Value) {
+    match src.as_object() {
+        Some(members) if dst.is_object() || dst.is_null() => {
+            for (key, value) in members {
+                merge_json_objects(&mut dst[key], value);
+            }
+        }
+        _ => *dst = src.clone(),
+    }
+}
+
 /// Pipe stdout only, and put the probe in its own process group (like the
 /// adapter) so a timeout also kills a launcher's children.
 fn configure_version_probe(cmd: &mut tokio::process::Command) {
@@ -3300,6 +3365,50 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_applies_claude_memory_defaults_only_to_claude() {
+        for var in [
+            "CLAUDE_CODE_DISABLE_CLAUDE_MDS",
+            "CLAUDE_CODE_DISABLE_AUTO_MEMORY",
+        ] {
+            // Operator precedence: a value already exported wins over the
+            // default, so the assertion below would be testing the shell.
+            if std::env::var_os(var).is_some() {
+                continue;
+            }
+            assert_eq!(
+                spawn_named_and_read_child_env("claude-agent-acp", var, &[]).await,
+                "1",
+                "Claude spawns must default {var}=1"
+            );
+            assert_eq!(
+                spawn_named_and_read_child_env("other-agent", var, &[]).await,
+                "<unset>",
+                "non-Claude spawns must not receive {var}"
+            );
+        }
+    }
+
+    /// The bank selector is stripped after every merge layer, so a persona pack
+    /// cannot reintroduce what the parent environment is not allowed to set.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn spawn_removes_hindsight_bank_overrides_from_persona_env() {
+        for var in crate::agent_isolation::REMOVED_BANK_ENV {
+            assert_eq!(
+                spawn_named_and_read_child_env(
+                    "other-agent",
+                    var,
+                    &[(var.into(), "must-not-cross-spawn".into())],
+                )
+                .await,
+                "<unset>",
+                "{var} must be removed after persona env is merged"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn idle_timeout_fires_on_silent_process() {
         let mut client = spawn_script("sleep 10").await;
@@ -3933,6 +4042,106 @@ sleep 1"#,
             assert!(meta.get("claudeCode").is_none(), "{case}: {meta}");
             assert_eq!(meta["sessionTitle"], "Fizz", "{case}");
         }
+    }
+
+    #[tokio::test]
+    async fn session_meta_options_merge_without_clobbering_prompt_or_title() {
+        // Installed adapter options are further `_meta` members, so all three
+        // must survive the same session/new.
+        let script = r#"
+            read -t 2 _init
+            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+            read -t 2 REQ
+            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_isolated","_receivedRequest":'"$REQ"'}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client.set_session_meta_options(crate::agent_isolation::session_meta_options(
+            crate::pool::CLAUDE_AGENT_ACP_NAME,
+            true,
+        ));
+
+        let resp = client
+            .session_new_full(
+                "/tmp",
+                vec![],
+                Some(SystemPromptTransport::ClaudeMeta("Be concise")),
+                Some("Fizz · #buzz-dev"),
+            )
+            .await
+            .expect("session_new_full should succeed");
+
+        let meta = &resp.raw["_receivedRequest"]["params"]["_meta"];
+        assert_eq!(
+            meta["claudeCode"]["options"]["settingSources"],
+            serde_json::json!(["project", "local"]),
+            "Claude sessions must exclude user-scoped settings"
+        );
+        assert_eq!(meta["systemPrompt"]["append"].as_str(), Some("Be concise"));
+        assert_eq!(meta["sessionTitle"].as_str(), Some("Fizz · #buzz-dev"));
+    }
+
+    /// Without installed options the request must stay byte-identical to the
+    /// un-isolated form — `_meta` absent, not present-and-empty.
+    #[tokio::test]
+    async fn session_new_omits_meta_entirely_when_no_options_are_installed() {
+        let script = r#"
+            read -t 2 _init
+            echo '{"jsonrpc":"2.0","id":0,"result":{"protocolVersion":1,"agentCapabilities":{}}}'
+            read -t 2 REQ
+            echo '{"jsonrpc":"2.0","id":1,"result":{"sessionId":"ses_plain","_receivedRequest":'"$REQ"'}}'
+            sleep 1
+        "#;
+        let mut client = spawn_script(script).await;
+        client
+            .initialize()
+            .await
+            .expect("initialize should succeed");
+        client
+            .set_session_meta_options(crate::agent_isolation::session_meta_options("goose", true));
+
+        let resp = client
+            .session_new_full("/tmp", vec![], None, None)
+            .await
+            .expect("session_new_full should succeed");
+
+        assert!(
+            resp.raw["_receivedRequest"]["params"]
+                .get("_meta")
+                .is_none(),
+            "a non-Claude adapter must receive no _meta at all"
+        );
+    }
+
+    /// Isolation (`settingSources`) and upstream's thinking summaries
+    /// (`extraArgs`) both live under `claudeCode.options`: installing one
+    /// must not erase the other.
+    #[test]
+    fn session_meta_options_merge_beside_thinking_extra_args() {
+        let mut params = serde_json::json!({ "cwd": "/tmp" });
+        params["_meta"]["claudeCode"]["options"]["extraArgs"]["thinking-display"] =
+            serde_json::Value::String("summarized".to_owned());
+        params["_meta"]["sessionTitle"] = serde_json::Value::String("Fizz".to_owned());
+        let options =
+            crate::agent_isolation::session_meta_options(crate::pool::CLAUDE_AGENT_ACP_NAME, true)
+                .expect("claude gets options");
+        for (key, value) in options.as_object().expect("object") {
+            merge_json_objects(&mut params["_meta"][key], value);
+        }
+        let claude_options = &params["_meta"]["claudeCode"]["options"];
+        assert_eq!(
+            claude_options["settingSources"],
+            serde_json::json!(["project", "local"])
+        );
+        assert_eq!(
+            claude_options["extraArgs"],
+            serde_json::json!({ "thinking-display": "summarized" })
+        );
+        assert_eq!(params["_meta"]["sessionTitle"], "Fizz");
     }
 
     // ── claude-agent-acp _meta.systemPrompt transport ─────────────────────
