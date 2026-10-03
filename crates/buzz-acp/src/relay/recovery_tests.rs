@@ -386,3 +386,41 @@ async fn socket_frame(
 
 #[path = "recovery_wake_tests.rs"]
 mod wake;
+
+/// Targeted overflow recovery re-sends the channel's REQ through the same
+/// builder, so a mention subscription keeps the self-echo filter that steer
+/// settlement depends on — with the recovery floor on both filters.
+#[tokio::test]
+async fn overflow_recovery_keeps_the_self_echo_filter() {
+    let (mut client, mut server) = test_ws_pair().await;
+    let mut state = BgState::new();
+    let ch = Uuid::new_v4();
+    apply_command_to_state(
+        &mut state,
+        RelayCommand::Subscribe {
+            channel_id: ch,
+            filter: ChannelFilter {
+                kinds: Some(vec![9]),
+                require_mention: true,
+            },
+            replay_since: Some(1_000),
+        },
+    );
+    state.channel_dropped_since.insert(ch, 1_000);
+    let (tx, _rx) = mpsc::channel(8);
+
+    recovery::recover_one(&mut client, &mut state, &tx, "synthetic-agent").await;
+
+    let req = next_test_frame(&mut server).await;
+    let filters = req.as_array().expect("REQ frame is an array");
+    assert_eq!(
+        filters.len(),
+        4,
+        "recovery REQ must keep both filters: {req}"
+    );
+    assert_eq!(req[1], channel_sub_id(ch));
+    assert_eq!(req[2]["#p"], json!(["synthetic-agent"]));
+    assert_eq!(req[3]["authors"], json!(["synthetic-agent"]));
+    assert_eq!(req[3]["kinds"], json!([9]));
+    assert_eq!(req[3]["since"], req[2]["since"]);
+}
