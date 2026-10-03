@@ -65,6 +65,9 @@ pub(crate) async fn execute(
         agent_name,
         goose_system_prompt_supported: None,
         protocol_version: init["protocolVersion"].as_u64().unwrap_or(1) as u32,
+        // One task, one session, and the process is shut down afterwards:
+        // nothing here is ever evicted, so this only records the capability.
+        session_close_supported: crate::session_eviction::advertises_session_close(&init),
     };
     let mut session = None;
     let outcome = tokio::select! {

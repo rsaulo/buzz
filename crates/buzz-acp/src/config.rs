@@ -499,6 +499,18 @@ pub struct CliArgs {
     )]
     pub claude_isolate_user_config: bool,
 
+    /// Seconds a session may sit idle before it is closed. Unset keeps the
+    /// per-harness default, which is what a live session costs on that adapter
+    /// (a whole CLI process for Claude, a map entry for an in-process one — no
+    /// single number can serve both). 0 disables idle eviction.
+    #[arg(long, env = "BUZZ_ACP_SESSION_IDLE_TTL_SECS")]
+    pub session_idle_ttl_secs: Option<u64>,
+
+    /// Maximum sessions one agent may hold before the least recently used ones
+    /// are closed. Unset keeps the per-harness default; 0 disables the cap.
+    #[arg(long, env = "BUZZ_ACP_MAX_LIVE_SESSIONS")]
+    pub max_live_sessions: Option<usize>,
+
     /// Permission mode for agents that support `session/set_config_option`
     /// with `configId: "mode"` (e.g. `claude-agent-acp`).
     ///
@@ -635,6 +647,12 @@ pub struct Config {
     /// Whether Claude ACP sessions exclude user-scoped settings, hooks, MCP
     /// servers, and personal instructions. Enabled by default.
     pub claude_isolate_user_config: bool,
+    /// Operator override for the idle-session TTL. `None` keeps the harness
+    /// default; `Some(0)` disables idle eviction.
+    pub session_idle_ttl_secs: Option<u64>,
+    /// Operator override for the per-agent live-session cap. `None` keeps the
+    /// harness default; `Some(0)` disables the cap.
+    pub max_live_sessions: Option<usize>,
     /// Permission mode to apply after session creation. `Default` = skip.
     pub permission_mode: PermissionMode,
     /// Inbound author gate mode.
@@ -1241,6 +1259,8 @@ impl Config {
                 .as_deref()
                 .and_then(sanitize_session_title),
             claude_isolate_user_config: args.claude_isolate_user_config,
+            session_idle_ttl_secs: args.session_idle_ttl_secs,
+            max_live_sessions: args.max_live_sessions,
             permission_mode: args.permission_mode,
             respond_to: args.respond_to,
             respond_to_allowlist,
@@ -1624,6 +1644,8 @@ mod tests {
             effort_level: None,
             session_title: None,
             claude_isolate_user_config: true,
+            session_idle_ttl_secs: None,
+            max_live_sessions: None,
             permission_mode: PermissionMode::BypassPermissions,
             respond_to: RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),

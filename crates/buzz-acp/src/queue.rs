@@ -271,6 +271,10 @@ pub struct EventQueue {
     /// Must be strictly greater than `max_turn_duration` so a turn running to
     /// the hard cap returns via `mark_complete` before the backstop fires.
     in_flight_deadline: Duration,
+    /// Steers the adapter accepted, held until the turn that received them
+    /// ends. See [`crate::steer_ledger`] for why acceptance alone must not
+    /// discard the event.
+    steer_ledger: crate::steer_ledger::SteerLedger,
 }
 
 impl EventQueue {
@@ -293,6 +297,7 @@ impl EventQueue {
             cancel_reasons: HashMap::new(),
             withheld_native_steer: HashMap::new(),
             in_flight_deadline: Duration::from_secs(DEFAULT_IN_FLIGHT_DEADLINE_SECS),
+            steer_ledger: crate::steer_ledger::SteerLedger::default(),
         }
     }
 
@@ -929,6 +934,19 @@ impl EventQueue {
             .retain(|s, _| s.channel_id() != channel_id);
         self.cancel_reasons
             .retain(|s, _| s.channel_id() != channel_id);
+        // Delivered steers for this channel are stale for the same reason the
+        // queued events are: the agent is out. Drop them without requeueing,
+        // and report their reaction targets so the caller clears those too.
+        for scope in self
+            .steer_ledger
+            .pending_scopes()
+            .into_iter()
+            .filter(|scope| scope.channel_id() == channel_id)
+        {
+            for event in self.steer_ledger.drain_scope(&scope) {
+                collect(&event.event);
+            }
+        }
         // Preserve in_flight_scopes AND in_flight_deadlines: the in-flight
         // task will eventually complete (calling mark_complete) or the deadline
         // will expire (auto-cleaning the scope). Removing deadlines without
@@ -1059,26 +1077,140 @@ impl EventQueue {
         self.enforce_channel_cap(channel_id);
     }
 
-    /// Drop a specific event by id from both the side table and the main
-    /// queue.
+    /// Move a delivered steer out of the queue and into the ledger, to be
+    /// settled when `turn_id` ends.
     ///
-    /// Called on `SteerAck::Success` — the agent received the steer, so the
-    /// event has been "delivered" via the non-cancelling path and must not
-    /// be redelivered via normal dispatch. Idempotent across both stores.
-    pub fn remove_event<K: IntoScope>(&mut self, scope: K, event_id: &str) {
+    /// This replaces dropping the event on acceptance. The adapter accepting a
+    /// steer proves delivery, not that the turn will answer it; if the turn ends
+    /// silently, [`settle_turn_steers`](Self::settle_turn_steers) puts the event
+    /// back. Returns `false` when the event is no longer here to move — a late
+    /// ack whose event was already released or drained, where doing anything at
+    /// all could remove the only queued copy.
+    pub fn record_delivered_steer<K: IntoScope>(
+        &mut self,
+        scope: K,
+        event_id: &str,
+        turn_id: &str,
+    ) -> bool {
         let scope = scope.into_scope();
-        if let Some(entries) = self.withheld_native_steer.get_mut(&scope) {
-            entries.retain(|qe| qe.event.id.to_hex() != event_id);
-            if entries.is_empty() {
-                self.withheld_native_steer.remove(&scope);
+        let taken = self
+            .take_withheld_event(&scope, event_id)
+            .or_else(|| self.take_queued_event(&scope, event_id));
+        let Some(event) = taken else {
+            return false;
+        };
+        self.steer_ledger.record_delivered(&scope, event, turn_id);
+        true
+    }
+
+    fn take_withheld_event(&mut self, scope: &SessionScope, event_id: &str) -> Option<QueuedEvent> {
+        let entries = self.withheld_native_steer.get_mut(scope)?;
+        let position = entries
+            .iter()
+            .position(|queued| queued.event.id.to_hex() == event_id)?;
+        let event = entries.remove(position);
+        if entries.is_empty() {
+            self.withheld_native_steer.remove(scope);
+        }
+        Some(event)
+    }
+
+    fn take_queued_event(&mut self, scope: &SessionScope, event_id: &str) -> Option<QueuedEvent> {
+        let queue = self.queues.get_mut(scope)?;
+        let position = queue
+            .iter()
+            .position(|queued| queued.event.id.to_hex() == event_id)?;
+        let event = queue.remove(position);
+        if queue.is_empty() {
+            self.queues.remove(scope);
+        }
+        event
+    }
+
+    /// Count one of our own published messages towards `scope`.
+    ///
+    /// Only a published message settles a steer — see [`crate::steer_ledger`].
+    pub fn note_published_message<K: IntoScope>(&mut self, scope: K) {
+        self.steer_ledger.note_published(&scope.into_scope());
+    }
+
+    /// Decide every steer `turn_id` accepted on `scope`, requeueing the ones it
+    /// never answered.
+    ///
+    /// Called once per turn completion, before `mark_complete`, so no delivered
+    /// event can outlive the turn that accepted it.
+    pub fn settle_turn_steers<K: IntoScope>(&mut self, scope: K, turn_id: &str) {
+        let scope = scope.into_scope();
+        let verdicts = self.steer_ledger.settle_turn(&scope, turn_id);
+        if verdicts.is_empty() {
+            return;
+        }
+        let mut answered = 0usize;
+        let mut owed = 0usize;
+        for verdict in verdicts {
+            match verdict {
+                crate::steer_ledger::SteerVerdict::Answered { event_id } => {
+                    answered += 1;
+                    tracing::debug!(
+                        scope = %scope.telemetry_label(),
+                        event_id = %event_id,
+                        turn_id,
+                        "steered event was answered by the turn that received it"
+                    );
+                }
+                crate::steer_ledger::SteerVerdict::Owed(event) => {
+                    owed += 1;
+                    self.restore_owed_steer(&scope, *event);
+                }
             }
         }
-        if let Some(q) = self.queues.get_mut(&scope) {
-            q.retain(|qe| qe.event.id.to_hex() != event_id);
-            if q.is_empty() {
-                self.queues.remove(&scope);
-            }
+        tracing::info!(
+            scope = %scope.telemetry_label(),
+            turn_id,
+            answered,
+            owed,
+            "settled steered events at turn completion"
+        );
+    }
+
+    /// Return every steer held for `scope`, whatever turn accepted it.
+    ///
+    /// For the paths where no turn will ever report back — a panicked task, an
+    /// agent process that exited. Silence there is not evidence of an answer.
+    pub fn release_all_steers<K: IntoScope>(&mut self, scope: K) {
+        let scope = scope.into_scope();
+        for event in self.steer_ledger.drain_scope(&scope) {
+            self.restore_owed_steer(&scope, event);
         }
+    }
+
+    /// Whether `scope` is holding a delivered steer awaiting its verdict.
+    #[cfg(test)]
+    pub fn has_pending_steers<K: IntoScope>(&self, scope: K) -> bool {
+        self.steer_ledger.has_pending(&scope.into_scope())
+    }
+
+    fn restore_owed_steer(&mut self, scope: &SessionScope, event: QueuedEvent) {
+        let channel_id = scope.channel_id();
+        tracing::info!(
+            scope = %scope.telemetry_label(),
+            event_id = %event.event.id.to_hex(),
+            "steered event was never answered — requeueing for the next turn"
+        );
+        // Front, preserving `received_at`: the message predates everything
+        // queued behind it, exactly as `release_native_steer` restores.
+        let queue = self.queues.entry(scope.clone()).or_default();
+        queue.push_front(event);
+        while queue.len() > MAX_PENDING_PER_SCOPE {
+            queue.pop_back();
+            tracing::warn!(
+                channel_id = %channel_id,
+                scope = %scope.telemetry_label(),
+                limit = MAX_PENDING_PER_SCOPE,
+                "steer settlement overflow — dropped newest event to enforce cap"
+            );
+        }
+        self.enforce_channel_cap(channel_id);
     }
 
     /// Bulk-release every withheld event for `channel_id` back to the queue
@@ -7132,6 +7264,222 @@ mod tests {
         assert!(
             !prompt.contains("Description:"),
             "unresolved metadata must not render a Description field; got: {prompt}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod steer_settlement_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind};
+
+    fn conv(channel_id: Uuid) -> SessionScope {
+        SessionScope::Conversation { channel_id }
+    }
+
+    fn queued(scope: &SessionScope, content: &str) -> QueuedEvent {
+        QueuedEvent {
+            channel_id: scope.channel_id(),
+            scope: scope.clone(),
+            event: EventBuilder::new(Kind::Custom(9), content)
+                .tags([])
+                .sign_with_keys(&Keys::generate())
+                .expect("sign test event"),
+            received_at: Instant::now(),
+            prompt_tag: "test".into(),
+            edit: None,
+        }
+    }
+
+    /// Put one event through the real path: queued, withheld for a steer, and
+    /// acknowledged by `turn_id`.
+    fn deliver_steer(
+        queue: &mut EventQueue,
+        scope: &SessionScope,
+        content: &str,
+        turn_id: &str,
+    ) -> String {
+        let event = queued(scope, content);
+        let event_id = event.event.id.to_hex();
+        assert!(queue.push(event), "test event must be admitted");
+        assert!(
+            queue.mark_native_steer_pending(scope.clone(), &event_id),
+            "the event must be withheld before the ack"
+        );
+        assert!(
+            queue.record_delivered_steer(scope.clone(), &event_id, turn_id),
+            "a withheld event must be ledgerable"
+        );
+        event_id
+    }
+
+    fn queued_contents(queue: &mut EventQueue, scope: &SessionScope) -> Vec<String> {
+        queue
+            .flush_next()
+            .map(|batch| {
+                let contents = batch
+                    .events
+                    .iter()
+                    .map(|event| event.event.content.clone())
+                    .collect();
+                queue.mark_complete(scope.clone());
+                contents
+            })
+            .unwrap_or_default()
+    }
+
+    /// The incident this exists to prevent: the turn accepted the mention and
+    /// ended without publishing. Before the ledger the event had already been
+    /// dropped on the ack, so it vanished with no log and no reply.
+    #[test]
+    fn a_silent_turn_returns_the_mention_to_the_queue() {
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        deliver_steer(&mut queue, &scope, "please look at this", "turn-1");
+
+        // Delivered: no longer dispatchable while the turn runs.
+        assert_eq!(queue.queued_event_count(scope.clone()), 0);
+        assert!(queue.has_pending_steers(scope.clone()));
+
+        queue.settle_turn_steers(scope.clone(), "turn-1");
+
+        assert_eq!(
+            queued_contents(&mut queue, &scope),
+            vec!["please look at this"],
+            "an unanswered mention must come back for the next turn"
+        );
+        assert!(!queue.has_pending_steers(scope.clone()));
+    }
+
+    #[test]
+    fn a_turn_that_published_afterwards_keeps_the_mention_settled() {
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        deliver_steer(&mut queue, &scope, "please look at this", "turn-1");
+
+        queue.note_published_message(scope.clone());
+        queue.settle_turn_steers(scope.clone(), "turn-1");
+
+        assert_eq!(queue.queued_event_count(scope.clone()), 0);
+        assert!(
+            queue.flush_next().is_none(),
+            "answered events do not return"
+        );
+    }
+
+    /// A reply in one thread says nothing about a mention steered into another.
+    #[test]
+    fn a_sibling_threads_reply_does_not_settle_this_thread() {
+        let channel_id = Uuid::new_v4();
+        let mine = SessionScope::Thread {
+            channel_id,
+            root_event_id: "a".repeat(64),
+        };
+        let sibling = SessionScope::Thread {
+            channel_id,
+            root_event_id: "b".repeat(64),
+        };
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        deliver_steer(&mut queue, &mine, "mine", "turn-1");
+        deliver_steer(&mut queue, &sibling, "sibling", "turn-1");
+
+        queue.note_published_message(sibling.clone());
+        queue.settle_turn_steers(mine.clone(), "turn-1");
+        queue.settle_turn_steers(sibling.clone(), "turn-1");
+
+        assert_eq!(queue.queued_event_count(mine.clone()), 1, "mine is owed");
+        assert_eq!(
+            queue.queued_event_count(sibling.clone()),
+            0,
+            "the sibling answered its own"
+        );
+    }
+
+    /// A late ack whose event already left the queue must change nothing: the
+    /// requeued copy is the only one left, and consuming it would lose it.
+    #[test]
+    fn a_late_ack_for_an_absent_event_is_refused() {
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+
+        assert!(!queue.record_delivered_steer(scope.clone(), &"f".repeat(64), "turn-1"));
+        assert!(!queue.has_pending_steers(scope));
+    }
+
+    #[test]
+    fn a_turn_settles_only_the_events_it_accepted() {
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        deliver_steer(&mut queue, &scope, "for turn-1", "turn-1");
+        deliver_steer(&mut queue, &scope, "for turn-2", "turn-2");
+
+        queue.settle_turn_steers(scope.clone(), "turn-1");
+
+        assert_eq!(queue.queued_event_count(scope.clone()), 1);
+        assert!(
+            queue.has_pending_steers(scope.clone()),
+            "turn-2's delivery still awaits its own turn"
+        );
+    }
+
+    /// Nothing will ever report for a panicked turn, so its deliveries are owed
+    /// regardless of which turn accepted them.
+    #[test]
+    fn releasing_everything_requeues_all_turns_deliveries() {
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        deliver_steer(&mut queue, &scope, "for turn-1", "turn-1");
+        deliver_steer(&mut queue, &scope, "for turn-2", "turn-2");
+
+        queue.release_all_steers(scope.clone());
+
+        assert_eq!(queue.queued_event_count(scope.clone()), 2);
+        assert!(!queue.has_pending_steers(scope));
+    }
+
+    /// Leaving the channel makes queued events stale, and a delivered steer is
+    /// no less stale. It is dropped, and its id reported so the reaction it left
+    /// behind is cleared with the others.
+    #[test]
+    fn draining_a_channel_discards_and_reports_delivered_steers() {
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        let steered = deliver_steer(&mut queue, &scope, "delivered", "turn-1");
+        assert!(queue.push(queued(&scope, "still queued")));
+
+        let drained = queue.drain_channel(channel_id);
+
+        assert!(
+            drained.contains(&steered),
+            "the delivered steer's id must be reported so its 👀 is cleared: {drained:?}"
+        );
+        assert_eq!(drained.len(), 2);
+        assert!(!queue.has_pending_steers(scope.clone()));
+        assert_eq!(queue.queued_event_count(scope), 0);
+    }
+
+    /// Settlement restores the event ahead of anything queued behind it: the
+    /// mention predates them all, and its `received_at` is preserved.
+    #[test]
+    fn an_owed_mention_returns_to_the_front_of_its_queue() {
+        let channel_id = Uuid::new_v4();
+        let scope = conv(channel_id);
+        let mut queue = EventQueue::new(DedupMode::Queue);
+        deliver_steer(&mut queue, &scope, "steered first", "turn-1");
+        assert!(queue.push(queued(&scope, "arrived later")));
+
+        queue.settle_turn_steers(scope.clone(), "turn-1");
+
+        assert_eq!(
+            queued_contents(&mut queue, &scope),
+            vec!["steered first", "arrived later"],
+            "the steered mention keeps its place in arrival order"
         );
     }
 }

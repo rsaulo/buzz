@@ -401,6 +401,15 @@ const STEER_OUTCOME_INJECTED: &str = "injected";
 /// this must not renew the hard deadline.
 const STEER_OUTCOME_STARTED_NEW_TURN: &str = "startedNewTurn";
 
+/// `outcome` value meaning the turn had already finished and the adapter did
+/// NOT consume the message, because we asked it not to. The content stays ours
+/// to deliver through an ordinary `session/prompt` — which is the point: unlike
+/// `startedNewTurn`, nothing is left running that no turn owns.
+const STEER_OUTCOME_PROMPT_REQUIRED: &str = "promptRequired";
+
+/// Value of `_meta.steering.idleBehavior` requesting the host-owned fallback.
+const STEER_IDLE_BEHAVIOR_PROMPT_REQUIRED: &str = "promptRequired";
+
 /// Which wire method carried an in-flight steer request, recorded so the
 /// response arm decodes the shape that method actually returns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -880,6 +889,21 @@ impl AcpClient {
         self.send_request("session/set_model", params).await
     }
 
+    /// Send `session/close`, releasing whatever the adapter holds for a session.
+    ///
+    /// This is what makes per-thread sessions affordable: in `claude-agent-acp`
+    /// a session owns a CLI process of its own, so a session that is never
+    /// closed is a process that is never reclaimed. Closing also ends the
+    /// session cleanly, which is what lets an agent's own end-of-session work
+    /// (memory retention, for one) run on a real boundary instead of never.
+    ///
+    /// Gate calls on the adapter advertising `sessionCapabilities.close` in its
+    /// `initialize` response — adapters without it answer method-not-found.
+    pub async fn session_close(&mut self, session_id: &str) -> Result<serde_json::Value, AcpError> {
+        let params = serde_json::json!({ "sessionId": session_id });
+        self.send_request("session/close", params).await
+    }
+
     /// Send `session/prompt` with idle-based timeout instead of wall-clock.
     ///
     /// The idle deadline resets on any stdout activity from the agent. The hard
@@ -1031,6 +1055,22 @@ impl AcpClient {
     pub(crate) fn notify_session_spawned(&mut self, session_id: &str) {
         self.goose_usage.seed_zero_baseline(session_id);
         self.standard_usage.seed_zero_baseline(session_id);
+    }
+
+    /// Notify the usage trackers that a session was closed on the wire.
+    ///
+    /// Accounting state is per session generation; a closed generation's
+    /// baselines must not survive it. Call only after the adapter confirmed
+    /// `session/close`.
+    pub(crate) fn notify_session_closed(&mut self, session_id: &str) {
+        self.goose_usage.remove_session(session_id);
+        self.standard_usage.remove_session(session_id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn tracks_usage_session(&self, session_id: &str) -> bool {
+        self.goose_usage.contains_session(session_id)
+            || self.standard_usage.contains_session(session_id)
     }
 
     /// Install a per-turn steer request channel for goose-native
@@ -1740,9 +1780,26 @@ impl AcpClient {
                                                 .filter(|o| {
                                                     *o == STEER_OUTCOME_INJECTED
                                                         || *o == STEER_OUTCOME_STARTED_NEW_TURN
+                                                        || *o == STEER_OUTCOME_PROMPT_REQUIRED
                                                 }),
                                         };
                                         match outcome {
+                                            Some(STEER_OUTCOME_PROMPT_REQUIRED) => {
+                                                // The turn was already over and
+                                                // the adapter handed the message
+                                                // back instead of starting a
+                                                // detached turn. Nothing was
+                                                // delivered and nothing is
+                                                // running: ordinary dispatch
+                                                // owns it from here.
+                                                tracing::info!(
+                                                    "steer returned {STEER_OUTCOME_PROMPT_REQUIRED}: \
+                                                     turn had ended — releasing event for normal dispatch"
+                                                );
+                                                crate::pool::SteerAck::Err(
+                                                    crate::pool::SteerError::PromptRequired,
+                                                )
+                                            }
                                             Some(STEER_OUTCOME_STARTED_NEW_TURN) => {
                                                 // Delivered, but into a NEW
                                                 // turn: the one this read loop
@@ -2220,6 +2277,16 @@ fn build_acp_steer_params(session_id: &str, prompt_blocks: &[&str]) -> serde_jso
     serde_json::json!({
         "sessionId": session_id,
         "prompt": steer_prompt_blocks(prompt_blocks),
+        // Opt into the host-owned idle fallback. Without it the adapter's
+        // default for "the turn already ended" is to start a DETACHED turn
+        // (`startedNewTurn`) that no `session/prompt` owns: its output, tool
+        // calls and edits stream with no turn in flight, and nothing here can
+        // settle it. `promptRequired` instead hands the message back unconsumed
+        // so it goes out through ordinary dispatch, which we can account for.
+        //
+        // Adapters that predate the option ignore unknown `_meta` and keep
+        // answering `startedNewTurn`, which the read loop still handles.
+        "_meta": { "steering": { "idleBehavior": STEER_IDLE_BEHAVIOR_PROMPT_REQUIRED } },
     })
 }
 
@@ -4797,6 +4864,68 @@ sleep 1"#,
         assert!(
             matches!(ack, crate::pool::SteerAck::Success { .. }),
             "startedNewTurn is a delivery success, got {ack:?}"
+        );
+    }
+
+    /// The steer request must carry the host-owned idle opt-in. Without it the
+    /// adapter's default for an already-finished turn is a DETACHED turn that
+    /// no `session/prompt` owns — output and file edits streaming with nothing
+    /// in flight to settle them.
+    #[test]
+    fn acp_steer_params_opt_into_host_owned_idle_fallback() {
+        let params = build_acp_steer_params("sess-1", &["body"]);
+        assert_eq!(
+            params["_meta"]["steering"]["idleBehavior"],
+            serde_json::json!("promptRequired"),
+            "steer must opt into the host-owned idle fallback: {params}"
+        );
+        assert_eq!(params["sessionId"], serde_json::json!("sess-1"));
+        assert!(
+            params["prompt"].is_array(),
+            "the opt-in must not disturb the prompt blocks: {params}"
+        );
+    }
+
+    /// `promptRequired` is the opt-in answer for "the turn had already ended".
+    /// The adapter did NOT consume the message, so this is a release — the event
+    /// goes back to ordinary dispatch — and explicitly not a delivery.
+    #[tokio::test]
+    async fn acp_steer_prompt_required_acks_release_without_delivery() {
+        let script = "sleep 0.2; \
+             echo '{\"jsonrpc\":\"2.0\",\"id\":0,\"result\":{\"outcome\":\"promptRequired\",\"reason\":\"noRunningTurn\"}}'; \
+             sleep 0.2; \
+             echo '{\"jsonrpc\":\"2.0\",\"id\":999,\"result\":{\"stopReason\":\"end_turn\"}}'";
+        let mut client = spawn_script(script).await;
+        set_steering_supported(&mut client);
+
+        let (steer_tx, steer_rx) = tokio::sync::mpsc::channel::<crate::pool::SteerRequest>(1);
+        client.install_steer_rx(steer_rx);
+        let (ack_tx, ack_rx) = tokio::sync::oneshot::channel::<crate::pool::SteerAck>();
+        let send_task = tokio::spawn(async move {
+            steer_tx
+                .send(crate::pool::SteerRequest {
+                    prompt_blocks: vec!["steer body".into()],
+                    ack_tx,
+                })
+                .await
+                .expect("steer_tx send should succeed");
+        });
+
+        let idle = std::time::Duration::from_secs(10);
+        let max_dur = std::time::Duration::from_secs(10);
+        let hard_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let _ = client
+            .read_until_response_with_idle_timeout("sess-test", 999, idle, hard_deadline, max_dur)
+            .await;
+        send_task.await.expect("send_task should complete");
+
+        let ack = ack_rx.await.expect("ack must be received");
+        assert!(
+            matches!(
+                ack,
+                crate::pool::SteerAck::Err(crate::pool::SteerError::PromptRequired)
+            ),
+            "promptRequired must release the event, not count as delivery; got {ack:?}"
         );
     }
 
