@@ -24,8 +24,10 @@ mod run_task;
 mod runtime;
 use runtime::{AgentRuntime, PoolStartup, SessionMode};
 mod scope;
+mod session_eviction;
 mod session_workspace;
 mod setup_mode;
+mod steer_ledger;
 mod usage;
 mod workspace_index;
 
@@ -2303,7 +2305,7 @@ fn any_respawn_in_flight(crash_history: &[SlotCircuit]) -> bool {
 struct RespawnResult {
     index: usize,
     /// Tuple: (initialized client, protocol version, agent name).
-    result: Result<(AcpClient, u32, String)>,
+    result: Result<(AcpClient, u32, String, bool)>,
 }
 
 /// Outcome of a non-cancelling steer attempt, forwarded from a per-attempt
@@ -2321,6 +2323,10 @@ struct SteerAckEvent {
     /// and deadline extension target this, not the whole channel.
     scope: scope::SessionScope,
     event_id: String,
+    /// The turn that accepted the steer. Carried so a late ack settles against
+    /// the turn that received it, not against whichever turn is running when
+    /// the ack lands.
+    turn_id: String,
     /// `Ok` if the read loop sent any of the locked `SteerAck` variants.
     /// `Err` if the oneshot was dropped without a send — should not happen
     /// under the current read-loop drains, but if it ever does the main
@@ -2350,7 +2356,7 @@ impl RespawnGuard {
     /// Send the result and disarm the guard. Uses `try_send` (sync) so there
     /// is no await boundary between marking `sent` and actually enqueueing —
     /// cancellation cannot slip between the two.
-    fn send(mut self, result: Result<(AcpClient, u32, String)>) {
+    fn send(mut self, result: Result<(AcpClient, u32, String, bool)>) {
         // Invariant: try_send succeeds because the channel capacity equals the
         // slot count, and respawn_in_flight guarantees at most one outstanding
         // result per slot. If this ever fails, the channel sizing or the
@@ -3257,6 +3263,30 @@ async fn run_harness(
             last_maintenance = std::time::Instant::now();
             queue.compact_expired_state();
 
+            // An adapter with no `session/close` can only release sessions by
+            // exiting, so process replacement is its eviction path. One per
+            // sweep, and the slot refill below spawns the replacement.
+            if let Some(agent) = pool.recycle_one_uncloseable_agent().await {
+                tracing::info!(
+                    agent,
+                    "recycled adapter process without session/close support"
+                );
+            }
+
+            // Reclaim conversations that have gone idle. This runs at the top of
+            // the loop for the same reason the rest of maintenance does: it
+            // cannot be starved by the biased select. Only idle agents are
+            // swept, so no in-flight turn can have its session closed under it.
+            let evicted = pool::evict_idle_sessions(
+                &mut pool,
+                config.session_idle_ttl_secs,
+                config.max_live_sessions,
+            )
+            .await;
+            if evicted > 0 {
+                tracing::info!(evicted, "idle session sweep closed sessions");
+            }
+
             // Slot refill: spawn background tasks for empty slots whose
             // circuit breaker allows it. spawn_and_init runs off the main
             // loop so it never blocks event processing.
@@ -3552,6 +3582,19 @@ async fn run_harness(
                             }
 
                             if config.ignore_self && buzz_event.event.pubkey.to_hex() == pubkey_hex {
+                                // Our own message coming back off the relay is
+                                // the only first-hand evidence that a turn said
+                                // something to somebody: the agent replies by
+                                // shelling out to `buzz messages send`, so
+                                // nothing in the ACP stream tells answering
+                                // apart from ordinary tool work. Count it before
+                                // dropping the event.
+                                note_self_published(
+                                    &mut queue,
+                                    buzz_event.channel_id,
+                                    kind_u32,
+                                    &buzz_event.event,
+                                );
                                 tracing::debug!(channel_id = %buzz_event.channel_id, "dropping self-authored event");
                                 continue;
                             }
@@ -3929,7 +3972,7 @@ async fn run_harness(
                     recovery_wake::RecoveryWake::Respawn(rr) => {
                         crash_history[rr.index].respawn_in_flight = false;
                         match rr.result {
-                            Ok((acp, protocol_version, agent_name)) => {
+                            Ok((acp, protocol_version, agent_name, session_close_supported)) => {
                                 let agent = OwnedAgent {
                                     index: rr.index,
                                     acp,
@@ -3943,6 +3986,7 @@ async fn run_harness(
                                     agent_name,
                                     goose_system_prompt_supported: None,
                                     protocol_version,
+                                    session_close_supported,
                                 };
                                 pool.return_agent(agent);
                                 tracing::info!(agent = rr.index, "respawn complete");
@@ -4051,6 +4095,7 @@ async fn run_harness(
                 channel_id,
                 scope,
                 event_id,
+                turn_id,
                 ack,
             })) => {
                 // Mid-turn steer attempt resolved (either transport:
@@ -4146,6 +4191,13 @@ async fn run_harness(
                     Ok(pool::SteerAck::Err(pool::SteerError::AgentError { .. })) => {
                         (true, false, false)
                     }
+                    // promptRequired: the turn was already over and the adapter
+                    // deliberately did not consume the message. Release it for
+                    // normal dispatch; no fallback, because there is no
+                    // in-flight turn to cancel and nothing was delivered.
+                    Ok(pool::SteerAck::Err(pool::SteerError::PromptRequired)) => {
+                        (true, false, false)
+                    }
                     // Transport / ExpectedRunIdMissing / OutcomeRejected: the
                     // steer did not land. Release and fire the cancel+merge
                     // fallback so the message still reaches the agent.
@@ -4164,7 +4216,12 @@ async fn run_harness(
                 );
                 if let Ok(pool::SteerAck::Success { session_id }) = &ack {
                     queue.extend_in_flight_deadline(&scope, config.max_turn_duration_secs);
-                    if !pool.record_successful_steer(&scope, event_id.clone(), session_id.clone()) {
+                    if !pool.record_successful_steer(
+                        &scope,
+                        event_id.clone(),
+                        session_id.clone(),
+                        &turn_id,
+                    ) {
                         tracing::warn!(
                             channel = %channel_id,
                             event_id = %event_id,
@@ -4173,7 +4230,17 @@ async fn run_harness(
                     }
                 }
                 if drop_withheld {
-                    queue.remove_event(&scope, &event_id);
+                    // Delivered, not answered: hold the event until the turn
+                    // that accepted it ends. Dropping it here is what let a
+                    // silent turn swallow a mention (see `steer_ledger`).
+                    if !queue.record_delivered_steer(&scope, &event_id, &turn_id) {
+                        tracing::warn!(
+                            channel = %channel_id,
+                            event_id = %event_id,
+                            turn_id = %turn_id,
+                            "steered event was gone before it could be ledgered"
+                        );
+                    }
                 }
                 if release_withheld {
                     queue.release_native_steer(&scope, &event_id);
@@ -4356,7 +4423,7 @@ async fn run_harness(
     // Drain any respawn results that completed before the abort. Explicitly
     // shut down returned agents instead of relying on AcpClient::Drop.
     while let Ok(rr) = respawn_rx.try_recv() {
-        if let Ok((mut acp, _, _)) = rr.result {
+        if let Ok((mut acp, _, _, _)) = rr.result {
             acp.shutdown().await;
             tracing::debug!(agent = rr.index, "reaped respawned agent on shutdown");
         }
@@ -4572,7 +4639,7 @@ fn try_native_steer(
     };
 
     match pool.send_steer(&scope, request) {
-        Ok(()) => {
+        Ok(turn_id) => {
             // Withhold the queued event synchronously BEFORE spawning
             // the watcher: this closes the race where `mark_complete`
             // clears `in_flight_channels` and a stray `flush_next` could
@@ -4603,6 +4670,7 @@ fn try_native_steer(
                     channel_id,
                     scope: scope_for_watcher,
                     event_id: event_id_for_watcher,
+                    turn_id,
                     ack,
                 });
             });
@@ -5154,6 +5222,33 @@ fn dispatch_pending(
 /// False positives (misclassifying a transient error as non-retryable) silently
 /// drop a user message, which is worse than a false negative (extra retries on
 /// an auth error). Both patterns are therefore chosen for high precision.
+/// Count one of our own messages coming back off the relay.
+///
+/// This is the only first-hand evidence that a turn said something to somebody:
+/// a managed agent answers by shelling out to `buzz messages send`, so nothing
+/// in the ACP stream tells replying apart from ordinary tool work.
+///
+/// A threaded reply credits both its thread *and* the channel's ambient
+/// conversation, because an ambient mention is answered by opening a thread
+/// rooted at it — crediting only the thread would leave the ambient session
+/// looking unanswered and requeue a message that was in fact replied to. It
+/// never credits a sibling thread.
+fn note_self_published(queue: &mut EventQueue, channel_id: Uuid, kind: u32, event: &nostr::Event) {
+    // Only a chat message answers anybody. Reactions and the rest are the
+    // agent's own bookkeeping; counting them would settle a steer the user
+    // never received a reply to.
+    if kind != KIND_STREAM_MESSAGE {
+        return;
+    }
+    queue.note_published_message(scope::SessionScope::Conversation { channel_id });
+    if let Some(root_event_id) = queue::parse_thread_tags(event).root_event_id {
+        queue.note_published_message(scope::SessionScope::Thread {
+            channel_id,
+            root_event_id,
+        });
+    }
+}
+
 fn is_auth_error(error: &acp::AcpError) -> bool {
     let acp::AcpError::AgentError { message, .. } = error else {
         return false;
@@ -5395,7 +5490,13 @@ fn handle_prompt_result(
     }
 
     match &result.source {
-        PromptSource::Channel(scope) => queue.mark_complete(scope.clone()),
+        PromptSource::Channel(scope) => {
+            // Before the scope leaves in-flight: every event this turn accepted
+            // by steer gets a verdict here — answered, or owed and requeued —
+            // so none can outlive the turn that took it.
+            queue.settle_turn_steers(scope.clone(), &result.turn_id);
+            queue.mark_complete(scope.clone());
+        }
         PromptSource::Heartbeat => *heartbeat_in_flight = false,
     }
 
@@ -5682,6 +5783,10 @@ fn recover_panicked_agent(
                 // Clear the panicked turn's exact scope so a sibling thread in
                 // the same channel keeps its typing indicator.
                 typing_channels.remove(scope);
+                // The turn died without reporting, so its silence is not
+                // evidence that it answered anything: everything it was handed
+                // mid-turn goes back to the queue.
+                queue.release_all_steers(scope.clone());
                 queue.mark_complete(scope.clone());
             }
             None => {
@@ -6099,6 +6204,16 @@ async fn initialize_agent_pool(
                             &agent_name,
                             startup.isolate_claude_user_config,
                         ));
+                        let session_close_supported =
+                            session_eviction::advertises_session_close(&init_result);
+                        if !session_close_supported {
+                            tracing::warn!(
+                                agent = i,
+                                name = %agent_name,
+                                "adapter does not advertise session/close — idle sessions can \
+                                 only be reclaimed by replacing its process"
+                            );
+                        }
                         agent_slots.push(Some(OwnedAgent {
                             index: i,
                             acp,
@@ -6112,6 +6227,7 @@ async fn initialize_agent_pool(
                             agent_name,
                             goose_system_prompt_supported: None,
                             protocol_version,
+                            session_close_supported,
                         }));
                     }
                     Ok(Err(e)) => {
@@ -6163,7 +6279,7 @@ async fn spawn_and_init(
     isolate_claude_user_config: bool,
     agent_index: usize,
     observer: Option<observer::ObserverHandle>,
-) -> Result<(AcpClient, u32, String)> {
+) -> Result<(AcpClient, u32, String, bool)> {
     let mut acp = AcpClient::spawn(command, args, extra_env, has_generated_codex_config)
         .await
         .map_err(|e| anyhow::anyhow!("failed to spawn agent: {e}"))?;
@@ -6188,7 +6304,8 @@ async fn spawn_and_init(
                 &agent_name,
                 isolate_claude_user_config,
             ));
-            Ok((acp, protocol_version, agent_name))
+            let session_close_supported = session_eviction::advertises_session_close(&init_result);
+            Ok((acp, protocol_version, agent_name, session_close_supported))
         }
         Err(e) => {
             // Explicitly shut down the spawned child to prevent zombie/leak.
@@ -10087,6 +10204,8 @@ mod build_mcp_servers_tests {
             effort_level: None,
             session_title: None,
             claude_isolate_user_config: true,
+            session_idle_ttl_secs: None,
+            max_live_sessions: None,
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: std::collections::HashSet::new(),
@@ -10839,6 +10958,7 @@ mod edit_native_steer_tests {
             agent_name: "dispatched-steer-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
+            session_close_supported: true,
         };
         if matches!(hold_at, HoldAt::Prompt | HoldAt::SessionNewAfterCwdRotation) {
             agent
@@ -11236,6 +11356,8 @@ mod error_outcome_emission_tests {
             effort_level: None,
             session_title: None,
             claude_isolate_user_config: true,
+            session_idle_ttl_secs: None,
+            max_live_sessions: None,
             permission_mode: config::PermissionMode::BypassPermissions,
             respond_to: config::RespondTo::Anyone,
             respond_to_allowlist: HashSet::new(),
@@ -11290,6 +11412,7 @@ mod error_outcome_emission_tests {
             // Error branches under test never read this; 1 is the legacy
             // non-systemPrompt path, the simplest valid value.
             protocol_version: 1,
+            session_close_supported: true,
         }
     }
 
@@ -11476,12 +11599,17 @@ mod error_outcome_emission_tests {
             scope::SessionScope::Conversation { channel_id },
             Default::default(),
         );
+        agent.state.turn_generations.insert(
+            scope::SessionScope::Conversation { channel_id },
+            "turn-1".into(),
+        );
         let mut pool = AgentPool::from_slots(vec![Some(agent)]);
 
         assert!(pool.record_successful_steer(
             &scope::SessionScope::Conversation { channel_id },
             steer_event_id.into(),
             "live-session".into(),
+            "turn-1",
         ));
         let returned = pool.agents_mut()[0].as_ref().expect("idle returned agent");
         assert!(
@@ -11509,6 +11637,7 @@ mod error_outcome_emission_tests {
             &scope::SessionScope::Conversation { channel_id },
             "stale-event".into(),
             "old-session".into(),
+            "turn-1",
         ));
         let returned = pool.agents_mut()[0].as_ref().expect("replacement agent");
         assert!(
@@ -13489,5 +13618,211 @@ mod observer_payload_trim_tests {
         assert!(leaf.starts_with('…'));
         assert!(leaf.ends_with('…'));
         assert!(leaf.contains("[elided"));
+    }
+}
+
+#[cfg(test)]
+mod self_published_accounting_tests {
+    use super::*;
+    use nostr::{EventBuilder, Keys, Kind, Tag};
+
+    fn conv(channel_id: Uuid) -> scope::SessionScope {
+        scope::SessionScope::Conversation { channel_id }
+    }
+
+    fn thread(channel_id: Uuid, root: &str) -> scope::SessionScope {
+        scope::SessionScope::Thread {
+            channel_id,
+            root_event_id: root.to_string(),
+        }
+    }
+
+    fn event(kind: u32, root: Option<&str>) -> nostr::Event {
+        let mut builder = EventBuilder::new(Kind::Custom(kind as u16), "published");
+        if let Some(root) = root {
+            builder = builder.tags([
+                Tag::parse(["e", root, "", "root"]).expect("root tag"),
+                Tag::parse(["e", root, "", "reply"]).expect("reply tag"),
+            ]);
+        }
+        builder
+            .sign_with_keys(&Keys::generate())
+            .expect("sign test event")
+    }
+
+    /// Deliver one steer into `scope`, then report whether it survived
+    /// settlement — i.e. whether the publish credited that scope.
+    fn steer_was_settled_by(
+        queue: &mut EventQueue,
+        scope: &scope::SessionScope,
+        publish: impl FnOnce(&mut EventQueue),
+    ) -> bool {
+        let queued = queue::QueuedEvent {
+            channel_id: scope.channel_id(),
+            scope: scope.clone(),
+            event: EventBuilder::new(Kind::Custom(9), "steered mention")
+                .sign_with_keys(&Keys::generate())
+                .expect("sign steered event"),
+            received_at: std::time::Instant::now(),
+            prompt_tag: "test".into(),
+            edit: None,
+        };
+        let event_id = queued.event.id.to_hex();
+        assert!(queue.push(queued));
+        assert!(queue.mark_native_steer_pending(scope.clone(), &event_id));
+        assert!(queue.record_delivered_steer(scope.clone(), &event_id, "turn-1"));
+
+        publish(queue);
+        queue.settle_turn_steers(scope.clone(), "turn-1");
+        queue.queued_event_count(scope.clone()) == 0
+    }
+
+    #[test]
+    fn a_top_level_reply_credits_the_ambient_conversation() {
+        let channel_id = Uuid::new_v4();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+
+        assert!(steer_was_settled_by(
+            &mut queue,
+            &conv(channel_id),
+            |queue| {
+                note_self_published(queue, channel_id, KIND_STREAM_MESSAGE, &event(9, None));
+            }
+        ));
+    }
+
+    /// An ambient mention is answered by opening a thread rooted at it, so a
+    /// threaded reply has to credit the ambient conversation too — otherwise the
+    /// mention that was just answered comes back as unanswered.
+    #[test]
+    fn a_threaded_reply_credits_both_its_thread_and_the_ambient_conversation() {
+        let channel_id = Uuid::new_v4();
+        let root = "a".repeat(64);
+
+        let mut ambient_queue = EventQueue::new(config::DedupMode::Queue);
+        assert!(
+            steer_was_settled_by(&mut ambient_queue, &conv(channel_id), |queue| {
+                note_self_published(
+                    queue,
+                    channel_id,
+                    KIND_STREAM_MESSAGE,
+                    &event(9, Some(&root)),
+                );
+            }),
+            "the ambient mention was answered by the thread rooted at it"
+        );
+
+        let mut thread_queue = EventQueue::new(config::DedupMode::Queue);
+        assert!(
+            steer_was_settled_by(&mut thread_queue, &thread(channel_id, &root), |queue| {
+                note_self_published(
+                    queue,
+                    channel_id,
+                    KIND_STREAM_MESSAGE,
+                    &event(9, Some(&root)),
+                );
+            }),
+            "the thread's own reply settles the thread"
+        );
+    }
+
+    #[test]
+    fn a_reply_in_one_thread_never_credits_a_sibling() {
+        let channel_id = Uuid::new_v4();
+        let sibling_root = "b".repeat(64);
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+
+        assert!(
+            !steer_was_settled_by(&mut queue, &thread(channel_id, &"a".repeat(64)), |queue| {
+                note_self_published(
+                    queue,
+                    channel_id,
+                    KIND_STREAM_MESSAGE,
+                    &event(9, Some(&sibling_root)),
+                );
+            }),
+            "another thread's reply must leave this mention owed"
+        );
+    }
+
+    /// Native steering in DMs (upstream #8058) puts DM follow-ups into the
+    /// ledger; before it they always took cancel+merge and never reached it.
+    /// A DM is one conversation session under every policy, and any reply the
+    /// agent publishes there credits it: top-level (a top-level DM turn has no
+    /// `--reply-to`) or threaded. A silent turn still leaves the follow-up owed.
+    #[test]
+    fn a_dm_native_steer_is_settled_by_the_dm_reply() {
+        let channel_id = Uuid::new_v4();
+        let root = "d".repeat(64);
+        for follow_up in [event(9, None), event(9, Some(&root))] {
+            assert_eq!(
+                scope::SessionScope::derive(
+                    scope::SessionPolicy::Thread,
+                    channel_id,
+                    true,
+                    &follow_up,
+                ),
+                conv(channel_id),
+                "a DM is one conversation session"
+            );
+        }
+
+        for reply in [event(9, None), event(9, Some(&root))] {
+            let mut queue = EventQueue::new(config::DedupMode::Queue);
+            assert!(
+                steer_was_settled_by(&mut queue, &conv(channel_id), |queue| {
+                    note_self_published(queue, channel_id, KIND_STREAM_MESSAGE, &reply);
+                }),
+                "the DM reply settles the steered follow-up"
+            );
+        }
+
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+        assert!(
+            !steer_was_settled_by(&mut queue, &conv(channel_id), |_| {}),
+            "a silent DM turn leaves the follow-up owed"
+        );
+    }
+
+    /// Agent-to-agent turns inside a thread now reply under their trigger
+    /// (upstream #8124): `root` stays the thread root and `reply` is the
+    /// trigger. That reply settles its own thread's steer.
+    #[test]
+    fn a_nested_reply_under_the_trigger_credits_its_thread() {
+        let channel_id = Uuid::new_v4();
+        let root = "e".repeat(64);
+        let trigger = "f".repeat(64);
+        let nested = EventBuilder::new(Kind::Custom(9), "nested answer")
+            .tags([
+                Tag::parse(["e", &root, "", "root"]).expect("root tag"),
+                Tag::parse(["e", &trigger, "", "reply"]).expect("reply tag"),
+            ])
+            .sign_with_keys(&Keys::generate())
+            .expect("sign nested reply");
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+
+        assert!(steer_was_settled_by(
+            &mut queue,
+            &thread(channel_id, &root),
+            |queue| {
+                note_self_published(queue, channel_id, KIND_STREAM_MESSAGE, &nested);
+            }
+        ));
+    }
+
+    /// Reactions and other self-authored events are the agent's own
+    /// bookkeeping. Counting them would settle a mention the user never got an
+    /// answer to — the exact failure the ledger exists to prevent.
+    #[test]
+    fn a_non_message_event_credits_nothing() {
+        let channel_id = Uuid::new_v4();
+        let mut queue = EventQueue::new(config::DedupMode::Queue);
+
+        assert!(
+            !steer_was_settled_by(&mut queue, &conv(channel_id), |queue| {
+                note_self_published(queue, channel_id, 7, &event(7, None));
+            }),
+            "a reaction is not an answer"
+        );
     }
 }

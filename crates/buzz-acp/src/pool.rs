@@ -23,7 +23,7 @@ use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
@@ -161,6 +161,24 @@ pub struct SessionState {
     /// pool uses this fence to discard that stale provider session before the
     /// worker becomes claimable again.
     scope_owner_generations: HashMap<SessionScope, u64>,
+    /// The turn each live session is currently serving. A steer ack can land
+    /// after its own turn ended and a later one began on the same session, and
+    /// crediting that delivery to the running turn would mark the user's
+    /// message as already delivered to a turn that never saw it — dropping it
+    /// from the next prompt. Session identity alone cannot tell the two turns
+    /// apart, because they share it.
+    pub(crate) turn_generations: HashMap<SessionScope, String>,
+    /// When each live session was last used, for idle eviction. A session with
+    /// no entry here is reclaimable: a bookkeeping gap must not make it
+    /// immortal.
+    last_active: HashMap<SessionScope, Instant>,
+    /// Session IDs removed from routing but not yet closed on the wire. Keeping
+    /// them reachable is what makes rotation and invalidation retryable instead
+    /// of stranding a session nobody can close.
+    retired_sessions: HashSet<String>,
+    /// Rotates close candidates so one wedged session cannot hide its siblings
+    /// behind it, sweep after sweep.
+    eviction_candidate_cursor: usize,
 }
 
 impl SessionState {
@@ -175,7 +193,9 @@ impl SessionState {
                 self.invalidate_scope(scope);
             }
             PromptSource::Heartbeat => {
-                self.heartbeat_session = None;
+                if let Some(session_id) = self.heartbeat_session.take() {
+                    self.retired_sessions.insert(session_id);
+                }
                 self.heartbeat_turn_count = 0;
                 self.heartbeat_standing_context_sent = false;
             }
@@ -184,14 +204,47 @@ impl SessionState {
 
     /// Invalidate a single session scope's session and turn counter.
     /// Returns `true` if the scope had an active session.
+    ///
+    /// The session ID is retired rather than forgotten: it still exists on the
+    /// adapter's side, and the next eviction sweep is what actually closes it.
+    /// Dropping it here would leave a session alive with no way to reach it.
     pub fn invalidate_scope(&mut self, scope: &SessionScope) -> bool {
+        match self.clear_scope_state(scope) {
+            Some(session_id) => {
+                self.retired_sessions.insert(session_id);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Forget one session after the adapter confirmed `session/close`.
+    fn forget_closed_session(&mut self, scope: &SessionScope) -> bool {
+        self.clear_scope_state(scope).is_some()
+    }
+
+    fn clear_scope_state(&mut self, scope: &SessionScope) -> Option<String> {
         self.turn_counts.remove(scope);
         self.core_sections.remove(scope);
         self.canvas_sections.remove(scope);
         self.deliveries.remove(scope);
         self.scope_owner_generations.remove(scope);
         self.session_workspaces.remove(scope);
-        self.sessions.remove(scope).is_some()
+        self.last_active.remove(scope);
+        self.turn_generations.remove(scope);
+        self.sessions.remove(scope)
+    }
+
+    /// Record that a session was just used, restarting its idle clock.
+    pub fn touch(&mut self, scope: &SessionScope) {
+        self.last_active.insert(scope.clone(), Instant::now());
+    }
+
+    /// Retire a session ID that exists on the wire but never entered routing —
+    /// a `session/new` that succeeded and then could not be made usable. The
+    /// eviction sweep closes it like any other retired session.
+    pub(crate) fn retire_session_id(&mut self, session_id: &str) {
+        self.retired_sessions.insert(session_id.to_string());
     }
 
     /// Invalidate every session scope belonging to `channel_id` (channel-wide
@@ -207,6 +260,8 @@ impl SessionState {
             .chain(self.deliveries.keys())
             .chain(self.scope_owner_generations.keys())
             .chain(self.session_workspaces.keys())
+            .chain(self.last_active.keys())
+            .chain(self.turn_generations.keys())
             .filter(|s| s.channel_id() == *channel_id)
             .cloned()
             .collect::<HashSet<_>>()
@@ -222,6 +277,11 @@ impl SessionState {
     }
 
     /// Invalidate all sessions and turn counters (e.g. after agent exit).
+    ///
+    /// Nothing is retired here: every caller reaches this because the adapter
+    /// process is gone or being replaced, and a session cannot outlive the
+    /// process that held it. Retiring the IDs would queue closes against a dead
+    /// pipe forever.
     pub fn invalidate_all(&mut self) {
         self.sessions.clear();
         self.turn_counts.clear();
@@ -233,6 +293,10 @@ impl SessionState {
         self.deliveries.clear();
         self.scope_owner_generations.clear();
         self.session_workspaces.clear();
+        self.last_active.clear();
+        self.turn_generations.clear();
+        self.retired_sessions.clear();
+        self.eviction_candidate_cursor = 0;
     }
 
     pub(crate) fn mark_scope_delivery_success(
@@ -312,6 +376,11 @@ pub struct OwnedAgent {
     pub goose_system_prompt_supported: Option<bool>,
     /// Protocol version reported by the agent in its initialize response.
     pub protocol_version: u32,
+    /// Whether the adapter advertised `session/close` at `initialize`. An
+    /// adapter without it can only release sessions by exiting, so the pool
+    /// replaces its process instead of closing (see
+    /// [`AgentPool::recycle_one_uncloseable_agent`]).
+    pub session_close_supported: bool,
 }
 
 /// Package name reported by `claude-agent-acp` in its `initialize` response.
@@ -392,6 +461,203 @@ pub struct AgentPool {
     /// `Thread` scopes (the sole variant [`hold_decision`](Self::hold_decision)
     /// stamps).
     held_since: HashMap<SessionScope, tokio::time::Instant>,
+    /// Rotates the first agent considered by each eviction sweep, so a slot
+    /// whose closes are slow cannot starve the slots behind it.
+    eviction_agent_cursor: usize,
+}
+
+/// Bound on one sweep's wire work, so maintenance cannot stall the main loop
+/// behind an adapter that is slow to answer `session/close`.
+const SESSION_CLOSE_BUDGET: Duration = Duration::from_secs(10);
+
+/// Close sessions that have gone idle, across every agent sitting in the pool.
+///
+/// This is what makes per-thread sessions affordable rather than a leak: with
+/// `claude-agent-acp` each live session holds a CLI process of its own, so
+/// without eviction the cost grows with every thread ever touched.
+///
+/// It is also what restores end-of-session behavior. A session that never ends
+/// never produces a session boundary, so whatever the agent does at one — memory
+/// retention, for instance — never runs. Closing an idle thread's session ends
+/// it for real.
+///
+/// Only idle agents are swept: an agent checked out for a turn is not in
+/// `agents`, so no in-flight session can have the ground closed under it.
+///
+/// A failed close leaves local state intact on purpose — dropping the session ID
+/// would strand the remote session with no way to ever close it. The next sweep
+/// retries.
+///
+/// Returns the number of sessions actually closed.
+pub async fn evict_idle_sessions(
+    pool: &mut AgentPool,
+    idle_ttl_secs: Option<u64>,
+    max_live_sessions: Option<usize>,
+) -> usize {
+    evict_idle_sessions_with_budget(pool, idle_ttl_secs, max_live_sessions, SESSION_CLOSE_BUDGET)
+        .await
+}
+
+async fn evict_idle_sessions_with_budget(
+    pool: &mut AgentPool,
+    idle_ttl_secs: Option<u64>,
+    max_live_sessions: Option<usize>,
+    close_budget: Duration,
+) -> usize {
+    /// A retired session is only an ID — its scope state is already gone.
+    enum CloseCandidate {
+        Retired(String),
+        Live(SessionScope, String),
+    }
+
+    let now = Instant::now();
+    let mut closed = 0usize;
+    let close_deadline = tokio::time::Instant::now() + close_budget;
+
+    let slot_count = pool.agents.len();
+    if slot_count == 0 {
+        return 0;
+    }
+    let first_slot = pool.eviction_agent_cursor % slot_count;
+    pool.eviction_agent_cursor = (first_slot + 1) % slot_count;
+
+    for offset in 0..slot_count {
+        let index = (first_slot + offset) % slot_count;
+        let Some(agent) = pool.agents[index].as_mut() else {
+            continue;
+        };
+        let policy = crate::session_eviction::SessionEvictionPolicy::resolve(
+            &agent.agent_name,
+            idle_ttl_secs,
+            max_live_sessions,
+        );
+        // Sorted so a sweep's order is a property of the state, not of hashing.
+        let mut retired: Vec<String> = agent.state.retired_sessions.iter().cloned().collect();
+        retired.sort();
+        let victims = crate::session_eviction::evictable(
+            &agent.state.sessions,
+            &agent.state.last_active,
+            &policy,
+            now,
+        );
+
+        if !agent.session_close_supported {
+            if !retired.is_empty() {
+                tracing::warn!(
+                    target: "pool::evict",
+                    agent = agent.index,
+                    retired = retired.len(),
+                    "adapter cannot close retired sessions; process replacement required"
+                );
+            } else if !victims.is_empty() {
+                tracing::debug!(
+                    target: "pool::evict",
+                    agent = agent.index,
+                    candidates = victims.len(),
+                    "adapter cannot close sessions — skipping eviction"
+                );
+            }
+            continue;
+        }
+
+        // Retired first: those sessions are already unreachable, so closing one
+        // reclaims an adapter resource that nothing can ever use again.
+        let mut candidates: Vec<CloseCandidate> = retired
+            .into_iter()
+            .map(CloseCandidate::Retired)
+            .chain(
+                victims
+                    .into_iter()
+                    .map(|(scope, session_id)| CloseCandidate::Live(scope, session_id)),
+            )
+            .collect();
+        if candidates.is_empty() {
+            continue;
+        }
+        // Rotate the starting point: without this, a session that always times
+        // out would consume the budget first on every sweep and hide the rest.
+        let candidate_index = agent.state.eviction_candidate_cursor % candidates.len();
+        agent.state.eviction_candidate_cursor =
+            agent.state.eviction_candidate_cursor.wrapping_add(1);
+        candidates.rotate_left(candidate_index);
+
+        for candidate in candidates {
+            let remaining = close_deadline
+                .checked_duration_since(tokio::time::Instant::now())
+                .unwrap_or_default();
+            if remaining.is_zero() {
+                return closed;
+            }
+
+            let (session_id, live_scope) = match &candidate {
+                CloseCandidate::Retired(session_id) => (session_id.clone(), None),
+                CloseCandidate::Live(scope, session_id) => {
+                    (session_id.clone(), Some(scope.clone()))
+                }
+            };
+            match tokio::time::timeout(remaining, agent.acp.session_close(&session_id)).await {
+                Ok(Ok(_)) => {
+                    agent.acp.notify_session_closed(&session_id);
+                    match candidate {
+                        CloseCandidate::Retired(session_id) => {
+                            agent.state.retired_sessions.remove(&session_id);
+                            tracing::info!(
+                                target: "pool::evict",
+                                agent = agent.index,
+                                session_id = %session_id,
+                                "closed retired session"
+                            );
+                        }
+                        CloseCandidate::Live(scope, session_id) => {
+                            agent.state.forget_closed_session(&scope);
+                            // The scope has no provider session anywhere now,
+                            // so it has no owner either. A stale owner entry
+                            // would make the next message for this thread wait
+                            // out the busy-owner hold (#7340) whenever this
+                            // agent is busy elsewhere, for a session that no
+                            // longer exists — as upstream's own invalidations
+                            // (`invalidate_scope_session`) already avoid.
+                            if pool
+                                .session_owners
+                                .get(&scope)
+                                .is_some_and(|owner| owner.agent_index == agent.index)
+                            {
+                                pool.session_owners.remove(&scope);
+                            }
+                            tracing::info!(
+                                target: "pool::evict",
+                                agent = agent.index,
+                                scope = %scope.telemetry_label(),
+                                session_id = %session_id,
+                                idle_ttl_secs = policy.idle_ttl.as_secs(),
+                                max_live_sessions = policy.max_live_sessions,
+                                "closed idle session"
+                            );
+                        }
+                    }
+                    closed += 1;
+                }
+                Ok(Err(error)) => tracing::warn!(
+                    target: "pool::evict",
+                    agent = agent.index,
+                    scope = ?live_scope.as_ref().map(SessionScope::telemetry_label),
+                    session_id,
+                    error = %error,
+                    "session close failed; keeping state to retry next sweep"
+                ),
+                Err(_) => tracing::warn!(
+                    target: "pool::evict",
+                    agent = agent.index,
+                    scope = ?live_scope.as_ref().map(SessionScope::telemetry_label),
+                    session_id,
+                    timeout_secs = remaining.as_secs_f64(),
+                    "session close timed out; keeping state to retry next sweep"
+                ),
+            }
+        }
+    }
+
+    closed
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -597,6 +863,15 @@ pub enum SteerError {
     /// drop the user's message: codex-acp answers unrecognized extension
     /// methods with a bare `{}` success rather than `-32601`.
     OutcomeRejected { outcome: String },
+    /// The adapter answered `promptRequired`: the turn had already finished, so
+    /// it did not consume the message and handed it back to us — the host-owned
+    /// idle fallback we opt into via `_meta.steering.idleBehavior`.
+    ///
+    /// Not a failure. The main loop releases the withheld event for ordinary
+    /// dispatch and must NOT fire the cancel+merge fallback: there is no
+    /// in-flight turn to cancel, and the message was never delivered, so
+    /// nothing is duplicated by re-prompting it.
+    PromptRequired,
     /// The read loop never got to dispatch the steer because the prompt
     /// completed first. Delivery state for the underlying message is
     /// unknown after prompt completion — the main loop must treat this as
@@ -965,6 +1240,7 @@ impl AgentPool {
             session_owners: HashMap::new(),
             next_scope_owner_generation: 1,
             held_since: HashMap::new(),
+            eviction_agent_cursor: 0,
         }
     }
 
@@ -1120,6 +1396,31 @@ impl AgentPool {
         self.agents[idx] = Some(agent);
     }
 
+    /// Replace at most one idle adapter process that accumulated sessions it
+    /// cannot close. Process teardown is that adapter's only session boundary,
+    /// so this is the eviction path for it — one per sweep, to bound the churn.
+    ///
+    /// Returns the emptied slot index; the caller's slot-refill logic spawns
+    /// the replacement.
+    pub async fn recycle_one_uncloseable_agent(&mut self) -> Option<usize> {
+        let index = self.agents.iter().position(|slot| {
+            slot.as_ref().is_some_and(|agent| {
+                !agent.session_close_supported && !agent.state.retired_sessions.is_empty()
+            })
+        })?;
+        let mut agent = self.agents[index]
+            .take()
+            .expect("selected occupied agent slot");
+        tracing::warn!(
+            target: "pool::evict",
+            agent = index,
+            retired = agent.state.retired_sessions.len(),
+            "replacing adapter process to reclaim uncloseable sessions"
+        );
+        agent.acp.shutdown().await;
+        Some(index)
+    }
+
     /// Whether any agent is currently idle (sitting in its slot).
     pub fn any_idle(&self) -> bool {
         self.agents.iter().any(|slot| slot.is_some())
@@ -1210,7 +1511,7 @@ impl AgentPool {
     /// Try to send a goose-native steer request to the in-flight task for
     /// `channel_id`.
     ///
-    /// Returns `Ok(())` if the request was accepted by the read loop's
+    /// Returns `Ok(turn_id)` if the request was accepted by the read loop's
     /// receiver (capacity-1 mpsc; one slot is the single in-flight steer
     /// write). Returns `Err(SteerError::Transport(_))` on `Full`/`Closed`
     /// (already-in-flight write, or read loop torn down); the `Transport`
@@ -1231,11 +1532,14 @@ impl AgentPool {
     /// and this call, or the channel was never in flight). This is
     /// semantically a soft no-op — the caller should release any withheld
     /// event and let normal dispatch handle delivery.
+    /// Returns the id of the turn that accepted the steer, so a late ack can be
+    /// matched against the turn that actually received it rather than whatever
+    /// is running when the ack lands.
     pub fn send_steer(
         &mut self,
         scope: &SessionScope,
         request: SteerRequest,
-    ) -> Result<(), SteerError> {
+    ) -> Result<String, SteerError> {
         let meta = self
             .task_map
             .values_mut()
@@ -1245,8 +1549,9 @@ impl AgentPool {
             .steer_tx
             .as_ref()
             .ok_or_else(|| SteerAdmissionReason::SenderAbsent.transport_refusal())?;
+        let turn_id = meta.turn_id.clone();
         match tx.try_send(request) {
-            Ok(()) => Ok(()),
+            Ok(()) => Ok(turn_id),
             // Capacity-1 mailbox already holds one in-flight steer write.
             // The refused request (including its oneshot ack) comes back
             // inside the error and is dropped here, exactly as before.
@@ -1264,16 +1569,21 @@ impl AgentPool {
     /// accepted it. Acks may arrive before or after the prompt result: while
     /// the task is in flight we stage the delivery in `TaskMeta`; after return
     /// we write directly to the idle agent's matching live-session ledger.
+    /// `turn_id` is the turn that accepted the steer, as returned by
+    /// [`send_steer`](Self::send_steer). Both arms match on it: an ack that
+    /// outlived its own turn belongs to no ledger, and recording it against the
+    /// current turn would retire an event that turn never received.
     pub fn record_successful_steer(
         &mut self,
         scope: &SessionScope,
         event_id: String,
         session_id: String,
+        turn_id: &str,
     ) -> bool {
         if let Some(meta) = self
             .task_map
             .values_mut()
-            .find(|meta| meta.scope.as_ref() == Some(scope))
+            .find(|meta| meta.scope.as_ref() == Some(scope) && meta.turn_id == turn_id)
         {
             meta.successful_steer_deliveries
                 .insert(SuccessfulSteerDelivery {
@@ -1285,6 +1595,7 @@ impl AgentPool {
 
         let Some(agent) = self.agents.iter_mut().flatten().find(|agent| {
             agent.state.sessions.get(scope).map(String::as_str) == Some(session_id.as_str())
+                && agent.state.turn_generations.get(scope).map(String::as_str) == Some(turn_id)
         }) else {
             return false;
         };
@@ -1588,6 +1899,26 @@ struct NewSessionChannelContext<'a> {
     channel_type: Option<&'a str>,
 }
 
+/// Retire a session that exists on the wire but could not be made usable.
+///
+/// `session/new` succeeded, so the adapter is holding a session; the failure
+/// came afterwards, while applying the model, effort, or permission mode.
+/// Returning the error without retiring the ID would strand that session with
+/// nothing left pointing at it — for an adapter that spawns a process per
+/// session, a leaked process per failed activation. Retiring hands it to the
+/// eviction sweep, which closes it like any other retired session.
+fn retire_unusable_session(agent: &mut OwnedAgent, session_id: &str, error: AcpError) -> AcpError {
+    tracing::warn!(
+        target: "pool::session",
+        agent = agent.index,
+        session_id,
+        error = %error,
+        "new session could not be activated; retiring it for the next eviction sweep"
+    );
+    agent.state.retire_session_id(session_id);
+    error
+}
+
 async fn create_session_and_apply_model(
     agent: &mut OwnedAgent,
     ctx: &PromptContext,
@@ -1665,7 +1996,7 @@ async fn create_session_and_apply_model(
                         "Goose does not support its system-prompt extension; using user-message framing"
                     );
                 }
-                Err(error) => return Err(error),
+                Err(error) => return Err(retire_unusable_session(agent, &resp.session_id, error)),
             }
         }
     }
@@ -1700,8 +2031,14 @@ async fn create_session_and_apply_model(
         let pending_ack = std::mem::take(&mut agent.desired_model_pending_ack);
         match resolve_model_switch_method(&resp.raw, desired) {
             Some(method) => {
-                match apply_model_switch(&mut agent.acp, &resp.session_id, desired, &method).await?
+                match match apply_model_switch(&mut agent.acp, &resp.session_id, desired, &method)
+                    .await
                 {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return Err(retire_unusable_session(agent, &resp.session_id, error))
+                    }
+                } {
                     ModelSwitchOutcome::Applied(switch_result) => {
                         // The adapter rebuilds `session.configOptions` for the
                         // target model and echoes them here. Refresh capabilities
@@ -1800,7 +2137,11 @@ async fn create_session_and_apply_model(
     // the session is actually running; computed BEFORE the capture emission so
     // the cached configOptions tell the truth about the running session.
     let effort_snapshot = post_switch_snapshot.as_ref().unwrap_or(&resp.raw);
-    let effort_outcome = apply_startup_effort(agent, effort_snapshot, &resp.session_id).await?;
+    let effort_outcome = match apply_startup_effort(agent, effort_snapshot, &resp.session_id).await
+    {
+        Ok(outcome) => outcome,
+        Err(error) => return Err(retire_unusable_session(agent, &resp.session_id, error)),
+    };
 
     // Emit session config for desktop consumption (config bridge tier 1b).
     // Emitted AFTER desired_model resolution so the desktop caches the
@@ -1850,7 +2191,11 @@ async fn create_session_and_apply_model(
     if !ctx.permission_mode.is_default()
         && agent_supports_mode(&resp.raw, ctx.permission_mode.as_wire_str())
     {
-        apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await?;
+        if let Err(error) =
+            apply_permission_mode(&mut agent.acp, &resp.session_id, &ctx.permission_mode).await
+        {
+            return Err(retire_unusable_session(agent, &resp.session_id, error));
+        }
     }
 
     Ok(resp.session_id)
@@ -2775,6 +3120,10 @@ pub async fn run_prompt_task(
                             .state
                             .deliveries
                             .insert(scope.clone(), ChannelDeliveryState::default());
+                        // Start the idle clock at creation, not at first
+                        // completion: a session whose turn fails is still a
+                        // session the adapter holds.
+                        agent.state.touch(scope);
                         // Seed a zero usage baseline: buzz-acp spawned this session
                         // so prior usage is zero by definition — first turn is reliable.
                         agent.acp.notify_session_spawned(&sid);
@@ -2870,6 +3219,15 @@ pub async fn run_prompt_task(
             }
         }
     };
+    // Bind this session to the turn now serving it. A steer ack that lands
+    // after the turn ends is matched against this, so it cannot be credited to
+    // whatever turn happens to be running when it arrives.
+    if let PromptSource::Channel(scope) = &source {
+        agent
+            .state
+            .turn_generations
+            .insert(scope.clone(), turn_id.clone());
+    }
     agent.acp.set_observer_context(observer::context_for_turn(
         observer_channel_id,
         Some(session_id.clone()),
@@ -3488,6 +3846,12 @@ pub async fn run_prompt_task(
                 );
             } else if !agent.has_system_prompt_support() {
                 agent.state.heartbeat_standing_context_sent = true;
+            }
+
+            // The turn is over and the session survived it: restart its idle
+            // clock so eviction measures silence, not age.
+            if let PromptSource::Channel(scope) = &source {
+                agent.state.touch(scope);
             }
 
             let should_rotate = matches!(
@@ -7180,6 +7544,7 @@ pub(crate) mod tests {
                 agent_name: "observer-test-agent".into(),
                 goose_system_prompt_supported: None,
                 protocol_version: 1,
+                session_close_supported: true,
             };
             let observer = observer::ObserverHandle::in_process();
             let mut observer_rx = observer.subscribe();
@@ -7308,6 +7673,7 @@ done"#
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
+            session_close_supported: true,
         };
         agent.state.heartbeat_session = Some("live-session".into());
 
@@ -7409,6 +7775,7 @@ done"#
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
+            session_close_supported: true,
         };
         agent
             .state
@@ -7602,6 +7969,7 @@ done"#
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
+            session_close_supported: true,
         };
         agent
             .state
@@ -7821,6 +8189,7 @@ done"#
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
+            session_close_supported: true,
         };
         agent
             .state
@@ -7981,6 +8350,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             agent_name: "legacy-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
+            session_close_supported: true,
         };
         agent
             .state
@@ -7994,6 +8364,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             .state
             .deliveries
             .insert(conv(channel_id), ChannelDeliveryState::default());
+        agent
+            .state
+            .turn_generations
+            .insert(conv(channel_id), "steered-turn".into());
 
         // Model the adversarial ordering: the task result has already retired
         // its TaskMeta and returned the agent before the successful ack arrives.
@@ -8002,6 +8376,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             &conv(channel_id),
             steered_event_id.clone(),
             "live-session".into(),
+            "steered-turn",
         ));
         let agent = pool
             .try_claim(Some(&conv(channel_id)))
@@ -8699,6 +9074,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
+            session_close_supported: true,
         };
         agent.state.sessions.insert(ta.clone(), "sess-a".into());
         agent.state.sessions.insert(tb.clone(), "sess-b".into());
@@ -8781,6 +9157,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             agent_name: "test".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
+            session_close_supported: true,
         };
         agent.state.sessions.insert(scope, "sess".into());
         agent
@@ -9844,6 +10221,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
+            session_close_supported: true,
         };
 
         // Simulate dispatch: install a steer receiver (normally done by
@@ -9905,6 +10283,7 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             agent_name: "unknown".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
+            session_close_supported: true,
         };
 
         // Simulate a completed turn: `steer_rx` was consumed by the read loop
@@ -11215,6 +11594,7 @@ done"#
             agent_name: "boundary-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 1,
+            session_close_supported: true,
         };
 
         let event = EventBuilder::new(Kind::Custom(9), "do project work")
@@ -11611,6 +11991,7 @@ mod startup_effort_tests {
             agent_name: "effort-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
+            session_close_supported: true,
         }
     }
 
@@ -11876,6 +12257,7 @@ mod model_switch_tests {
             agent_name: "switch-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
+            session_close_supported: true,
         }
     }
 
@@ -12459,6 +12841,7 @@ done"#
             agent_name: "switch-effort-test-agent".into(),
             goose_system_prompt_supported: None,
             protocol_version: 2,
+            session_close_supported: true,
         }
     }
 
@@ -12562,3 +12945,536 @@ done"#
 #[cfg(all(test, unix))]
 #[path = "pool/pi_prompt_tests.rs"]
 mod pi_prompt_tests;
+
+#[cfg(test)]
+mod session_eviction_tests {
+    use super::*;
+    use crate::acp::AcpClient;
+
+    fn conv(channel_id: Uuid) -> SessionScope {
+        SessionScope::Conversation { channel_id }
+    }
+
+    fn thread(channel_id: Uuid, root: &str) -> SessionScope {
+        SessionScope::Thread {
+            channel_id,
+            root_event_id: root.to_string(),
+        }
+    }
+
+    fn owned_agent(index: usize, acp: AcpClient, state: SessionState) -> OwnedAgent {
+        OwnedAgent {
+            index,
+            acp,
+            state,
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "opencode".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+            session_close_supported: true,
+        }
+    }
+
+    /// One idle session, already past any TTL, and an adapter scripted to answer
+    /// exactly one `session/close` with `response`.
+    async fn agent_with_close_response(response: &str) -> (AgentPool, SessionScope) {
+        let escaped = response.replace('"', "\\\"");
+        let script = format!("read -r _line; printf '%s\\n' \"{escaped}\"; sleep 1");
+        let mut acp = AcpClient::spawn("bash", &["-c".into(), script], &[], false)
+            .await
+            .expect("spawn close-response ACP");
+        let session_id = "sess-idle";
+        acp.notify_session_spawned(session_id);
+
+        let scope = conv(Uuid::new_v4());
+        let mut state = SessionState::default();
+        state.sessions.insert(scope.clone(), session_id.into());
+        state
+            .deliveries
+            .insert(scope.clone(), ChannelDeliveryState::default());
+        state
+            .last_active
+            .insert(scope.clone(), Instant::now() - Duration::from_secs(60));
+
+        (
+            AgentPool::from_slots(vec![Some(owned_agent(0, acp, state))]),
+            scope,
+        )
+    }
+
+    #[tokio::test]
+    async fn successful_eviction_clears_session_delivery_and_usage_state() {
+        let (mut pool, scope) =
+            agent_with_close_response(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#).await;
+
+        assert_eq!(evict_idle_sessions(&mut pool, Some(1), Some(0)).await, 1);
+
+        let agent = pool.agents[0].as_ref().expect("idle agent");
+        assert!(!agent.state.sessions.contains_key(&scope));
+        assert!(!agent.state.deliveries.contains_key(&scope));
+        assert!(
+            !agent.state.retired_sessions.contains("sess-idle"),
+            "a confirmed close forgets the session instead of retiring it"
+        );
+        assert!(
+            !agent.acp.tracks_usage_session("sess-idle"),
+            "accounting must not outlive the session generation"
+        );
+    }
+
+    /// An evicted scope must not keep its owner: otherwise the next message for
+    /// that thread is held for a busy agent that no longer has its session.
+    #[tokio::test]
+    async fn eviction_releases_the_scope_owner() {
+        let (mut pool, scope) =
+            agent_with_close_response(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#).await;
+        let generation = pool.record_scope_owner(scope.clone(), 0);
+        pool.agents[0]
+            .as_mut()
+            .expect("idle agent")
+            .state
+            .set_scope_owner_generation(scope.clone(), generation);
+
+        assert_eq!(evict_idle_sessions(&mut pool, Some(1), Some(0)).await, 1);
+
+        assert!(
+            !pool.session_owners.contains_key(&scope),
+            "a closed session leaves its scope unowned"
+        );
+        assert!(!pool.should_hold_for_busy_owner(&scope));
+    }
+
+    /// A failed close must leave everything in place: dropping the ID would
+    /// strand a live session with nothing able to close it.
+    #[tokio::test]
+    async fn failed_eviction_retains_state_for_the_next_sweep() {
+        let (mut pool, scope) = agent_with_close_response(
+            r#"{"jsonrpc":"2.0","id":0,"error":{"code":-32000,"message":"close failed"}}"#,
+        )
+        .await;
+
+        assert_eq!(evict_idle_sessions(&mut pool, Some(1), Some(0)).await, 0);
+
+        let agent = pool.agents[0].as_ref().expect("idle agent");
+        assert_eq!(
+            agent.state.sessions.get(&scope).map(String::as_str),
+            Some("sess-idle")
+        );
+        assert!(agent.state.deliveries.contains_key(&scope));
+        assert!(agent.acp.tracks_usage_session("sess-idle"));
+    }
+
+    #[tokio::test]
+    async fn every_candidate_is_drained_within_one_sweep() {
+        let script = r#"
+for id in 0 1 2; do
+    read -r _line
+    printf '%s\n' "{\"jsonrpc\":\"2.0\",\"id\":$id,\"result\":{}}"
+done
+sleep 1
+"#;
+        let mut acp = AcpClient::spawn("bash", &["-c".into(), script.into()], &[], false)
+            .await
+            .expect("spawn multi-close ACP");
+        let channel_id = Uuid::new_v4();
+        let scopes = [
+            conv(channel_id),
+            thread(channel_id, &"a".repeat(64)),
+            thread(channel_id, &"b".repeat(64)),
+        ];
+        let mut state = SessionState::default();
+        for (index, scope) in scopes.iter().enumerate() {
+            let session_id = format!("sess-{index}");
+            acp.notify_session_spawned(&session_id);
+            state.sessions.insert(scope.clone(), session_id);
+            state
+                .deliveries
+                .insert(scope.clone(), ChannelDeliveryState::default());
+            state
+                .last_active
+                .insert(scope.clone(), Instant::now() - Duration::from_secs(60));
+        }
+        let mut pool = AgentPool::from_slots(vec![Some(owned_agent(0, acp, state))]);
+
+        assert_eq!(evict_idle_sessions(&mut pool, Some(1), Some(0)).await, 3);
+        let agent = pool.agents[0].as_ref().expect("idle agent");
+        assert!(agent.state.sessions.is_empty());
+        assert!(agent.state.deliveries.is_empty());
+    }
+
+    /// Retired sessions are unreachable, so they are closed regardless of the
+    /// idle limits — those govern live sessions only.
+    #[tokio::test]
+    async fn retired_session_is_closed_even_with_both_limits_disabled() {
+        let (mut pool, scope) =
+            agent_with_close_response(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#).await;
+        {
+            let agent = pool.agents[0].as_mut().expect("idle agent");
+            assert!(agent.state.invalidate_scope(&scope));
+            assert!(
+                agent.state.retired_sessions.contains("sess-idle"),
+                "invalidation must retire the ID, not forget it"
+            );
+        }
+
+        assert_eq!(evict_idle_sessions(&mut pool, Some(0), Some(0)).await, 1);
+        let agent = pool.agents[0].as_ref().expect("idle agent");
+        assert!(agent.state.retired_sessions.is_empty());
+        assert!(!agent.acp.tracks_usage_session("sess-idle"));
+    }
+
+    #[tokio::test]
+    async fn an_adapter_without_close_support_is_recycled_instead() {
+        let (mut pool, scope) =
+            agent_with_close_response(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#).await;
+        {
+            let agent = pool.agents[0].as_mut().expect("idle agent");
+            agent.session_close_supported = false;
+            assert!(agent.state.invalidate_scope(&scope));
+        }
+
+        // No close is attempted: the request would come back as -32601.
+        assert_eq!(evict_idle_sessions(&mut pool, Some(1), Some(0)).await, 0);
+        assert_eq!(pool.recycle_one_uncloseable_agent().await, Some(0));
+        assert!(
+            pool.agents[0].is_none(),
+            "the emptied slot is refilled by the caller's slot-refill logic"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_adapter_without_close_support_and_nothing_retired_is_left_alone() {
+        let (mut pool, _scope) =
+            agent_with_close_response(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#).await;
+        pool.agents[0]
+            .as_mut()
+            .expect("idle agent")
+            .session_close_supported = false;
+
+        assert_eq!(
+            pool.recycle_one_uncloseable_agent().await,
+            None,
+            "process replacement is for reclaiming retired sessions, not routine"
+        );
+        assert!(pool.agents[0].is_some());
+    }
+
+    /// A close that hangs must not consume every sweep: the next one starts at
+    /// the following slot, so a healthy agent behind it still gets swept.
+    #[tokio::test]
+    async fn a_hanging_close_does_not_starve_later_slots() {
+        let (mut healthy_pool, healthy_scope) =
+            agent_with_close_response(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#).await;
+        let mut healthy = healthy_pool.agents[0].take().expect("healthy agent");
+        healthy.index = 1;
+
+        let mut hanging_acp = AcpClient::spawn(
+            "bash",
+            &["-c".into(), "read -r _line; sleep 60".into()],
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn hanging ACP");
+        hanging_acp.notify_session_spawned("sess-hanging");
+        let hanging_scope = conv(Uuid::new_v4());
+        let mut hanging_state = SessionState::default();
+        hanging_state
+            .sessions
+            .insert(hanging_scope.clone(), "sess-hanging".into());
+        hanging_state.last_active.insert(
+            hanging_scope.clone(),
+            Instant::now() - Duration::from_secs(60),
+        );
+        let hanging = owned_agent(0, hanging_acp, hanging_state);
+
+        let mut pool = AgentPool::from_slots(vec![Some(hanging), Some(healthy)]);
+
+        // Sweep 1 starts at slot 0 and spends its whole budget there.
+        assert_eq!(
+            evict_idle_sessions_with_budget(
+                &mut pool,
+                Some(1),
+                Some(0),
+                Duration::from_millis(200)
+            )
+            .await,
+            0
+        );
+        assert!(pool.agents[1]
+            .as_ref()
+            .expect("healthy agent retained")
+            .state
+            .sessions
+            .contains_key(&healthy_scope));
+
+        // Sweep 2 starts at slot 1 because the cursor advanced.
+        assert_eq!(
+            evict_idle_sessions_with_budget(
+                &mut pool,
+                Some(1),
+                Some(0),
+                Duration::from_millis(500)
+            )
+            .await,
+            1
+        );
+        assert!(!pool.agents[1]
+            .as_ref()
+            .expect("healthy agent retained")
+            .state
+            .sessions
+            .contains_key(&healthy_scope));
+        assert!(
+            pool.agents[0]
+                .as_ref()
+                .expect("hanging agent retained")
+                .state
+                .sessions
+                .contains_key(&hanging_scope),
+            "the hanging session keeps its state for a later retry"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_agent_is_never_swept() {
+        let (mut pool, scope) =
+            agent_with_close_response(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#).await;
+        // Checking the agent out is what a dispatched turn does; its state is
+        // then invisible to the pool, which is the mechanism that keeps a live
+        // turn's session safe.
+        let agent = pool.try_claim(Some(&scope)).expect("claim idle agent");
+
+        assert_eq!(evict_idle_sessions(&mut pool, Some(1), Some(0)).await, 0);
+
+        assert_eq!(
+            agent.state.sessions.get(&scope).map(String::as_str),
+            Some("sess-idle"),
+            "the checked-out agent still holds its session"
+        );
+        pool.return_agent(agent);
+    }
+
+    #[tokio::test]
+    async fn touch_restarts_the_idle_clock() {
+        let (mut pool, scope) =
+            agent_with_close_response(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#).await;
+        pool.agents[0]
+            .as_mut()
+            .expect("idle agent")
+            .state
+            .touch(&scope);
+
+        assert_eq!(
+            evict_idle_sessions(&mut pool, Some(600), Some(0)).await,
+            0,
+            "a session used a moment ago is not idle"
+        );
+        assert!(pool.agents[0]
+            .as_ref()
+            .expect("idle agent")
+            .state
+            .sessions
+            .contains_key(&scope));
+    }
+
+    #[tokio::test]
+    async fn an_unusable_new_session_is_retired_for_the_sweep() {
+        let (mut pool, _scope) =
+            agent_with_close_response(r#"{"jsonrpc":"2.0","id":0,"result":{}}"#).await;
+        let agent = pool.agents[0].as_mut().expect("idle agent");
+
+        let error = retire_unusable_session(
+            agent,
+            "sess-never-activated",
+            AcpError::Protocol("model switch failed".into()),
+        );
+
+        assert!(matches!(error, AcpError::Protocol(_)), "error is forwarded");
+        assert!(
+            agent
+                .state
+                .retired_sessions
+                .contains("sess-never-activated"),
+            "a session that exists on the wire must stay reachable for close"
+        );
+    }
+}
+
+#[cfg(test)]
+mod steer_turn_fencing_tests {
+    use super::*;
+    use crate::acp::AcpClient;
+
+    fn conv(channel_id: Uuid) -> SessionScope {
+        SessionScope::Conversation { channel_id }
+    }
+
+    async fn idle_agent_serving(
+        scope: &SessionScope,
+        session_id: &str,
+        turn_id: &str,
+    ) -> AgentPool {
+        let acp = AcpClient::spawn("cat", &[], &[], false)
+            .await
+            .expect("spawn inert ACP");
+        let mut state = SessionState::default();
+        state.sessions.insert(scope.clone(), session_id.into());
+        state
+            .deliveries
+            .insert(scope.clone(), ChannelDeliveryState::default());
+        state.turn_generations.insert(scope.clone(), turn_id.into());
+        let agent = OwnedAgent {
+            index: 0,
+            acp,
+            state,
+            model_capabilities: None,
+            desired_model: None,
+            model_overridden: false,
+            desired_model_request_id: None,
+            desired_model_pending_ack: false,
+            startup_effort: None,
+            agent_name: "opencode".into(),
+            goose_system_prompt_supported: None,
+            protocol_version: 2,
+            session_close_supported: true,
+        };
+        AgentPool::from_slots(vec![Some(agent)])
+    }
+
+    fn delivered(pool: &AgentPool, scope: &SessionScope) -> HashSet<String> {
+        pool.agents[0]
+            .as_ref()
+            .expect("idle agent")
+            .state
+            .deliveries
+            .get(scope)
+            .map(|delivery| delivery.delivered_event_ids.clone())
+            .unwrap_or_default()
+    }
+
+    #[tokio::test]
+    async fn an_ack_from_the_serving_turn_is_recorded() {
+        let scope = conv(Uuid::new_v4());
+        let mut pool = idle_agent_serving(&scope, "live-session", "turn-1").await;
+
+        assert!(pool.record_successful_steer(
+            &scope,
+            "event-1".into(),
+            "live-session".into(),
+            "turn-1",
+        ));
+        assert!(delivered(&pool, &scope).contains("event-1"));
+    }
+
+    /// The case session identity cannot catch: the same session, a later turn.
+    /// Recording here would tell the next prompt that the user's message was
+    /// already delivered — to a turn that never received it.
+    #[tokio::test]
+    async fn an_ack_that_outlived_its_turn_is_refused_on_the_same_session() {
+        let scope = conv(Uuid::new_v4());
+        let mut pool = idle_agent_serving(&scope, "live-session", "turn-2").await;
+
+        assert!(
+            !pool.record_successful_steer(
+                &scope,
+                "stale-event".into(),
+                "live-session".into(),
+                "turn-1",
+            ),
+            "an ack from turn-1 must not settle against turn-2"
+        );
+        assert!(
+            delivered(&pool, &scope).is_empty(),
+            "the event stays undelivered, so ordinary dispatch re-delivers it"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ack_for_a_replaced_session_is_still_refused() {
+        let scope = conv(Uuid::new_v4());
+        let mut pool = idle_agent_serving(&scope, "replacement-session", "turn-1").await;
+
+        assert!(!pool.record_successful_steer(
+            &scope,
+            "stale-event".into(),
+            "old-session".into(),
+            "turn-1",
+        ));
+        assert!(delivered(&pool, &scope).is_empty());
+    }
+
+    /// While the task is still in flight the ledger lives in `TaskMeta`, and
+    /// that arm is fenced by turn as well: an ack from a previous turn on the
+    /// same scope must not be staged into the running turn's deliveries.
+    #[tokio::test]
+    async fn the_in_flight_arm_is_fenced_by_turn_too() {
+        let scope = conv(Uuid::new_v4());
+        let mut pool = idle_agent_serving(&scope, "live-session", "turn-2").await;
+        let agent = pool.try_claim(Some(&scope)).expect("claim agent");
+        let task_id = pool.join_set.spawn(std::future::pending::<()>()).id();
+        pool.task_map_mut().insert(
+            task_id,
+            TaskMeta {
+                agent_index: agent.index,
+                channel_id: Some(scope.channel_id()),
+                scope: Some(scope.clone()),
+                turn_id: "turn-2".into(),
+                recoverable_batch: None,
+                control_tx: None,
+                steer_tx: None,
+                successful_steer_deliveries: HashSet::new(),
+            },
+        );
+
+        assert!(
+            !pool.record_successful_steer(
+                &scope,
+                "stale-event".into(),
+                "live-session".into(),
+                "turn-1",
+            ),
+            "turn-1's ack has no ledger once turn-2 owns the task"
+        );
+        assert!(pool.record_successful_steer(
+            &scope,
+            "current-event".into(),
+            "live-session".into(),
+            "turn-2",
+        ));
+        let staged = pool
+            .task_map()
+            .values()
+            .find(|meta| meta.turn_id == "turn-2")
+            .map(|meta| meta.successful_steer_deliveries.clone())
+            .expect("running turn keeps its ledger");
+        assert_eq!(staged.len(), 1);
+        assert!(staged.iter().any(|entry| entry.event_id == "current-event"));
+        pool.return_agent(agent);
+    }
+
+    /// Rotating a session clears its turn generation along with the session, so
+    /// a stale ack cannot match by turn id alone after a rotation.
+    #[tokio::test]
+    async fn invalidation_clears_the_turn_generation() {
+        let scope = conv(Uuid::new_v4());
+        let mut pool = idle_agent_serving(&scope, "live-session", "turn-1").await;
+        assert!(pool.agents[0]
+            .as_mut()
+            .expect("idle agent")
+            .state
+            .invalidate_scope(&scope));
+
+        assert!(!pool.record_successful_steer(
+            &scope,
+            "stale-event".into(),
+            "live-session".into(),
+            "turn-1",
+        ));
+    }
+}
