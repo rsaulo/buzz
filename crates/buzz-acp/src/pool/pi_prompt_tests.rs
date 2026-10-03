@@ -71,6 +71,7 @@ async fn pi_composed_prompt_uses_meta_without_capability_negotiation() {
             &ctx,
             Some(core),
             NewSessionChannelContext {
+                cwd: Path::new("."),
                 huddle_instructions: Some("BUZZ_HUDDLE"),
                 canvas: Some(canvas),
                 name: Some("channel"),
@@ -266,7 +267,9 @@ async fn real_pi_preserves_buzz_prompt_and_launch_skills_on_restore() {
     let mut agent = owned_pi(acp, 1);
     assert!(agent.has_system_prompt_support());
     let mut ctx = tests::make_prompt_context_no_owner();
-    ctx.cwd = workspace.to_string_lossy().into_owned();
+    // The session cwd is chosen per session generation, not stored on the
+    // shared context; this fixture opens every session in its workspace.
+    let session_cwd = workspace.to_string_lossy().into_owned();
     ctx.base_prompt = Some("BUZZ_BASE".into());
     ctx.system_prompt = Some("BUZZ_PERSONA".into());
     ctx.team_instructions = Some("BUZZ_TEAM".into());
@@ -276,6 +279,7 @@ async fn real_pi_preserves_buzz_prompt_and_launch_skills_on_restore() {
         &ctx,
         Some("<core-memory>BUZZ_CORE</core-memory>"),
         NewSessionChannelContext {
+            cwd: &workspace,
             huddle_instructions: Some("BUZZ_HUDDLE"),
             canvas: Some("<channel-canvas>BUZZ_CANVAS</channel-canvas>"),
             name: None,
@@ -297,13 +301,13 @@ async fn real_pi_preserves_buzz_prompt_and_launch_skills_on_restore() {
     let timestamp = "2026-01-01T00:00:00.000Z";
     std::fs::create_dir_all(std::path::Path::new(transcript).parent().unwrap()).unwrap();
     std::fs::write(transcript, format!("{}\n{}\n",
-        serde_json::json!({"type":"session","version":3,"id":id,"timestamp":timestamp,"cwd":ctx.cwd}),
+        serde_json::json!({"type":"session","version":3,"id":id,"timestamp":timestamp,"cwd":session_cwd}),
         serde_json::json!({"type":"message","id":"00000001","parentId":null,"timestamp":timestamp,"message":{"role":"user","content":[{"type":"text","text":"fixture"}],"timestamp":1767225600000u64}})
     )).unwrap();
     agent
         .acp
         .session_new_full(
-            &ctx.cwd,
+            &session_cwd,
             vec![],
             Some(SystemPromptTransport::PiMeta("OTHER_SESSION")),
             None,

@@ -21,6 +21,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -31,7 +32,7 @@ use uuid::Uuid;
 
 use crate::acp::{
     extract_model_config_options, extract_model_state, extract_thought_level_config_id,
-    model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, EnvVar, McpServer,
+    model_in_catalog, resolve_model_switch_method, AcpClient, AcpError, McpServer,
     ModelSwitchMethod, StopReason, SystemPromptTransport, BUZZ_PI_ACP_NAME,
 };
 use crate::config::{compose_scoped_session_title, DedupMode, PermissionMode};
@@ -43,6 +44,7 @@ use crate::queue::{
 };
 use crate::relay::{ChannelInfo, RestClient};
 use crate::scope::SessionScope;
+use crate::session_workspace::{SessionCwdDecision, SessionCwdResolver};
 
 /// Window within which agent activity before a hard-cap death qualifies
 /// the turn as "recently active" (eligible for requeue instead of dead-letter).
@@ -131,6 +133,8 @@ pub struct ChannelDeliveryState {
 pub struct SessionState {
     /// session scope → session_id
     pub sessions: HashMap<SessionScope, String>,
+    /// Immutable cwd selected when each live ACP session was created.
+    pub session_workspaces: HashMap<SessionScope, PathBuf>,
     pub heartbeat_session: Option<String>,
     /// Per-scope turn counters for proactive session rotation.
     /// Incremented on each successful prompt; reset when the session is rotated.
@@ -186,6 +190,7 @@ impl SessionState {
         self.canvas_sections.remove(scope);
         self.deliveries.remove(scope);
         self.scope_owner_generations.remove(scope);
+        self.session_workspaces.remove(scope);
         self.sessions.remove(scope).is_some()
     }
 
@@ -201,6 +206,7 @@ impl SessionState {
             .chain(self.canvas_sections.keys())
             .chain(self.deliveries.keys())
             .chain(self.scope_owner_generations.keys())
+            .chain(self.session_workspaces.keys())
             .filter(|s| s.channel_id() == *channel_id)
             .cloned()
             .collect::<HashSet<_>>()
@@ -226,6 +232,7 @@ impl SessionState {
         self.canvas_sections.clear();
         self.deliveries.clear();
         self.scope_owner_generations.clear();
+        self.session_workspaces.clear();
     }
 
     pub(crate) fn mark_scope_delivery_success(
@@ -257,6 +264,7 @@ impl SessionState {
             || self.core_sections.keys().any(matches)
             || self.canvas_sections.keys().any(matches)
             || self.deliveries.keys().any(matches)
+            || self.session_workspaces.keys().any(matches)
     }
 }
 
@@ -311,7 +319,7 @@ pub struct OwnedAgent {
 /// on `session/new` — the feature landed in v0.6.0 (Oct 2025), before the
 /// `@zed-industries/claude-code-acp` → `@agentclientprotocol/claude-agent-acp`
 /// rename, so the new name is a reliable capability gate.
-const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
+pub(crate) const CLAUDE_AGENT_ACP_NAME: &str = "@agentclientprotocol/claude-agent-acp";
 
 fn has_system_prompt_support(
     protocol_version: u32,
@@ -907,7 +915,7 @@ pub struct PromptContext {
     /// assembled once and shared by modern and legacy ACP standing context.
     /// `None` when `--no-base-prompt` was passed.
     pub base_prompt: Option<String>,
-    pub cwd: String,
+    pub session_cwd: SessionCwdResolver,
     /// REST client for pre-prompt context fetches (thread/DM history).
     pub rest_client: RestClient,
     /// Shared channel metadata for startup-known and dynamically joined channels.
@@ -1571,6 +1579,8 @@ async fn resolve_new_session_channel_context(
 /// error reporting. Model-switch failures are logged and gracefully ignored
 /// (the agent proceeds with its default model).
 struct NewSessionChannelContext<'a> {
+    /// Session cwd resolved once for this scope's session generation.
+    cwd: &'a Path,
     huddle_instructions: Option<&'a str>,
     canvas: Option<&'a str>,
     name: Option<&'a str>,
@@ -1584,6 +1594,7 @@ async fn create_session_and_apply_model(
     agent_core: Option<&str>,
     channel: NewSessionChannelContext<'_>,
 ) -> Result<String, AcpError> {
+    let session_cwd = channel.cwd.to_string_lossy();
     // Build base_prompt + system_prompt + agent core + canvas metadata into a
     // single prompt. Standard protocol-v2 agents receive it in `session/new`;
     // Goose receives it through the custom request below. Legacy agents receive
@@ -1596,7 +1607,7 @@ async fn create_session_and_apply_model(
             with_core(
                 with_team(
                     framed_system_prompt(
-                        &ctx.cwd,
+                        &session_cwd,
                         ctx.base_prompt.as_deref(),
                         ctx.system_prompt.as_deref(),
                     ),
@@ -1616,17 +1627,18 @@ async fn create_session_and_apply_model(
             channel.scope.and_then(SessionScope::root_event_id),
         )
     });
-    let mcp_servers = mcp_servers_with_git_origin(
+    let mcp_servers = crate::mcp_config::for_session(
         &ctx.mcp_servers,
         channel.scope.map(SessionScope::channel_id),
         channel.channel_type,
         ctx.session_title.as_deref(),
+        channel.cwd,
     );
 
     let resp = agent
         .acp
         .session_new_full(
-            &ctx.cwd,
+            &session_cwd,
             mcp_servers,
             session_new_system_prompt(
                 is_goose,
@@ -1831,7 +1843,6 @@ async fn create_session_and_apply_model(
             "relayUrl": ctx.relay_url,
         }),
     );
-
     // Apply permission mode if not the agent's built-in default AND the agent
     // advertises the requested mode in session/new. Agents that don't support
     // the mode (e.g., goose crashes on unrecognized set_config_option values)
@@ -1876,6 +1887,9 @@ pub(crate) async fn run_isolated_prompt(
         ctx,
         core.as_deref(),
         NewSessionChannelContext {
+            // A prepared task has no channel: like the heartbeat, it opens in
+            // the harness process directory, as upstream does.
+            cwd: ctx.session_cwd.heartbeat_cwd(),
             huddle_instructions: None,
             canvas: None,
             name: None,
@@ -1905,35 +1919,6 @@ pub(crate) async fn run_isolated_prompt(
         .session_prompt_with_idle_timeout(&session_id, &prompt, ctx.idle_timeout, max_duration)
         .await
 }
-
-fn mcp_servers_with_git_origin(
-    servers: &[McpServer],
-    channel_id: Option<Uuid>,
-    channel_type: Option<&str>,
-    agent_name: Option<&str>,
-) -> Vec<McpServer> {
-    let mut servers = servers.to_vec();
-    let origin = match (channel_id, channel_type) {
-        (Some(channel_id), Some("stream")) => Some(EnvVar {
-            name: "BUZZ_GIT_ORIGIN_CHANNEL_ID".into(),
-            value: channel_id.to_string(),
-        }),
-        (Some(_), _) => agent_name
-            .filter(|name| !name.trim().is_empty())
-            .map(|name| EnvVar {
-                name: "BUZZ_GIT_ORIGIN_AGENT_NAME".into(),
-                value: name.trim().to_string(),
-            }),
-        (None, _) => None,
-    };
-    if let Some(origin) = origin {
-        for server in &mut servers {
-            server.env.push(origin.clone());
-        }
-    }
-    servers
-}
-
 /// Outcome of a live model-switch RPC returned by [`apply_model_switch`].
 ///
 /// `Applied` and `Rejected` are distinct outcomes and must not be collapsed:
@@ -2658,12 +2643,83 @@ pub async fn run_prompt_task(
         PromptSource::Heartbeat => None,
     };
 
-    let (session_id, is_new_session) = match &source {
+    let (session_id, is_new_session, session_workspace) = match &source {
         PromptSource::Channel(scope) => {
-            let cid = &scope.channel_id();
-            if let Some(sid) = agent.state.sessions.get(scope) {
-                (sid.clone(), false)
+            let cid = scope.channel_id();
+            let existing_session = agent.state.sessions.get(scope).cloned();
+            let existing_workspace = agent.state.session_workspaces.get(scope).cloned();
+            if let (Some(sid), Some(workspace)) = (existing_session, existing_workspace) {
+                (sid, false, workspace)
             } else {
+                if agent.state.sessions.contains_key(scope) {
+                    tracing::warn!(
+                        target: "pool::session",
+                        scope = %scope.telemetry_label(),
+                        "session missing its cwd decision; rotating before prompt"
+                    );
+                    agent.state.invalidate_scope(scope);
+                }
+                let workspace = match ctx.session_cwd.resolve_channel(cid) {
+                    SessionCwdDecision::Pinned(path) => {
+                        tracing::info!(
+                            target: "pool::session",
+                            channel = %cid,
+                            cwd = %path.display(),
+                            decision = "pinned",
+                            "resolved channel session working directory"
+                        );
+                        path
+                    }
+                    SessionCwdDecision::Workspace(path) => {
+                        tracing::info!(
+                            target: "pool::session",
+                            channel = %cid,
+                            cwd = %path.display(),
+                            decision = "workspace",
+                            "resolved channel session working directory"
+                        );
+                        path
+                    }
+                    SessionCwdDecision::RootMode(path) => {
+                        tracing::info!(
+                            target: "pool::session",
+                            channel = %cid,
+                            cwd = %path.display(),
+                            decision = "root_mode",
+                            "resolved channel session working directory"
+                        );
+                        path
+                    }
+                    SessionCwdDecision::Refused(reason) => {
+                        tracing::error!(
+                            target: "pool::session",
+                            channel = %cid,
+                            reason = %reason,
+                            "channel session working directory refused"
+                        );
+                        if ctx.session_cwd.should_post_refusal_notice(cid) {
+                            let thread_tags = batch
+                                .as_ref()
+                                .and_then(|batch| batch.events.last())
+                                .map(|event| crate::queue::parse_thread_tags(&event.event))
+                                .unwrap_or_default();
+                            let project = resolved_channel_info
+                                .as_ref()
+                                .and_then(|info| info.project.as_ref());
+                            let notice = ctx.session_cwd.refusal_notice(cid, project);
+                            post_failure_notice(&ctx.rest_client, cid, &thread_tags, &notice).await;
+                        }
+                        send_prompt_result(
+                            &result_tx,
+                            &turn_id,
+                            agent,
+                            source,
+                            PromptOutcome::Error(AcpError::SessionRefused(reason)),
+                            requeue_batch_if_queue(&ctx, batch),
+                        );
+                        return;
+                    }
+                };
                 // The title includes channel and, for thread sessions, the
                 // canonical root prefix so sibling sessions are distinguishable.
                 // DMs, unresolved, and unnamed channels omit the channel name.
@@ -2672,6 +2728,7 @@ pub async fn run_prompt_task(
                     &ctx,
                     agent_core.as_deref(),
                     NewSessionChannelContext {
+                        cwd: &workspace,
                         huddle_instructions: huddle_instructions.as_deref(),
                         canvas: agent_canvas.as_deref(),
                         name: title_channel.as_deref(),
@@ -2690,6 +2747,10 @@ pub async fn run_prompt_task(
                         agent.state.sessions.insert(scope.clone(), sid.clone());
                         agent
                             .state
+                            .session_workspaces
+                            .insert(scope.clone(), workspace.clone());
+                        agent
+                            .state
                             .deliveries
                             .insert(scope.clone(), ChannelDeliveryState::default());
                         // Seed a zero usage baseline: buzz-acp spawned this session
@@ -2699,7 +2760,7 @@ pub async fn run_prompt_task(
                         if let Some((pending_scope, section)) = pending_canvas.take() {
                             agent.state.canvas_sections.insert(pending_scope, section);
                         }
-                        (sid, true)
+                        (sid, true, workspace)
                     }
                     Err(AcpError::AgentExited) => {
                         agent.state.invalidate_all();
@@ -2730,14 +2791,16 @@ pub async fn run_prompt_task(
             }
         }
         PromptSource::Heartbeat => {
+            let workspace = ctx.session_cwd.heartbeat_cwd().to_path_buf();
             if let Some(sid) = &agent.state.heartbeat_session {
-                (sid.clone(), false)
+                (sid.clone(), false, workspace)
             } else {
                 match create_session_and_apply_model(
                     &mut agent,
                     &ctx,
                     None,
                     NewSessionChannelContext {
+                        cwd: &workspace,
                         huddle_instructions: None,
                         canvas: None,
                         name: None,
@@ -2756,7 +2819,7 @@ pub async fn run_prompt_task(
                         agent.state.heartbeat_session = Some(sid.clone());
                         // Seed a zero usage baseline: buzz-acp spawned this session.
                         agent.acp.notify_session_spawned(&sid);
-                        (sid, true)
+                        (sid, true, workspace)
                     }
                     Err(AcpError::AgentExited) => {
                         agent.state.invalidate_all();
@@ -2800,6 +2863,12 @@ pub async fn run_prompt_task(
             "sessionId": session_id,
             "isNewSession": is_new_session,
         }),
+    );
+    tracing::debug!(
+        target: "pool::session",
+        session_id,
+        cwd = %session_workspace.display(),
+        "using session working directory"
     );
 
     // Standing context is fixed for the life of a session. Agents with
@@ -5728,11 +5797,12 @@ mod tests {
     #[test]
     fn public_session_forwards_channel_origin_to_mcp() {
         let channel_id = Uuid::new_v4();
-        let servers = mcp_servers_with_git_origin(
+        let servers = crate::mcp_config::for_session(
             &[test_mcp_server()],
             Some(channel_id),
             Some("stream"),
             None,
+            Path::new("/repo"),
         );
         assert!(servers[0].env.iter().any(|entry| {
             entry.name == "BUZZ_GIT_ORIGIN_CHANNEL_ID" && entry.value == channel_id.to_string()
@@ -5745,11 +5815,12 @@ mod tests {
 
     #[test]
     fn private_session_forwards_agent_name_without_channel_id() {
-        let servers = mcp_servers_with_git_origin(
+        let servers = crate::mcp_config::for_session(
             &[test_mcp_server()],
             Some(Uuid::new_v4()),
             Some("dm"),
             Some("Builder"),
+            Path::new("/repo"),
         );
         assert!(servers[0].env.iter().any(|entry| {
             entry.name == "BUZZ_GIT_ORIGIN_AGENT_NAME" && entry.value == "Builder"
@@ -7317,6 +7388,10 @@ done"#
             .insert(conv(channel_id), "live-session".into());
         agent
             .state
+            .session_workspaces
+            .insert(conv(channel_id), PathBuf::from("."));
+        agent
+            .state
             .deliveries
             .insert(conv(channel_id), ChannelDeliveryState::default());
 
@@ -7507,6 +7582,10 @@ done"#
             .state
             .deliveries
             .insert(scope.clone(), ChannelDeliveryState::default());
+        agent
+            .state
+            .session_workspaces
+            .insert(scope.clone(), PathBuf::from("."));
 
         let make_context = |context_message_limit| {
             let mut ctx = make_prompt_context_impl(&agent_keys, None);
@@ -7718,6 +7797,10 @@ done"#
             .insert(conv(channel_id), "live-session".into());
         agent
             .state
+            .session_workspaces
+            .insert(conv(channel_id), PathBuf::from("."));
+        agent
+            .state
             .deliveries
             .insert(conv(channel_id), ChannelDeliveryState::default());
 
@@ -7871,6 +7954,10 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             .state
             .sessions
             .insert(conv(channel_id), "live-session".into());
+        agent
+            .state
+            .session_workspaces
+            .insert(conv(channel_id), PathBuf::from("."));
         agent
             .state
             .deliveries
@@ -10431,7 +10518,17 @@ printf '%s\n' '{{"jsonrpc":"2.0","id":0,"result":{{"stopReason":"end_turn"}}}}'"
             team_instructions: None,
             heartbeat_prompt: None,
             base_prompt: None,
-            cwd: ".".to_string(),
+            session_cwd: crate::session_workspace::SessionCwdResolver::new(
+                crate::session_workspace::StartupCwds {
+                    process: PathBuf::from("."),
+                    pinned: Some(PathBuf::from(".")),
+                },
+                crate::workspace_index::WorkspaceIndex::from_test_channels(
+                    std::collections::BTreeMap::new(),
+                    |_| true,
+                ),
+                crate::config::UnindexedChannelPolicy::Refuse,
+            ),
             rest_client: RestClient {
                 http: reqwest::Client::new(),
                 base_url: "http://127.0.0.1:0".to_string(),
@@ -11540,6 +11637,7 @@ done"#
             &ctx,
             None,
             NewSessionChannelContext {
+                cwd: Path::new("."),
                 huddle_instructions: None,
                 canvas: None,
                 name: None,
@@ -11577,6 +11675,7 @@ done"#
             &ctx,
             None,
             NewSessionChannelContext {
+                cwd: Path::new("."),
                 huddle_instructions: None,
                 canvas: None,
                 name: None,
@@ -11611,6 +11710,7 @@ done"#
             &ctx,
             None,
             NewSessionChannelContext {
+                cwd: Path::new("."),
                 huddle_instructions: None,
                 canvas: None,
                 name: None,
@@ -11644,6 +11744,7 @@ done"#
             &ctx,
             None,
             NewSessionChannelContext {
+                cwd: Path::new("."),
                 huddle_instructions: None,
                 canvas: None,
                 name: None,
@@ -11684,6 +11785,7 @@ exit 0"#
             &ctx,
             None,
             NewSessionChannelContext {
+                cwd: Path::new("."),
                 huddle_instructions: None,
                 canvas: None,
                 name: None,
@@ -11848,6 +11950,7 @@ done"#
                     &ctx,
                     None,
                     NewSessionChannelContext {
+                        cwd: Path::new("."),
                         huddle_instructions: None,
                         canvas: None,
                         name,
@@ -11965,6 +12068,7 @@ done"#
             &ctx,
             None,
             NewSessionChannelContext {
+                cwd: Path::new("."),
                 huddle_instructions: None,
                 canvas: None,
                 name: None,
@@ -12036,6 +12140,7 @@ done"#
             &ctx,
             None,
             NewSessionChannelContext {
+                cwd: Path::new("."),
                 huddle_instructions: None,
                 canvas: None,
                 name: None,
@@ -12091,6 +12196,7 @@ done"#
             &ctx,
             None,
             NewSessionChannelContext {
+                cwd: Path::new("."),
                 huddle_instructions: None,
                 canvas: None,
                 name: None,
@@ -12133,6 +12239,7 @@ done"#
             &ctx,
             None,
             NewSessionChannelContext {
+                cwd: Path::new("."),
                 huddle_instructions: None,
                 canvas: None,
                 name: None,
@@ -12174,6 +12281,7 @@ done"#
             &ctx,
             None,
             NewSessionChannelContext {
+                cwd: Path::new("."),
                 huddle_instructions: None,
                 canvas: None,
                 name: None,
@@ -12240,6 +12348,7 @@ done"#
             &ctx,
             None,
             NewSessionChannelContext {
+                cwd: Path::new("."),
                 huddle_instructions: None,
                 canvas: None,
                 name: None,
@@ -12277,6 +12386,7 @@ done"#
             &ctx,
             None,
             NewSessionChannelContext {
+                cwd: Path::new("."),
                 huddle_instructions: None,
                 canvas: None,
                 name: None,
@@ -12350,6 +12460,7 @@ done"#
             &ctx,
             None,
             NewSessionChannelContext {
+                cwd: Path::new("."),
                 huddle_instructions: None,
                 canvas: None,
                 name: None,
@@ -12391,6 +12502,7 @@ done"#
             &ctx,
             None,
             NewSessionChannelContext {
+                cwd: Path::new("."),
                 huddle_instructions: None,
                 canvas: None,
                 name: None,

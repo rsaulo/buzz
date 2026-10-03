@@ -45,6 +45,13 @@ pub(crate) async fn execute(
             return outcome;
         }
     };
+    let agent_name = crate::normalized_agent_name(&init);
+    // Same isolation decision as pool agents: made once, from the name the
+    // adapter reported at initialize.
+    acp.set_session_meta_options(crate::agent_isolation::session_meta_options(
+        &agent_name,
+        startup.isolate_claude_user_config,
+    ));
     let mut agent = OwnedAgent {
         index: 0,
         acp,
@@ -55,7 +62,7 @@ pub(crate) async fn execute(
         desired_model_request_id: None,
         desired_model_pending_ack: false,
         startup_effort: startup.effort_level.clone(),
-        agent_name: crate::normalized_agent_name(&init),
+        agent_name,
         goose_system_prompt_supported: None,
         protocol_version: init["protocolVersion"].as_u64().unwrap_or(1) as u32,
     };
