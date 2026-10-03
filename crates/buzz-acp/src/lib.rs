@@ -2617,7 +2617,18 @@ async fn run_harness(
     mut shutdown_rx: watch::Receiver<()>,
     startup_ready: tokio::sync::oneshot::Sender<()>,
 ) -> Result<()> {
+    // Resolve where sessions will run BEFORE anything is spawned, and after the
+    // setup-mode branch in `tokio_main`.
+    //
+    // Before the pool: a mistyped `AGENT_CWD` is an operator error that must
+    // surface as itself, immediately — not after N adapter processes have been
+    // started, and never as a session opened somewhere the operator did not
+    // choose. After setup mode: an agent that is already missing credentials
+    // must still be fixable, and a workspace typo cannot be allowed to block
+    // that.
+    let session_cwds = runtime::SessionCwdInputs::resolve()?;
     let runtime = AgentRuntime::prepare(config)?;
+    runtime.install_session_cwds(session_cwds);
     let config = runtime.config();
 
     tracing::info!("buzz-acp starting: {}", config.summary());
@@ -12577,6 +12588,45 @@ mod observer_payload_trim_tests {
         assert!(leaf.starts_with('…'));
         assert!(leaf.ends_with('…'));
         assert!(leaf.contains("[elided"));
+    }
+}
+
+#[cfg(test)]
+mod startup_order_tests {
+    /// `AGENT_CWD` must be resolved before any adapter is spawned, and after the
+    /// setup-mode branch.
+    ///
+    /// Order is the whole contract here and it is invisible at the type level:
+    /// resolving after the pool means a mistyped workspace surfaces only once N
+    /// adapter processes are already running — or worse, as a session opened in
+    /// the process directory the operator did not choose. Resolving before the
+    /// setup branch means a workspace typo blocks an operator from fixing the
+    /// very credentials that put the agent into setup mode.
+    ///
+    /// A source-order assertion is crude, but it fails loudly the moment someone
+    /// moves either call — which is exactly what happened once already, and was
+    /// caught by running the binary, not by the suite.
+    #[test]
+    fn agent_cwd_resolves_after_setup_mode_and_before_the_pool() {
+        let source = include_str!("lib.rs");
+        let setup_branch = source
+            .find("setup_mode::run_setup_listener")
+            .expect("setup-mode branch");
+        let resolution = source
+            .find("runtime::SessionCwdInputs::resolve()")
+            .expect("startup cwd resolution");
+        let pool = source
+            .find("initialize_agent_pool(&runtime.startup(")
+            .expect("initial pool startup");
+
+        assert!(
+            setup_branch < resolution,
+            "cwd resolution must come after the setup-mode branch"
+        );
+        assert!(
+            resolution < pool,
+            "cwd resolution must come before the agent pool is started"
+        );
     }
 }
 

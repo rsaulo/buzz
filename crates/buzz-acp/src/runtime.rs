@@ -17,7 +17,40 @@ pub(crate) enum SessionMode {
 /// Add new runtime capabilities here, not separately to the CLI entry points.
 pub(crate) struct AgentRuntime {
     config: Config,
+    /// Session cwd inputs resolved ahead of the pool by the entry point that
+    /// needs that ordering (see [`SessionCwdInputs::resolve`]). Consumed by the
+    /// first [`prompt_context`](Self::prompt_context); resolved there if absent.
+    session_cwds: std::sync::Mutex<Option<SessionCwdInputs>>,
     _git_environment: git::GitEnvironment,
+}
+
+/// Where channel sessions may open: the `AGENT_CWD` pin, the harness directory,
+/// and the local workspace index. Resolution fails closed on a bad pin.
+pub(crate) struct SessionCwdInputs {
+    startup: session_workspace::StartupCwds,
+    index: workspace_index::WorkspaceIndex,
+}
+
+impl SessionCwdInputs {
+    /// Resolve and log the session cwd inputs. The harness calls this after
+    /// the setup-mode branch and before any adapter is spawned, so a mistyped
+    /// `AGENT_CWD` surfaces as itself instead of after the pool is up.
+    pub(crate) fn resolve() -> Result<Self> {
+        let startup = session_workspace::resolve_startup_cwds()
+            .map_err(|error| anyhow::anyhow!(error.to_string()))?;
+        let index = workspace_index::WorkspaceIndex::from_env();
+        if let Some(path) = &startup.pinned {
+            tracing::info!(cwd = %path.display(), "channel sessions pinned by AGENT_CWD");
+        } else {
+            tracing::info!(
+                process_cwd = %startup.process.display(),
+                repositories = index.repository_count(),
+                channels = index.channel_count(),
+                "channel sessions use local workspace resolution"
+            );
+        }
+        Ok(Self { startup, index })
+    }
 }
 
 impl AgentRuntime {
@@ -25,8 +58,17 @@ impl AgentRuntime {
         let git_environment = git::GitEnvironment::for_config(&mut config)?;
         Ok(Self {
             config,
+            session_cwds: std::sync::Mutex::new(None),
             _git_environment: git_environment,
         })
+    }
+
+    /// Install session cwd inputs the caller resolved before spawning anything.
+    pub(crate) fn install_session_cwds(&self, inputs: SessionCwdInputs) {
+        *self
+            .session_cwds
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(inputs);
     }
 
     pub(crate) fn config(&self) -> &Config {
@@ -43,7 +85,21 @@ impl AgentRuntime {
         channels: HashMap<Uuid, relay::ChannelInfo>,
         mode: SessionMode,
     ) -> Result<PromptContext> {
-        make_prompt_context(&self.config, rest, channels, mode)
+        let installed = self
+            .session_cwds
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take();
+        let inputs = match installed {
+            Some(inputs) => inputs,
+            None => SessionCwdInputs::resolve()?,
+        };
+        let session_cwd = session_workspace::SessionCwdResolver::new(
+            inputs.startup,
+            inputs.index,
+            self.config.unindexed_channel_policy,
+        );
+        make_prompt_context(&self.config, rest, channels, mode, session_cwd)
     }
 }
 
@@ -81,23 +137,9 @@ fn make_prompt_context(
     rest_client: relay::RestClient,
     channels: HashMap<Uuid, relay::ChannelInfo>,
     mode: SessionMode,
+    session_cwd: session_workspace::SessionCwdResolver,
 ) -> Result<PromptContext> {
     let base_prompt_content = config.base_prompt_content.as_ref();
-    // Where sessions open is resolved per channel at session creation; this
-    // only fixes the inputs (AGENT_CWD pin, harness directory, workspace index).
-    let startup_cwds = session_workspace::resolve_startup_cwds()
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    let workspace_index = workspace_index::WorkspaceIndex::from_env();
-    if let Some(path) = &startup_cwds.pinned {
-        tracing::info!(cwd = %path.display(), "channel sessions pinned by AGENT_CWD");
-    } else {
-        tracing::info!(
-            process_cwd = %startup_cwds.process.display(),
-            repositories = workspace_index.repository_count(),
-            channels = workspace_index.channel_count(),
-            "channel sessions use local workspace resolution"
-        );
-    }
     Ok(PromptContext {
         mcp_servers: build_mcp_servers(config),
         initial_message: config.initial_message.clone(),
@@ -124,11 +166,7 @@ fn make_prompt_context(
             })
         },
         heartbeat_prompt: config.heartbeat_prompt.clone(),
-        session_cwd: session_workspace::SessionCwdResolver::new(
-            startup_cwds,
-            workspace_index,
-            config.unindexed_channel_policy,
-        ),
+        session_cwd,
         rest_client: rest_client.clone(),
         channel_info: pool::ChannelInfoResolver::new(channels, rest_client),
         context_message_limit: config.context_message_limit,
