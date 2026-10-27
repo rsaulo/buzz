@@ -46,6 +46,31 @@ APP_DISPLAY_NAME = $DISPLAY_NAME
 BUZZ_DEVELOPMENT_TEAM = $TEAM_ID
 EOF
 
+# The App Store Connect API key provisions bundle IDs, push and profiles, but
+# not App Attest, Communication Notifications, Declared Age Range or App Group
+# registration (developer-portal only). Those serve push enrollment (no
+# gateway here) and the age gate, which production builds keep disabled and
+# fail-open. Sign this build with only push + keychain sharing; the tracked
+# entitlements are restored on exit, so the fork carries no diff for this.
+runner_entitlements=ios/Runner/Runner.entitlements
+extension_entitlements=ios/NotificationService/NotificationService.entitlements
+restore_entitlements() {
+  git -C "$mobile_dir" checkout -- "$runner_entitlements" "$extension_entitlements"
+}
+trap restore_entitlements EXIT
+plist_head='<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>'
+keychain_group='	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)$(BUZZ_KEYCHAIN_ACCESS_GROUP)</string>
+	</array>'
+printf '%s\n\t<key>aps-environment</key>\n\t<string>$(BUZZ_IOS_PUSH_ENVIRONMENT)</string>\n%s\n</dict>\n</plist>\n' \
+  "$plist_head" "$keychain_group" > "$runner_entitlements"
+printf '%s\n%s\n</dict>\n</plist>\n' \
+  "$plist_head" "$keychain_group" > "$extension_entitlements"
+
 ../bin/flutter build ios --release --config-only \
   --build-name "$version" --build-number 1
 
