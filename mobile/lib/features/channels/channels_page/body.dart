@@ -10,6 +10,7 @@ class _ChannelsBody extends StatelessWidget {
   final double topSectionHeight;
   final bool usesPinnedGradient;
   final ScrollController scrollController;
+  final Widget? workspaceHeader;
   final Future<void> Function() onRefresh;
   final Future<void> Function(Channel channel) onSelectChannel;
 
@@ -23,6 +24,7 @@ class _ChannelsBody extends StatelessWidget {
     required this.topSectionHeight,
     required this.usesPinnedGradient,
     required this.scrollController,
+    required this.workspaceHeader,
     required this.onRefresh,
     required this.onSelectChannel,
   });
@@ -32,15 +34,16 @@ class _ChannelsBody extends StatelessWidget {
     final barHeight = topSectionHeight;
     final loadedChannels = channels;
     final loading = loadedChannels == null && !showError;
-    final content = showError && channelsAsync.hasError
+    Widget buildContent({required double topInset}) =>
+        showError && channelsAsync.hasError
         ? Padding(
-            padding: EdgeInsets.only(top: barHeight),
+            padding: EdgeInsets.only(top: topInset),
             child: _ErrorView(error: channelsAsync.error!, onRetry: onRefresh),
           )
         : loadedChannels == null
         ? const SizedBox.shrink()
         : BeeRefreshIndicator(
-            edgeOffset: barHeight,
+            edgeOffset: topInset,
             onRefresh: onRefresh,
             child: CustomScrollView(
               controller: scrollController,
@@ -49,7 +52,7 @@ class _ChannelsBody extends StatelessWidget {
               // later and retains its community and profile controls.
               hitTestBehavior: HitTestBehavior.translucent,
               slivers: [
-                SliverToBoxAdapter(child: SizedBox(height: barHeight)),
+                SliverToBoxAdapter(child: SizedBox(height: topInset)),
                 if (usesPinnedGradient)
                   _SliverChannelsList(
                     channels: loadedChannels,
@@ -74,7 +77,7 @@ class _ChannelsBody extends StatelessWidget {
             ),
           );
 
-    return SkeletonReveal(
+    Widget buildReveal({required double topInset}) => SkeletonReveal(
       onReadyChanged: onReadyChanged,
       loading: loading,
       loadingSemanticsKey: const Key('channels-connection-skeleton'),
@@ -84,12 +87,22 @@ class _ChannelsBody extends StatelessWidget {
         _ => 'Loading',
       },
       shimmerEnabled: sessionStatus != SessionStatus.disconnected,
-      skeleton: _ChannelsSkeleton(
-        channels: loadedChannels,
-        topInset: barHeight,
-      ),
-      content: content,
+      skeleton: _ChannelsSkeleton(channels: loadedChannels, topInset: topInset),
+      content: buildContent(topInset: topInset),
     );
+
+    final header = workspaceHeader;
+    if (header != null) {
+      return Column(
+        children: [
+          SizedBox(height: barHeight),
+          header,
+          Expanded(child: buildReveal(topInset: 0)),
+        ],
+      );
+    }
+
+    return buildReveal(topInset: barHeight);
   }
 }
 

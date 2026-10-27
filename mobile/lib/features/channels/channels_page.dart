@@ -78,6 +78,8 @@ part 'channels_page/header_actions.dart';
 
 enum _QuickAction { createChannel, newDm, browseChannels }
 
+final _workspaceSelectedChannelIdProvider = Provider<String?>((ref) => null);
+
 const double _kChannelSectionInset = Grid.gutter;
 const double _kChannelLeadingWidth = 22.0;
 const double _kChannelIconSize = 18.0;
@@ -114,6 +116,13 @@ class ChannelsPage extends HookConsumerWidget {
     this.communityAppearancePageBuilder,
     required this.onSettingsTransitionProgress,
     this.tabReselection,
+    this.onChannelSelected,
+    this.onCompactChannelSelected,
+    this.onCompactChannelDismissed,
+    this.selectedChannelId,
+    this.workspaceHeader,
+    this.onCommunityChanged,
+    this.onSelectedChannelUnavailable,
     super.key,
   });
 
@@ -140,6 +149,30 @@ class ChannelsPage extends HookConsumerWidget {
 
   /// Notifies this page when its already-selected tab is tapped again.
   final ValueListenable<int>? tabReselection;
+
+  /// Selects a channel in an enclosing persistent workspace instead of
+  /// pushing the phone detail route.
+  final ValueChanged<Channel>? onChannelSelected;
+
+  /// Remembers a phone-route selection so an enclosing adaptive workspace can
+  /// take it over if the window grows to tablet size while that route is open.
+  final ValueChanged<Channel>? onCompactChannelSelected;
+
+  /// Clears the remembered phone-route selection after an ordinary Back.
+  final VoidCallback? onCompactChannelDismissed;
+
+  /// Channel currently shown by an enclosing persistent workspace.
+  final String? selectedChannelId;
+
+  /// Optional top-level workspace destinations rendered above channel groups.
+  final Widget? workspaceHeader;
+
+  /// Notifies an enclosing workspace when its relay scope changes.
+  final ValueChanged<String?>? onCommunityChanged;
+
+  /// Clears a persistent detail when the selected channel leaves the joined
+  /// channel set.
+  final VoidCallback? onSelectedChannelUnavailable;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -222,6 +255,10 @@ class ChannelsPage extends HookConsumerWidget {
     final activeCommunityId = ref.watch(
       activeCommunityProvider.select((v) => v.unwrapPrevious().value?.id),
     );
+    useEffect(() {
+      onCommunityChanged?.call(activeCommunityId);
+      return null;
+    }, [activeCommunityId]);
     final cachedChannels = useRef<List<Channel>?>(null);
     final lastCommunityId = useRef<String?>(null);
     if (lastCommunityId.value != activeCommunityId) {
@@ -236,16 +273,44 @@ class ChannelsPage extends HookConsumerWidget {
     final channels = cachedChannels.value
         ?.where((channel) => !personalIds.contains(channel.id))
         .toList();
+    final selectedChannelStillAvailable =
+        selectedChannelId == null ||
+        channels == null ||
+        channels.any(
+          (channel) =>
+              channel.id == selectedChannelId &&
+              channel.isMember &&
+              !channel.isArchived,
+        );
+    useEffect(() {
+      if (!selectedChannelStillAvailable) {
+        onSelectedChannelUnavailable?.call();
+      }
+      return null;
+    }, [selectedChannelStillAvailable]);
     Future<void> openChannel(Channel channel) async {
+      final onChannelSelected = this.onChannelSelected;
+      if (onChannelSelected != null) {
+        onChannelSelected(channel);
+        return;
+      }
+      onCompactChannelSelected?.call(channel);
       if (!context.mounted) return;
-      await Navigator.of(context).push(
+      var yieldedToTabletWorkspace = false;
+      await Navigator.of(context).push<void>(
         MaterialPageRoute<void>(
           builder: (_) => ChannelDetailPage(
             channel: channel,
             placement: ChannelRoutePlacement.ordinary,
+            onTabletWorkspaceActivated: onCompactChannelSelected == null
+                ? null
+                : () => yieldedToTabletWorkspace = true,
           ),
         ),
       );
+      if (!yieldedToTabletWorkspace) {
+        onCompactChannelDismissed?.call();
+      }
     }
 
     // Only surface fetch errors while the relay is stably connected. During a
@@ -530,18 +595,26 @@ class ChannelsPage extends HookConsumerWidget {
         bottomHeight: _kTopSectionBottomPadding,
         bottom: const SizedBox.expand(),
       ),
-      body: _ChannelsBody(
-        onReadyChanged: (ready) => bodyReady.value = ready,
-        channels: channels,
-        channelsAsync: channelsAsync,
-        showError: showError.value,
-        sessionStatus: sessionState.status,
-        currentPubkey: currentPubkey,
-        topSectionHeight: topSectionHeight,
-        usesPinnedGradient: usesPinnedGradient,
-        scrollController: channelsScrollController,
-        onRefresh: () => ref.read(channelsProvider.notifier).refresh(),
-        onSelectChannel: openChannel,
+      body: ProviderScope(
+        overrides: [
+          _workspaceSelectedChannelIdProvider.overrideWithValue(
+            selectedChannelId,
+          ),
+        ],
+        child: _ChannelsBody(
+          onReadyChanged: (ready) => bodyReady.value = ready,
+          channels: channels,
+          channelsAsync: channelsAsync,
+          showError: showError.value,
+          sessionStatus: sessionState.status,
+          currentPubkey: currentPubkey,
+          topSectionHeight: topSectionHeight,
+          usesPinnedGradient: usesPinnedGradient,
+          scrollController: channelsScrollController,
+          workspaceHeader: workspaceHeader,
+          onRefresh: () => ref.read(channelsProvider.notifier).refresh(),
+          onSelectChannel: openChannel,
+        ),
       ),
     );
   }

@@ -65,7 +65,14 @@ double _searchHeaderFiltersHeight(BuildContext context) {
 }
 
 class SearchPage extends HookConsumerWidget {
-  const SearchPage({this.tabReselection, super.key});
+  const SearchPage({
+    this.tabReselection,
+    this.showCloseButton = true,
+    super.key,
+  });
+
+  /// Hidden when Search is a persistent tablet workspace destination.
+  final bool showCloseButton;
 
   /// Notifies this page when its already-selected tab is tapped again.
   final ValueListenable<int>? tabReselection;
@@ -142,7 +149,9 @@ class SearchPage extends HookConsumerWidget {
               ),
               child: Row(
                 children: [
-                  if (nativeIos)
+                  if (!showCloseButton)
+                    const SizedBox.shrink()
+                  else if (nativeIos)
                     IosGlassNavigationButton(
                       key: const Key('search-close'),
                       icon: IosGlassNavigationIcon.close,
@@ -165,7 +174,7 @@ class SearchPage extends HookConsumerWidget {
                         icon: const Icon(BuzzIcons.x),
                       ),
                     ),
-                  const SizedBox(width: Grid.xxs),
+                  if (showCloseButton) const SizedBox(width: Grid.xxs),
                   Expanded(
                     child: SizedBox(
                       key: const Key('search-field-container'),

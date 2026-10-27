@@ -33,17 +33,14 @@ class _NestedThreadSummaryRow extends ConsumerWidget {
         summary: summary,
         hasReactions: replyMessage.reactions.isNotEmpty,
         onTap: () {
-          Navigator.of(context).push(
-            MaterialPageRoute<void>(
-              builder: (_) => ThreadDetailPage(
-                threadHead: replyMessage,
-                allMessages: allMessages,
-                channelId: channelId,
-                currentPubkey: currentPubkey,
-                isMember: isMember,
-                isArchived: isArchived,
-              ),
-            ),
+          openThreadDetail(
+            context,
+            threadHead: replyMessage,
+            allMessages: allMessages,
+            channelId: channelId,
+            currentPubkey: currentPubkey,
+            isMember: isMember,
+            isArchived: isArchived,
           );
         },
       ),

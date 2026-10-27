@@ -25,6 +25,7 @@ import 'package:buzz/features/channels/channel_mutes/channel_mutes_provider.dart
 import 'package:buzz/features/channels/channel_sort/channel_sort_provider.dart';
 import 'package:buzz/shared/theme/buzz_icons.dart';
 import 'package:buzz/features/channels/channel.dart';
+import 'package:buzz/features/channels/channel_detail_page.dart';
 import 'package:buzz/features/channels/channel_management_provider.dart';
 import 'package:buzz/features/channels/channel_sections/channel_sections_provider.dart';
 import 'package:buzz/features/channels/channel_sections/channel_sections_storage.dart';
@@ -86,6 +87,9 @@ void main() {
     ValueListenable<int>? tabReselection,
     _FakeProfileNotifier? profile,
     bool realHome = false,
+    ValueChanged<Channel>? onChannelSelected,
+    String? selectedChannelId,
+    Widget? workspaceHeader,
   }) {
     return ProviderScope(
       overrides: [
@@ -135,6 +139,9 @@ void main() {
                     onSettingsTransitionProgress:
                         onSettingsTransitionProgress ?? (_) {},
                     tabReselection: tabReselection,
+                    onChannelSelected: onChannelSelected,
+                    selectedChannelId: selectedChannelId,
+                    workspaceHeader: workspaceHeader,
                   ),
                   const Positioned.fill(
                     child: ChannelQuickActionsLauncher(
@@ -196,6 +203,50 @@ void main() {
     (overrides) => buildTestable(overrides: overrides),
     testChannels,
   );
+
+  testWidgets('workspace header selects and highlights a channel in place', (
+    tester,
+  ) async {
+    Channel? selectedChannel;
+    await tester.pumpWidget(
+      buildTestable(
+        overrides: [
+          channelsProvider.overrideWith(() => _FakeNotifier(testChannels)),
+        ],
+        selectedChannelId: '1',
+        onChannelSelected: (channel) => selectedChannel = channel,
+        workspaceHeader: const Text('Workspace destinations'),
+      ),
+    );
+    await tester.pumpAndSettle();
+
+    expect(find.text('Workspace destinations'), findsOneWidget);
+    final selectedSurface = tester.widget<DecoratedBox>(
+      find
+          .descendant(
+            of: find.byKey(const ValueKey('channel-row-1')),
+            matching: find.byType(DecoratedBox),
+          )
+          .first,
+    );
+    expect(
+      (selectedSurface.decoration as BoxDecoration).color,
+      isNot(Colors.transparent),
+    );
+    expect(
+      tester
+          .getSemantics(find.byKey(const ValueKey('channel-row-1')))
+          .flagsCollection
+          .isSelected
+          .toString(),
+      'Tristate.isTrue',
+    );
+
+    await tester.tap(find.byKey(const ValueKey('channel-row-3')));
+    await tester.pump();
+    expect(selectedChannel?.id, '3');
+    expect(find.byType(ChannelDetailPage), findsNothing);
+  });
 
   testWidgets('DM tile presence observation failure hides the dot', (
     tester,

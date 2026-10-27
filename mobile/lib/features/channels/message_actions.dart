@@ -604,17 +604,14 @@ class _MessageQuickActionsRow extends ConsumerWidget {
           label: 'Reply',
           onTap: () {
             if (!_selectMessageAction(context)) return;
-            Navigator.of(pageContext).push(
-              MaterialPageRoute<void>(
-                builder: (_) => ThreadDetailPage(
-                  threadHead: message,
-                  allMessages: messages,
-                  channelId: channelId,
-                  currentPubkey: currentPubkey,
-                  isMember: isMember,
-                  isArchived: isArchived,
-                ),
-              ),
+            openThreadDetail(
+              pageContext,
+              threadHead: message,
+              allMessages: messages,
+              channelId: channelId,
+              currentPubkey: currentPubkey,
+              isMember: isMember,
+              isArchived: isArchived,
             );
           },
         ),

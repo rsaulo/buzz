@@ -11,11 +11,19 @@ import 'package:buzz/shared/theme/buzz_icons.dart';
 import '../../shared/theme/theme.dart';
 import '../../shared/widgets/bottom_up_page_route.dart';
 import '../../shared/widgets/concentric_sheet_surface.dart';
+import '../../shared/utils/adaptive_layout.dart';
+import '../../shared/widgets/app_route_observer.dart';
 import '../../shared/widgets/directional_transition_scope.dart';
 import '../../shared/widgets/mobile_tab_footer_backdrop.dart';
 import '../activity/activity_page.dart';
+import '../channels/channel.dart';
+import '../channels/channel_detail_page.dart';
 import '../channels/channels_page.dart';
+import '../channels/thread_detail_page.dart';
+import '../channels/thread_detail_target.dart';
 import '../search/search_page.dart';
+
+part 'home_page/tablet_workspace.dart';
 
 class HomePage extends HookConsumerWidget {
   const HomePage({
@@ -91,6 +99,10 @@ class HomePage extends HookConsumerWidget {
     final homeReselection = useValueNotifier(0);
     final newChatAction = useValueNotifier<VoidCallback?>(null);
     final settingsTransitionProgress = useValueNotifier(0.0);
+    final workspaceDestination = useState(_kWorkspaceInbox);
+    final workspaceChannel = useState<Channel?>(null);
+    final workspaceThread = useState<ThreadDetailTarget?>(null);
+    final workspaceCommunityId = useRef<String?>(null);
     final reducedMotion = MediaQuery.of(context).disableAnimations;
     final tabContentTransitionProgress = reducedMotion
         ? 1.0
@@ -125,6 +137,16 @@ class HomePage extends HookConsumerWidget {
             settingsTransitionProgress.value = progress;
           }
         },
+        onCompactChannelSelected: (channel) {
+          workspaceChannel.value = channel;
+          workspaceThread.value = null;
+          workspaceDestination.value = _kWorkspaceChannel;
+        },
+        onCompactChannelDismissed: () {
+          workspaceChannel.value = null;
+          workspaceThread.value = null;
+          workspaceDestination.value = _kWorkspaceInbox;
+        },
       ),
       if (visitedTabs.value.contains(1))
         mePageBuilder?.call(context, newChatAction) ?? const SizedBox.shrink()
@@ -135,6 +157,58 @@ class HomePage extends HookConsumerWidget {
     final settingsTransitionGradient = tabIndex.value == 0
         ? context.appColors.topSectionGradient
         : null;
+
+    final windowSize = MediaQuery.sizeOf(context);
+    if (usesTabletWorkspace(
+      width: windowSize.width,
+      height: windowSize.height,
+    )) {
+      return _TabletWorkspace(
+        settingsPageBuilder: settingsPageBuilder,
+        communityInvitePageBuilder: communityInvitePageBuilder,
+        communityAppearancePageBuilder: communityAppearancePageBuilder,
+        mePageBuilder: mePageBuilder,
+        newChatAction: newChatAction,
+        hasUnreadInbox: hasUnreadInbox,
+        hasUnreadSolo: hasUnreadSolo,
+        selectedDestination: workspaceDestination.value,
+        selectedChannel: workspaceChannel.value,
+        selectedThread: workspaceThread.value,
+        settingsTransitionProgress: settingsTransitionProgress,
+        onDestinationSelected: (index) {
+          if (workspaceDestination.value == index &&
+              workspaceChannel.value == null) {
+            return;
+          }
+          unawaited(HapticFeedback.selectionClick());
+          workspaceChannel.value = null;
+          workspaceThread.value = null;
+          workspaceDestination.value = index;
+        },
+        onChannelSelected: (channel) {
+          if (workspaceChannel.value?.id != channel.id) {
+            unawaited(HapticFeedback.selectionClick());
+          }
+          workspaceChannel.value = channel;
+          workspaceThread.value = null;
+          workspaceDestination.value = _kWorkspaceChannel;
+        },
+        onThreadSelected: (thread) => workspaceThread.value = thread,
+        onThreadClosed: () => workspaceThread.value = null,
+        onCommunityChanged: (communityId) {
+          if (workspaceCommunityId.value == communityId) return;
+          workspaceCommunityId.value = communityId;
+          workspaceChannel.value = null;
+          workspaceThread.value = null;
+          workspaceDestination.value = _kWorkspaceInbox;
+        },
+        onSelectedChannelUnavailable: () {
+          workspaceChannel.value = null;
+          workspaceThread.value = null;
+          workspaceDestination.value = _kWorkspaceInbox;
+        },
+      );
+    }
 
     return Stack(
       fit: StackFit.expand,

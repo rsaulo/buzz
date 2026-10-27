@@ -34,6 +34,10 @@ class ChannelQuickActionsLauncher extends HookConsumerWidget {
   /// Distance between the launcher and the right edge of the screen.
   final double rightInset;
 
+  /// Shows a created channel or DM in an enclosing persistent workspace
+  /// instead of pushing the phone detail route.
+  final ValueChanged<Channel>? onOpenChannel;
+
   /// Creates a launcher aligned with the supplied navigation geometry.
   const ChannelQuickActionsLauncher({
     super.key,
@@ -46,6 +50,7 @@ class ChannelQuickActionsLauncher extends HookConsumerWidget {
     required this.navigationBarWidth,
     required this.systemBottomInset,
     required this.rightInset,
+    this.onOpenChannel,
   });
 
   @override
@@ -78,6 +83,11 @@ class ChannelQuickActionsLauncher extends HookConsumerWidget {
 
     Future<void> openChannel(Channel channel) async {
       if (!context.mounted) return;
+      final onOpenChannel = this.onOpenChannel;
+      if (onOpenChannel != null) {
+        onOpenChannel(channel);
+        return;
+      }
       await Navigator.of(context).push(
         MaterialPageRoute<void>(
           builder: (_) => ChannelDetailPage(

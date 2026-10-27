@@ -15,6 +15,10 @@ class ChannelDetailPage extends ConsumerWidget {
   final String? initialThreadRootId;
   final InitialThreadRouteBehavior initialThreadRouteBehavior;
 
+  /// Lets an enclosing adaptive workspace take over this phone route when the
+  /// window grows to tablet size.
+  final VoidCallback? onTabletWorkspaceActivated;
+
   const ChannelDetailPage({
     super.key,
     required this.channel,
@@ -24,6 +28,7 @@ class ChannelDetailPage extends ConsumerWidget {
     this.initialMessageId,
     this.initialThreadRootId,
     this.initialThreadRouteBehavior = InitialThreadRouteBehavior.push,
+    this.onTabletWorkspaceActivated,
   });
 
   @override
@@ -55,6 +60,7 @@ class ChannelDetailPage extends ConsumerWidget {
       initialMessageId: initialMessageId,
       initialThreadRootId: initialThreadRootId,
       initialThreadRouteBehavior: initialThreadRouteBehavior,
+      onTabletWorkspaceActivated: onTabletWorkspaceActivated,
     );
   }
 }

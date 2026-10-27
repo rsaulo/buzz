@@ -48,6 +48,81 @@ void main() {
     );
   }
 
+  testWidgets('uses the persistent workspace on a tablet-class window', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(1024, 768);
+    addTearDown(tester.view.reset);
+
+    await tester.pumpWidget(await buildHome());
+    await tester.pump();
+
+    expect(find.byKey(const ValueKey('tablet-workspace')), findsOneWidget);
+    expect(find.bySemanticsLabel('Home'), findsNothing);
+    expect(
+      tester
+          .getSize(find.byKey(const ValueKey('tablet-workspace-sidebar')))
+          .width,
+      300,
+    );
+    final workspaceRect = tester.getRect(
+      find.byKey(const ValueKey('tablet-workspace')),
+    );
+    final contentRect = tester.getRect(
+      find.byKey(const ValueKey('tablet-workspace-content-surface')),
+    );
+    expect(contentRect.left, 300);
+    expect(contentRect.top, workspaceRect.top);
+    expect(contentRect.right, workspaceRect.right);
+    expect(contentRect.bottom, workspaceRect.bottom);
+    expect(
+      find.byKey(const ValueKey('split-activity-inbox-list')),
+      findsOneWidget,
+    );
+    for (final destination in ['inbox', 'search', 'solo']) {
+      expect(
+        find.byKey(ValueKey('tablet-workspace-$destination')),
+        findsOneWidget,
+      );
+    }
+    expect(find.byKey(const ValueKey('tablet-quick-actions')), findsOneWidget);
+    final sidebar = find.byKey(const ValueKey('tablet-workspace-sidebar'));
+    final inboxDestination = find.descendant(
+      of: sidebar,
+      matching: find.bySemanticsLabel('Inbox'),
+    );
+    expect(inboxDestination, findsOneWidget);
+    final inboxSemantics = tester.getSemantics(inboxDestination);
+    expect(inboxSemantics.flagsCollection.isButton, isTrue);
+    expect(
+      inboxSemantics.flagsCollection.isSelected.toString(),
+      'Tristate.isTrue',
+    );
+
+    await tester.tap(find.byKey(const ValueKey('tablet-workspace-solo')));
+    await tester.pump();
+    expect(find.text('Personal workspace'), findsOneWidget);
+    expect(
+      find.byKey(const ValueKey('tablet-workspace-sidebar')),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('keeps a wide landscape phone in the compact shell', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(932, 430);
+    addTearDown(tester.view.reset);
+
+    await tester.pumpWidget(await buildHome());
+    await tester.pump();
+
+    expect(find.byKey(const ValueKey('tablet-workspace')), findsNothing);
+    expect(find.bySemanticsLabel('Home'), findsOneWidget);
+  });
+
   testWidgets('iOS glass retains icons, tab taps and unread semantics', (
     tester,
   ) async {
@@ -519,6 +594,8 @@ void main() {
     tester,
   ) async {
     tester.view.devicePixelRatio = 1;
+    // A phone window: at DPR 1 the default 2400x1800 surface is tablet-sized.
+    tester.view.physicalSize = const Size(390, 844);
     tester.view.viewPadding = const FakeViewPadding(bottom: 34);
     tester.view.padding = const FakeViewPadding(bottom: 34);
     addTearDown(tester.view.reset);

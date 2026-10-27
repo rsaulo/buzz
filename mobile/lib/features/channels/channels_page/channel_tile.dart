@@ -30,90 +30,109 @@ class _ChannelTile extends ConsumerWidget {
         ? navigationSecondaryForeground(context)
         : navigationPrimaryForeground(context);
 
-    return InkWell(
-      borderRadius: BorderRadius.circular(Radii.md),
-      onTap: onTap,
-      onLongPress: () => _showChannelActions(context, ref),
-      child: Padding(
-        padding: const EdgeInsets.only(
-          left: _kChannelSectionInset,
-          right: _kChannelSectionInset,
-          top: _kChannelRowVerticalPadding,
-          bottom: _kChannelRowVerticalPadding,
-        ),
-        child: Row(
-          children: [
-            if (channel.isDm) ...[
-              SizedBox(
-                width: _kChannelLeadingWidth,
-                child: Align(
-                  alignment: Alignment.centerLeft,
-                  child: _DmAvatar(
-                    channel: channel,
-                    currentPubkey: currentPubkey,
+    final selected =
+        ref.watch(_workspaceSelectedChannelIdProvider) == channel.id;
+    return Semantics(
+      selected: selected,
+      child: InkWell(
+        key: ValueKey('channel-row-${channel.id}'),
+        overlayColor: selected
+            ? const WidgetStatePropertyAll<Color>(Colors.transparent)
+            : null,
+        borderRadius: BorderRadius.circular(Radii.md),
+        onTap: onTap,
+        onLongPress: () => _showChannelActions(context, ref),
+        child: DecoratedBox(
+          decoration: BoxDecoration(
+            color: selected
+                ? context.colors.primaryContainer.withValues(alpha: 0.72)
+                : Colors.transparent,
+            borderRadius: BorderRadius.circular(Radii.md),
+          ),
+          child: Padding(
+            padding: const EdgeInsets.only(
+              left: _kChannelSectionInset,
+              right: _kChannelSectionInset,
+              top: _kChannelRowVerticalPadding,
+              bottom: _kChannelRowVerticalPadding,
+            ),
+            child: Row(
+              children: [
+                if (channel.isDm) ...[
+                  SizedBox(
+                    width: _kChannelLeadingWidth,
+                    child: Align(
+                      alignment: Alignment.centerLeft,
+                      child: _DmAvatar(
+                        channel: channel,
+                        currentPubkey: currentPubkey,
+                      ),
+                    ),
+                  ),
+                  const SizedBox(width: _kChannelLabelGap),
+                ],
+                Expanded(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        ref.watch(
+                          identityNameSourcesProvider.select(
+                            (names) => resolveDmChannelDisplayLabel(
+                              channel,
+                              currentPubkey: currentPubkey,
+                              names: names,
+                            ),
+                          ),
+                        ),
+                        maxLines: 1,
+                        overflow: TextOverflow.ellipsis,
+                        style: contentListTitleTextStyle.copyWith(
+                          color: contentColor,
+                          fontWeight: isUnread
+                              ? FontWeight.w700
+                              : FontWeight.w400,
+                        ),
+                      ),
+                    ],
                   ),
                 ),
-              ),
-              const SizedBox(width: _kChannelLabelGap),
-            ],
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Text(
-                    ref.watch(
-                      identityNameSourcesProvider.select(
-                        (names) => resolveDmChannelDisplayLabel(
-                          channel,
-                          currentPubkey: currentPubkey,
-                          names: names,
+                if (channel.isEphemeral) ...[
+                  const SizedBox(width: Grid.xxs),
+                  _EphemeralBadge(channel: channel),
+                ],
+                if (isMuted) ...[
+                  const SizedBox(width: Grid.xxs),
+                  Icon(
+                    BuzzIcons.bellOff,
+                    size: 12,
+                    color: context.colors.onSurface.withValues(alpha: 0.4),
+                  ),
+                ],
+                if (!channel.isMember && !channel.isDm)
+                  Padding(
+                    padding: const EdgeInsets.only(right: Grid.xxs),
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: Grid.half + 2,
+                        vertical: 3,
+                      ),
+                      decoration: BoxDecoration(
+                        color: context.colors.primary.withValues(alpha: 0.1),
+                        borderRadius: BorderRadius.circular(Radii.sm),
+                      ),
+                      child: Text(
+                        'Open',
+                        style: context.textTheme.labelSmall?.copyWith(
+                          color: context.colors.primary,
+                          fontWeight: FontWeight.w600,
                         ),
                       ),
                     ),
-                    maxLines: 1,
-                    overflow: TextOverflow.ellipsis,
-                    style: contentListTitleTextStyle.copyWith(
-                      color: contentColor,
-                      fontWeight: isUnread ? FontWeight.w700 : FontWeight.w400,
-                    ),
                   ),
-                ],
-              ),
+              ],
             ),
-            if (channel.isEphemeral) ...[
-              const SizedBox(width: Grid.xxs),
-              _EphemeralBadge(channel: channel),
-            ],
-            if (isMuted) ...[
-              const SizedBox(width: Grid.xxs),
-              Icon(
-                BuzzIcons.bellOff,
-                size: 12,
-                color: context.colors.onSurface.withValues(alpha: 0.4),
-              ),
-            ],
-            if (!channel.isMember && !channel.isDm)
-              Padding(
-                padding: const EdgeInsets.only(right: Grid.xxs),
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: Grid.half + 2,
-                    vertical: 3,
-                  ),
-                  decoration: BoxDecoration(
-                    color: context.colors.primary.withValues(alpha: 0.1),
-                    borderRadius: BorderRadius.circular(Radii.sm),
-                  ),
-                  child: Text(
-                    'Open',
-                    style: context.textTheme.labelSmall?.copyWith(
-                      color: context.colors.primary,
-                      fontWeight: FontWeight.w600,
-                    ),
-                  ),
-                ),
-              ),
-          ],
+          ),
         ),
       ),
     );

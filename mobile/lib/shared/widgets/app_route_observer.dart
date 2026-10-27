@@ -39,3 +39,32 @@ class AppRouteObserver extends RouteObserver<ModalRoute<dynamic>> {
     });
   }
 }
+
+/// Reports a nested navigator's route changes to [appRouteObserver].
+///
+/// A [NavigatorObserver] can be attached to only one [Navigator], so nested
+/// navigators (tablet panes) forward their events instead. Native navigation
+/// bars and voice-note recording subscribe through [appRouteObserver] and need
+/// the reveal and cover notifications from routes in those panes too.
+class NestedNavigatorRouteObserver extends NavigatorObserver {
+  NestedNavigatorRouteObserver([AppRouteObserver? target])
+    : _target = target ?? appRouteObserver;
+
+  final AppRouteObserver _target;
+
+  @override
+  void didPush(Route<dynamic> route, Route<dynamic>? previousRoute) =>
+      _target.didPush(route, previousRoute);
+
+  @override
+  void didPop(Route<dynamic> route, Route<dynamic>? previousRoute) =>
+      _target.didPop(route, previousRoute);
+
+  @override
+  void didRemove(Route<dynamic> route, Route<dynamic>? previousRoute) =>
+      _target.didRemove(route, previousRoute);
+
+  @override
+  void didReplace({Route<dynamic>? newRoute, Route<dynamic>? oldRoute}) =>
+      _target.didReplace(newRoute: newRoute, oldRoute: oldRoute);
+}

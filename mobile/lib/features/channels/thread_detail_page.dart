@@ -35,6 +35,7 @@ import 'channel_messages_provider.dart';
 import 'channel_typing_provider.dart';
 import 'channel_typing_indicator.dart';
 import 'thread_replies_provider.dart';
+import 'thread_detail_target.dart';
 import 'channels_provider.dart';
 import 'compose_bar.dart';
 import 'composer_dock_size_reporter.dart';
@@ -76,6 +77,42 @@ const _landingHighlightDelay = Duration(milliseconds: 50);
 const _landingHighlightTransitionDuration = Duration(milliseconds: 300);
 const _landingHighlightOpacity = 0.12;
 
+void openThreadDetail(
+  BuildContext context, {
+  required TimelineMessage threadHead,
+  required List<TimelineMessage> allMessages,
+  required String channelId,
+  required String? currentPubkey,
+  required bool isMember,
+  required bool isArchived,
+  String? initialMessageId,
+  bool replaceCurrentRoute = false,
+}) {
+  final target = ThreadDetailTarget(
+    threadHead: threadHead,
+    allMessages: allMessages,
+    channelId: channelId,
+    currentPubkey: currentPubkey,
+    isMember: isMember,
+    isArchived: isArchived,
+    initialMessageId: initialMessageId,
+  );
+  final pane = ThreadDetailPaneScope.maybeOf(context);
+  if (pane != null) {
+    pane.onOpenThread(target);
+    return;
+  }
+  final route = MaterialPageRoute<void>(
+    builder: (_) => ThreadDetailPage.fromTarget(target),
+  );
+  final navigator = Navigator.of(context);
+  if (replaceCurrentRoute) {
+    navigator.pushReplacement(route);
+  } else {
+    navigator.push(route);
+  }
+}
+
 /// Full-screen thread detail page.
 ///
 /// Shows the thread head message, direct replies, typing indicators scoped to
@@ -88,6 +125,7 @@ class ThreadDetailPage extends HookConsumerWidget {
   final bool isMember;
   final bool isArchived;
   final String? initialMessageId;
+  final VoidCallback? onClose;
 
   /// Overrides the tail jump only in deterministic lazy-layout tests.
   @visibleForTesting
@@ -102,8 +140,25 @@ class ThreadDetailPage extends HookConsumerWidget {
     required this.isMember,
     required this.isArchived,
     this.initialMessageId,
+    this.onClose,
     this.jumpThreadTailForTesting,
   });
+
+  factory ThreadDetailPage.fromTarget(
+    ThreadDetailTarget target, {
+    Key? key,
+    VoidCallback? onClose,
+  }) => ThreadDetailPage(
+    key: key,
+    threadHead: target.threadHead,
+    allMessages: target.allMessages,
+    channelId: target.channelId,
+    currentPubkey: target.currentPubkey,
+    isMember: target.isMember,
+    isArchived: target.isArchived,
+    initialMessageId: target.initialMessageId,
+    onClose: onClose,
+  );
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -927,7 +982,13 @@ class ThreadDetailPage extends HookConsumerWidget {
             )
           : null,
       resizeToAvoidBottomInset: !usesFixedAndroidImeViewport,
-      appBar: _threadAppBar(context, ref, channel, currentPubkey),
+      appBar: _threadAppBar(
+        context,
+        ref,
+        channel,
+        currentPubkey,
+        onClose: onClose,
+      ),
       body: Stack(
         fit: StackFit.expand,
         children: [
