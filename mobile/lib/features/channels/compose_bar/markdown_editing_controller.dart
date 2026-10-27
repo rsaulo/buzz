@@ -16,6 +16,7 @@ class _MarkdownRule {
 
 class _MarkdownEditingController extends TextEditingController {
   final Set<String> _agentMentionNames = <String>{};
+  final Set<String> _personMentionNames = <String>{};
   TextSpan? _cachedTextSpan;
   String? _cachedText;
   TextRange? _cachedComposingRange;
@@ -241,6 +242,22 @@ class _MarkdownEditingController extends TextEditingController {
     };
     if (setEquals(_agentMentionNames, next)) return;
     _agentMentionNames
+      ..clear()
+      ..addAll(next);
+    _cachedTextSpan = null;
+    notifyListeners();
+  }
+
+  /// Updates the known people labels (picked from the mention picker or
+  /// channel members that resolve on send), rendered as mention chips like
+  /// agents so the composer shows which names will notify someone.
+  void setPersonMentionNames(Iterable<String> names) {
+    final next = {
+      for (final name in names)
+        if (name.trim().isNotEmpty) name.trim().toLowerCase(),
+    };
+    if (setEquals(_personMentionNames, next)) return;
+    _personMentionNames
       ..clear()
       ..addAll(next);
     _cachedTextSpan = null;
@@ -686,12 +703,14 @@ class _MarkdownEditingController extends TextEditingController {
         ? _buildComposerTokenSpans(context, source, style, sourceOffset)
         : null;
     if (tokenSpans != null) return tokenSpans;
-    if (_agentMentionNames.isEmpty) {
+    if (_agentMentionNames.isEmpty && _personMentionNames.isEmpty) {
       return [TextSpan(text: source, style: style)];
     }
 
-    final escapedNames = _agentMentionNames.toList()
-      ..sort((a, b) => b.length.compareTo(a.length));
+    final escapedNames = {
+      ..._agentMentionNames,
+      ..._personMentionNames,
+    }.toList()..sort((a, b) => b.length.compareTo(a.length));
     final expression = RegExp(
       r'(^|\s)@(' +
           escapedNames.map(RegExp.escape).join('|') +
@@ -725,7 +744,11 @@ class _MarkdownEditingController extends TextEditingController {
         WidgetSpan(
           alignment: PlaceholderAlignment.baseline,
           baseline: TextBaseline.alphabetic,
-          child: _ComposerAgentMentionChip(label: label, textStyle: style),
+          child: _ComposerAgentMentionChip(
+            label: label,
+            textStyle: style,
+            isAgent: _agentMentionNames.contains(label.toLowerCase()),
+          ),
         ),
       );
       _pendingChipRanges.add(
@@ -1006,7 +1029,11 @@ class _ComposerAgentMentionChip extends StatelessWidget {
   const _ComposerAgentMentionChip({
     required this.label,
     required this.textStyle,
+    this.isAgent = true,
   });
+
+  /// Agents carry the bot glyph; people carry the person glyph.
+  final bool isAgent;
 
   @override
   Widget build(BuildContext context) {
@@ -1018,10 +1045,14 @@ class _ComposerAgentMentionChip extends StatelessWidget {
     final fontSize = style.fontSize ?? 16;
 
     return Semantics(
-      label: 'Agent mention: $label',
+      label: isAgent ? 'Agent mention: $label' : 'Mention: $label',
       excludeSemantics: true,
       child: Container(
-        key: const ValueKey('composer-agent-mention-chip'),
+        key: ValueKey(
+          isAgent
+              ? 'composer-agent-mention-chip'
+              : 'composer-person-mention-chip',
+        ),
         padding: const EdgeInsets.fromLTRB(
           Grid.half,
           Grid.quarter + 1,
@@ -1043,7 +1074,7 @@ class _ComposerAgentMentionChip extends StatelessWidget {
           crossAxisAlignment: CrossAxisAlignment.center,
           children: [
             Icon(
-              BuzzIcons.bot,
+              isAgent ? BuzzIcons.bot : BuzzIcons.user,
               size: fontSize * 0.95,
               color: context.colors.primary,
             ),
