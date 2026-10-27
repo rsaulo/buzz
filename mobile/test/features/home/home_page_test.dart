@@ -141,6 +141,35 @@ void main() {
     expect(tester.getRect(contentSurface).left, 300);
   });
 
+  testWidgets('resizes the tablet sidebar by dragging its edge', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(1194, 834);
+    addTearDown(tester.view.reset);
+
+    await tester.pumpWidget(await buildHome());
+    await tester.pump();
+
+    expect(find.byKey(const ValueKey('tablet-header-profile')), findsOneWidget);
+    expect(find.byKey(const ValueKey('tablet-community-menu')), findsOneWidget);
+    final contentSurface = find.byKey(
+      const ValueKey('tablet-workspace-content-surface'),
+    );
+    final handle = find.byKey(const ValueKey('tablet-sidebar-resize'));
+    await tester.drag(handle, const Offset(80, 0));
+    await tester.pumpAndSettle();
+    expect(tester.getRect(contentSurface).left, closeTo(380, 1));
+
+    // Clamped to the minimum width.
+    await tester.drag(handle, const Offset(-400, 0));
+    await tester.pumpAndSettle();
+    expect(tester.getRect(contentSurface).left, closeTo(260, 1));
+
+    final prefs = await SharedPreferences.getInstance();
+    expect(prefs.getDouble('tablet_workspace.sidebar_width'), closeTo(260, 1));
+  });
+
   testWidgets('keeps a wide landscape phone in the compact shell', (
     tester,
   ) async {

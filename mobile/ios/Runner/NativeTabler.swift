@@ -78,6 +78,10 @@ enum NativeTabler {
     "building.2.crop.circle": 0xebf6, // building-community
     "folder.badge.plus": 0xeaab, // folder-plus
     "headphones": 0xeabd, // headphones
+    "sidebar.left": 0xeada, // layout-sidebar
+    "arrow.up.left.and.arrow.down.right": 0xea28, // arrows-maximize
+    "arrow.down.right.and.arrow.up.left": 0xea29, // arrows-minimize
+    "gearshape": 0xeb20, // settings
     "line.3.horizontal.decrease": 0xeaa5, // filter
     "square.and.pencil": 0xea98, // edit
     "pencil": 0xea98, // edit

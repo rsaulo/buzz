@@ -1,12 +1,14 @@
 import 'dart:async';
+import 'dart:math' as math;
 import 'dart:ui';
 
-import 'package:flutter/cupertino.dart' show CupertinoIcons;
 import 'package:flutter/foundation.dart';
+import 'package:flutter/gestures.dart' show DragStartBehavior;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
 import 'package:hooks_riverpod/hooks_riverpod.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:buzz/shared/theme/buzz_icons.dart';
 
 import '../../shared/theme/theme.dart';
@@ -104,7 +106,9 @@ class HomePage extends HookConsumerWidget {
     final workspaceChannel = useState<Channel?>(null);
     final workspaceThread = useState<ThreadDetailTarget?>(null);
     final workspaceCommunityId = useRef<String?>(null);
-    final workspaceSidebarCollapsed = useState(false);
+    final workspaceSidebarCollapsed = useState(
+      _tabletPrefs(ref)?.getBool(_kTabletSidebarCollapsedPref) ?? false,
+    );
     final workspaceThreadExpanded = useState(false);
     final reducedMotion = MediaQuery.of(context).disableAnimations;
     final tabContentTransitionProgress = reducedMotion
@@ -220,6 +224,9 @@ class HomePage extends HookConsumerWidget {
         onSidebarCollapsedChanged: (collapsed) {
           unawaited(HapticFeedback.selectionClick());
           workspaceSidebarCollapsed.value = collapsed;
+          unawaited(
+            _tabletPrefs(ref)?.setBool(_kTabletSidebarCollapsedPref, collapsed),
+          );
         },
         threadExpanded: workspaceThreadExpanded.value,
         onThreadExpandedChanged: (expanded) {

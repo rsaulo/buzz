@@ -63,6 +63,9 @@ FrostedAppBar _threadAppBar(
                 symbol: expanded
                     ? 'arrow.down.right.and.arrow.up.left'
                     : 'arrow.up.left.and.arrow.down.right',
+                icon: expanded
+                    ? BuzzIcons.arrowsMinimize
+                    : BuzzIcons.arrowsMaximize,
                 onPressed: onToggleExpanded,
               ),
             IosNavigationAction(
@@ -78,9 +81,7 @@ FrostedAppBar _threadAppBar(
           tooltip: expanded ? 'Exit full screen' : 'Full screen',
           onPressed: onToggleExpanded,
           icon: Icon(
-            expanded
-                ? CupertinoIcons.arrow_down_right_arrow_up_left
-                : CupertinoIcons.arrow_up_left_arrow_down_right,
+            expanded ? BuzzIcons.arrowsMinimize : BuzzIcons.arrowsMaximize,
           ),
         ),
       if (onClose != null)

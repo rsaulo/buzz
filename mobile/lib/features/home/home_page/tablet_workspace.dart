@@ -1,14 +1,33 @@
 part of '../home_page.dart';
 
-const double _tabletSidebarWidth = 300;
+const double _tabletSidebarDefaultWidth = 300;
+const double _tabletSidebarMinWidth = 260;
+const double _tabletSidebarMaxWidth = 480;
 const double _tabletRailWidth = 68;
-const double _tabletThreadPaneWidth = 380;
+const double _tabletThreadDefaultWidth = 380;
+const double _tabletThreadMinWidth = 300;
 
-/// Window width at which a selected channel keeps its thread in a third pane.
-///
-/// Narrower workspaces (iPad portrait, Split View) open threads inside the
-/// content pane instead, so the conversation never shrinks below phone width.
-const double _tabletThreePaneMinWidth = 1100;
+/// Narrowest the conversation beside a thread pane may become. Below this the
+/// thread covers the conversation instead of sitting beside it.
+const double _tabletChannelMinWidth = 360;
+
+/// Content width kept free when no thread is open.
+const double _tabletContentMinWidth = 400;
+const double _tabletResizeHandleWidth = 14;
+
+const _kTabletSidebarWidthPref = 'tablet_workspace.sidebar_width';
+const _kTabletThreadWidthPref = 'tablet_workspace.thread_width';
+const _kTabletSidebarCollapsedPref = 'tablet_workspace.sidebar_collapsed';
+
+/// Tablet layout preferences survive relaunches; tests without stored
+/// preferences fall back to defaults.
+SharedPreferences? _tabletPrefs(WidgetRef ref) {
+  try {
+    return ref.read(savedPrefsProvider);
+  } catch (_) {
+    return null;
+  }
+}
 
 /// Persistent workspace destinations. [_kWorkspaceChannel] shows the channel
 /// selected in the sidebar; the others are the sidebar's top-level rows.
@@ -93,21 +112,70 @@ class _TabletWorkspace extends StatelessWidget {
       ),
       _ => const ActivityPage(splitView: true),
     };
-    final showsThreadPane =
-        channel != null &&
-        MediaQuery.sizeOf(context).width >= _tabletThreePaneMinWidth;
-    final threadVisible = showsThreadPane && selectedThread != null;
-    final threadFullScreen = threadVisible && threadExpanded;
     final contentNavigator = _TabletContentNavigator(
       key: ValueKey('tablet-content-$destination-${channel?.id}'),
       child: page,
     );
-    final content = showsThreadPane
+    // Threads opened from a channel belong to the workspace: beside the
+    // conversation when there is room, over it otherwise.
+    final content = channel != null
         ? ThreadDetailPaneScope(
             onOpenThread: onThreadSelected,
             child: contentNavigator,
           )
         : contentNavigator;
+    final thread = channel == null ? null : selectedThread;
+
+    final sidebar = Stack(
+      fit: StackFit.expand,
+      children: [
+        MediaQuery(
+          // Keep the last channel rows clear of the quick actions.
+          data: _mediaQueryWithFloatingTabBarClearance(
+            context,
+            HomePage._fabClearance,
+          ),
+          child: ChannelsPage(
+            settingsPageBuilder: settingsPageBuilder,
+            communityInvitePageBuilder: communityInvitePageBuilder,
+            communityAppearancePageBuilder: communityAppearancePageBuilder,
+            onSettingsTransitionProgress: (progress) {
+              if (settingsTransitionProgress.value != progress) {
+                settingsTransitionProgress.value = progress;
+              }
+            },
+            selectedChannelId: channel?.id,
+            onChannelSelected: onChannelSelected,
+            onCommunityChanged: onCommunityChanged,
+            onSelectedChannelUnavailable: onSelectedChannelUnavailable,
+            onHideSidebar: () => onSidebarCollapsedChanged(true),
+            workspaceHeader: _TabletWorkspaceDestinations(
+              selectedDestination: destination,
+              hasUnreadInbox: hasUnreadInbox,
+              hasUnreadSolo: hasUnreadSolo,
+              showsSolo: mePageBuilder != null,
+              onDestinationSelected: onDestinationSelected,
+            ),
+          ),
+        ),
+        ValueListenableBuilder<VoidCallback?>(
+          valueListenable: newChatAction,
+          builder: (context, onNewChat, _) => ChannelQuickActionsLauncher(
+            key: const ValueKey('tablet-quick-actions'),
+            visible: true,
+            newChatMode: destination == _kWorkspaceSolo,
+            onNewChat: onNewChat,
+            navigationBarHeight: HomePage._tabBarHeight,
+            navigationBarBottomGap: HomePage._tabBarBottomGap,
+            navigationBarWidth: 0,
+            navigationBarLeft: 0,
+            systemBottomInset: MediaQuery.viewPaddingOf(context).bottom,
+            rightInset: Grid.gutter,
+            onOpenChannel: onChannelSelected,
+          ),
+        ),
+      ],
+    );
 
     return Scaffold(
       key: const ValueKey('tablet-workspace'),
@@ -120,82 +188,152 @@ class _TabletWorkspace extends StatelessWidget {
               : null,
           gradient: gradient,
         ),
-        child: Row(
+        child: _WorkspacePanes(
+          sidebar: sidebar,
+          rail: _TabletWorkspaceRail(
+            selectedDestination: destination,
+            hasUnreadInbox: hasUnreadInbox,
+            hasUnreadSolo: hasUnreadSolo,
+            showsSolo: mePageBuilder != null,
+            onDestinationSelected: onDestinationSelected,
+            onShowSidebar: () => onSidebarCollapsedChanged(false),
+          ),
+          content: content,
+          thread: thread == null
+              ? null
+              : ThreadDetailPaneScope(
+                  // Nested threads replace the pane's thread instead of
+                  // covering the whole workspace.
+                  onOpenThread: onThreadSelected,
+                  child: ThreadDetailPage.fromTarget(
+                    thread,
+                    key: ValueKey('tablet-thread-${thread.threadHead.id}'),
+                    onClose: onThreadClosed,
+                    expanded: threadExpanded,
+                    onToggleExpanded: () =>
+                        onThreadExpandedChanged(!threadExpanded),
+                  ),
+                ),
+          sidebarCollapsed: sidebarCollapsed,
+          threadExpanded: threadExpanded,
+        ),
+      ),
+    );
+  }
+}
+
+/// Lays out sidebar (or rail), content and thread, with drag handles on the
+/// sidebar edge and the thread edge. Pane widths persist across launches.
+///
+/// Children are built once by the caller, so dragging a handle only re-lays
+/// out the panes instead of rebuilding them. Hidden panes stay mounted
+/// offstage, so scroll positions, drafts and nested routes survive collapsing
+/// the sidebar or expanding the thread.
+class _WorkspacePanes extends HookConsumerWidget {
+  const _WorkspacePanes({
+    required this.sidebar,
+    required this.rail,
+    required this.content,
+    required this.thread,
+    required this.sidebarCollapsed,
+    required this.threadExpanded,
+  });
+
+  final Widget sidebar;
+  final Widget rail;
+  final Widget content;
+  final Widget? thread;
+  final bool sidebarCollapsed;
+  final bool threadExpanded;
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final prefs = _tabletPrefs(ref);
+    final sidebarWidth = useState(
+      prefs?.getDouble(_kTabletSidebarWidthPref) ?? _tabletSidebarDefaultWidth,
+    );
+    final threadWidth = useState(
+      prefs?.getDouble(_kTabletThreadWidthPref) ?? _tabletThreadDefaultWidth,
+    );
+    final borderColor = context.colors.outlineVariant.withValues(alpha: 0.45);
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final total = constraints.maxWidth;
+        final threadOpen = thread != null;
+        final threadFullScreen = threadOpen && threadExpanded;
+        final sidebarHidden = sidebarCollapsed || threadFullScreen;
+        final reservedContent = threadOpen
+            ? _tabletChannelMinWidth + _tabletThreadMinWidth
+            : _tabletContentMinWidth;
+        final sidebarMax = math.max(
+          _tabletSidebarMinWidth,
+          math.min(_tabletSidebarMaxWidth, total - reservedContent),
+        );
+        final sidebarW = sidebarWidth.value
+            .clamp(_tabletSidebarMinWidth, sidebarMax)
+            .toDouble();
+        final leftW = sidebarHidden
+            ? (threadFullScreen ? 0.0 : _tabletRailWidth)
+            : sidebarW;
+        final contentW = total - leftW;
+        // Beside the conversation when both fit, otherwise over it.
+        final threadBeside =
+            threadOpen &&
+            !threadFullScreen &&
+            contentW >= _tabletChannelMinWidth + _tabletThreadMinWidth;
+        final threadMax = math.max(
+          _tabletThreadMinWidth,
+          contentW - _tabletChannelMinWidth,
+        );
+        final threadW = threadWidth.value
+            .clamp(_tabletThreadMinWidth, threadMax)
+            .toDouble();
+        final threadCovers = threadOpen && !threadBeside;
+
+        void persist(String key, double value) =>
+            unawaited(prefs?.setDouble(key, value));
+
+        return Row(
           children: [
-            // Hidden panes stay mounted offstage so scroll positions, drafts
-            // and nested routes survive collapsing and expanding.
             Offstage(
               key: const ValueKey('tablet-workspace-sidebar-slot'),
-              offstage: sidebarCollapsed || threadFullScreen,
+              offstage: sidebarHidden,
               child: SizedBox(
                 key: const ValueKey('tablet-workspace-sidebar'),
-                width: _tabletSidebarWidth,
+                width: sidebarW,
                 child: Stack(
                   fit: StackFit.expand,
                   children: [
-                    MediaQuery(
-                      // Keep the last channel rows clear of the quick actions.
-                      data: _mediaQueryWithFloatingTabBarClearance(
-                        context,
-                        HomePage._fabClearance,
-                      ),
-                      child: ChannelsPage(
-                        settingsPageBuilder: settingsPageBuilder,
-                        communityInvitePageBuilder: communityInvitePageBuilder,
-                        communityAppearancePageBuilder:
-                            communityAppearancePageBuilder,
-                        onSettingsTransitionProgress: (progress) {
-                          if (settingsTransitionProgress.value != progress) {
-                            settingsTransitionProgress.value = progress;
-                          }
-                        },
-                        selectedChannelId: channel?.id,
-                        onChannelSelected: onChannelSelected,
-                        onCommunityChanged: onCommunityChanged,
-                        onSelectedChannelUnavailable:
-                            onSelectedChannelUnavailable,
-                        onHideSidebar: () => onSidebarCollapsedChanged(true),
-                        workspaceHeader: _TabletWorkspaceDestinations(
-                          selectedDestination: destination,
-                          hasUnreadInbox: hasUnreadInbox,
-                          hasUnreadSolo: hasUnreadSolo,
-                          showsSolo: mePageBuilder != null,
-                          onDestinationSelected: onDestinationSelected,
+                    sidebar,
+                    Positioned(
+                      top: 0,
+                      bottom: 0,
+                      right: 0,
+                      width: _tabletResizeHandleWidth,
+                      child: _PaneResizeHandle(
+                        key: const ValueKey('tablet-sidebar-resize'),
+                        label: 'Resize sidebar',
+                        grabberAlignment: Alignment.centerRight,
+                        onDrag: (dx) => sidebarWidth.value =
+                            (sidebarWidth.value.clamp(
+                                      _tabletSidebarMinWidth,
+                                      sidebarMax,
+                                    ) +
+                                    dx)
+                                .clamp(_tabletSidebarMinWidth, sidebarMax)
+                                .toDouble(),
+                        onDragEnd: () => persist(
+                          _kTabletSidebarWidthPref,
+                          sidebarWidth.value,
                         ),
                       ),
-                    ),
-                    ValueListenableBuilder<VoidCallback?>(
-                      valueListenable: newChatAction,
-                      builder: (context, onNewChat, _) =>
-                          ChannelQuickActionsLauncher(
-                            key: const ValueKey('tablet-quick-actions'),
-                            visible: true,
-                            newChatMode: destination == _kWorkspaceSolo,
-                            onNewChat: onNewChat,
-                            navigationBarHeight: HomePage._tabBarHeight,
-                            navigationBarBottomGap: HomePage._tabBarBottomGap,
-                            navigationBarWidth: 0,
-                            navigationBarLeft: 0,
-                            systemBottomInset: MediaQuery.viewPaddingOf(
-                              context,
-                            ).bottom,
-                            rightInset: Grid.gutter,
-                            onOpenChannel: onChannelSelected,
-                          ),
                     ),
                   ],
                 ),
               ),
             ),
-            if (sidebarCollapsed && !threadFullScreen)
-              _TabletWorkspaceRail(
-                selectedDestination: destination,
-                hasUnreadInbox: hasUnreadInbox,
-                hasUnreadSolo: hasUnreadSolo,
-                showsSolo: mePageBuilder != null,
-                onDestinationSelected: onDestinationSelected,
-                onShowSidebar: () => onSidebarCollapsedChanged(false),
-              ),
+            if (sidebarHidden && !threadFullScreen) rail,
             Expanded(
               child: DecoratedBox(
                 key: const ValueKey('tablet-workspace-content-surface'),
@@ -204,11 +342,7 @@ class _TabletWorkspace extends StatelessWidget {
                   border: Border(
                     left: threadFullScreen
                         ? BorderSide.none
-                        : BorderSide(
-                            color: context.colors.outlineVariant.withValues(
-                              alpha: 0.45,
-                            ),
-                          ),
+                        : BorderSide(color: borderColor),
                   ),
                 ),
                 child: Stack(
@@ -217,48 +351,50 @@ class _TabletWorkspace extends StatelessWidget {
                       left: 0,
                       top: 0,
                       bottom: 0,
-                      right: threadVisible && !threadFullScreen
-                          ? _tabletThreadPaneWidth
-                          : 0,
-                      child: Offstage(
-                        offstage: threadFullScreen,
-                        child: content,
-                      ),
+                      right: threadBeside ? threadW : 0,
+                      child: Offstage(offstage: threadCovers, child: content),
                     ),
-                    if (threadVisible)
+                    if (threadOpen)
                       Positioned(
                         top: 0,
                         bottom: 0,
                         right: 0,
-                        left: threadFullScreen ? 0 : null,
-                        width: threadFullScreen ? null : _tabletThreadPaneWidth,
+                        left: threadBeside ? null : 0,
+                        width: threadBeside ? threadW : null,
                         child: DecoratedBox(
                           key: const ValueKey('tablet-thread-pane'),
                           decoration: BoxDecoration(
                             color: context.colors.surface,
                             border: Border(
-                              left: threadFullScreen
-                                  ? BorderSide.none
-                                  : BorderSide(
-                                      color: context.colors.outlineVariant
-                                          .withValues(alpha: 0.45),
-                                    ),
+                              left: threadBeside
+                                  ? BorderSide(color: borderColor)
+                                  : BorderSide.none,
                             ),
                           ),
-                          // Nested threads replace the pane's thread instead
-                          // of covering the whole workspace.
-                          child: ThreadDetailPaneScope(
-                            onOpenThread: onThreadSelected,
-                            child: ThreadDetailPage.fromTarget(
-                              selectedThread!,
-                              key: ValueKey(
-                                'tablet-thread-${selectedThread!.threadHead.id}',
-                              ),
-                              onClose: onThreadClosed,
-                              expanded: threadFullScreen,
-                              onToggleExpanded: () =>
-                                  onThreadExpandedChanged(!threadExpanded),
-                            ),
+                          child: thread,
+                        ),
+                      ),
+                    if (threadBeside)
+                      Positioned(
+                        top: 0,
+                        bottom: 0,
+                        right: threadW - _tabletResizeHandleWidth,
+                        width: _tabletResizeHandleWidth,
+                        child: _PaneResizeHandle(
+                          key: const ValueKey('tablet-thread-resize'),
+                          label: 'Resize thread',
+                          grabberAlignment: Alignment.centerLeft,
+                          onDrag: (dx) => threadWidth.value =
+                              (threadWidth.value.clamp(
+                                        _tabletThreadMinWidth,
+                                        threadMax,
+                                      ) -
+                                      dx)
+                                  .clamp(_tabletThreadMinWidth, threadMax)
+                                  .toDouble(),
+                          onDragEnd: () => persist(
+                            _kTabletThreadWidthPref,
+                            threadWidth.value,
                           ),
                         ),
                       ),
@@ -267,12 +403,77 @@ class _TabletWorkspace extends StatelessWidget {
               ),
             ),
           ],
+        );
+      },
+    );
+  }
+}
+
+/// Horizontal drag strip on a pane edge, with a small grabber on the border.
+///
+/// Only horizontal drags are claimed, so taps and vertical scrolling still
+/// reach the pane underneath.
+class _PaneResizeHandle extends HookWidget {
+  const _PaneResizeHandle({
+    required this.label,
+    required this.grabberAlignment,
+    required this.onDrag,
+    required this.onDragEnd,
+    super.key,
+  });
+
+  final String label;
+  final Alignment grabberAlignment;
+  final ValueChanged<double> onDrag;
+  final VoidCallback onDragEnd;
+
+  @override
+  Widget build(BuildContext context) {
+    final dragging = useState(false);
+    void end() {
+      if (!dragging.value) return;
+      dragging.value = false;
+      onDragEnd();
+    }
+
+    return Semantics(
+      label: label,
+      child: MouseRegion(
+        cursor: SystemMouseCursors.resizeColumn,
+        child: GestureDetector(
+          behavior: HitTestBehavior.translucent,
+          // Follow the finger from touch-down, including the drag slop.
+          dragStartBehavior: DragStartBehavior.down,
+          onHorizontalDragStart: (_) {
+            dragging.value = true;
+            unawaited(HapticFeedback.selectionClick());
+          },
+          onHorizontalDragUpdate: (details) => onDrag(details.delta.dx),
+          onHorizontalDragEnd: (_) => end(),
+          onHorizontalDragCancel: end,
+          child: Align(
+            alignment: grabberAlignment,
+            child: AnimatedContainer(
+              duration: const Duration(milliseconds: 120),
+              width: dragging.value ? 6 : 4,
+              height: dragging.value ? 56 : 36,
+              decoration: BoxDecoration(
+                color: dragging.value
+                    ? context.colors.primary
+                    : context.colors.outlineVariant.withValues(alpha: 0.9),
+                borderRadius: BorderRadius.circular(Radii.full),
+              ),
+            ),
+          ),
         ),
       ),
     );
   }
 }
 
+/// Hosts a workspace destination in its own navigator, so the routes it opens
+/// (channel info, Solo chats, search results) stay beside the sidebar instead
+/// of covering the whole window.
 class _TabletContentNavigator extends HookWidget {
   const _TabletContentNavigator({required this.child, super.key});
 
@@ -481,7 +682,7 @@ class _TabletWorkspaceRail extends StatelessWidget {
           children: [
             _TabletRailButton(
               key: const ValueKey('tablet-show-sidebar'),
-              icon: CupertinoIcons.sidebar_left,
+              icon: BuzzIcons.layoutSidebar,
               label: 'Show sidebar',
               onTap: onShowSidebar,
             ),

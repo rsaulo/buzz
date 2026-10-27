@@ -8,7 +8,6 @@ import 'dart:math' show max, min, pi;
 import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
-import 'package:flutter/cupertino.dart' show CupertinoIcons;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
@@ -44,6 +43,7 @@ import '../profile/profile_provider.dart';
 import '../profile/presence_cache_provider.dart';
 import '../../shared/identity_names/identity_names_provider.dart';
 import '../../shared/profile/user_cache_provider.dart';
+import '../../shared/profile/user_profile.dart';
 import '../pairing/pairing_page.dart';
 import '../pairing/pairing_provider.dart';
 import 'channel.dart';
@@ -176,7 +176,9 @@ class ChannelsPage extends HookConsumerWidget {
   /// channel set.
   final VoidCallback? onSelectedChannelUnavailable;
 
-  /// Collapses an enclosing workspace sidebar from the header.
+  /// Collapses an enclosing workspace sidebar from the header. When set, the
+  /// header uses the tablet arrangement: profile (Settings) on the left, then
+  /// Hide sidebar and a gear for the community menu on the right.
   final VoidCallback? onHideSidebar;
 
   @override
@@ -484,6 +486,16 @@ class ChannelsPage extends HookConsumerWidget {
       );
     }
 
+    void openSettings() {
+      unawaited(HapticFeedback.lightImpact());
+      Navigator.of(context).push(
+        BottomUpPageRoute<void>(
+          builder: settingsPageBuilder,
+          reducedMotion: reducedMotion,
+        ),
+      );
+    }
+
     final activeCommunity = ref
         .watch(activeCommunityProvider)
         .unwrapPrevious()
@@ -502,112 +514,121 @@ class ChannelsPage extends HookConsumerWidget {
           ? Colors.transparent
           : context.colors.surface,
       backgroundGradient: topSectionGradient,
-      appBar: FrostedAppBar(
-        key: headerKey,
-        onNativeReadyChanged: (ready) => nativeHeaderReady.value = ready,
-        nativeTitle: '',
-        nativeLargeTitle: false,
-        nativeLeading: IosNavigationAction(
-          label: 'Community settings',
-          onAvatarBoundsChanged: (bounds) {
-            final header = headerKey.currentContext?.findRenderObject();
-            if (header is RenderBox) {
-              // Store native coordinates, then apply the current Home transform
-              // when measuring the destination immediately before departure.
-              nativeCommunityAvatarBounds.value =
-                  header.globalToLocal(bounds.topLeft) & bounds.size;
-            }
-          },
-          avatarHidden: communityFlightActive.value,
-          avatarIdentity: activeCommunity?.id,
-          symbol: 'building.2.crop.circle',
-          imageUrl: communityAvatar,
-          avatarInitial: communityName.isEmpty
-              ? '?'
-              : communityName.substring(0, 1).toUpperCase(),
-          onPressed: openCommunitySwitcher,
-        ),
-        nativeActions: [
-          if (onSearch != null)
-            IosNavigationAction(
-              label: 'Search',
-              symbol: 'magnifyingglass',
-              sharesBackground: true,
-              icon: BuzzIcons.search300,
-              onPressed: onSearch,
-            ),
-          if (onInbox != null)
-            IosNavigationAction(
-              label: 'Inbox',
-              symbol: 'tray',
-              sharesBackground: true,
-              icon: BuzzIcons.inbox300,
-              activityColor: hasUnreadInbox ? context.colors.primary : null,
-              activityLabel: hasUnreadInbox ? 'Unread' : null,
-              onPressed: onInbox,
-            ),
-          if (onHideSidebar != null)
-            IosNavigationAction(
-              label: 'Hide sidebar',
-              symbol: 'sidebar.left',
-              sharesBackground: true,
-              onPressed: onHideSidebar,
-            ),
-          IosNavigationAction(
-            label: 'Settings',
-            sharesBackground: false,
-            avatarIdentity: '${activeCommunity?.id}:${activeCommunity?.pubkey}',
-            symbol: 'person.crop.circle',
-            imageUrl: profile?.avatarUrl,
-            avatarInitial: profile?.initial ?? '?',
-            onPressed: () => Navigator.of(context).push(
-              BottomUpPageRoute<void>(
-                builder: settingsPageBuilder,
-                reducedMotion: reducedMotion,
+      appBar: onHideSidebar != null
+          ? _tabletHeader(
+              headerKey: headerKey,
+              onNativeReadyChanged: (ready) => nativeHeaderReady.value = ready,
+              profile: profile,
+              profileIdentity:
+                  '${activeCommunity?.id}:${activeCommunity?.pubkey}',
+              onHideSidebar: onHideSidebar!,
+              onCommunityMenu: openCommunitySwitcher,
+              onSettings: openSettings,
+              usesPinnedGradient: usesPinnedGradient,
+              headerFrostProgress: headerFrostProgress.value,
+              titleStyle: headerTitleStyle,
+            )
+          : FrostedAppBar(
+              key: headerKey,
+              onNativeReadyChanged: (ready) => nativeHeaderReady.value = ready,
+              nativeTitle: '',
+              nativeLargeTitle: false,
+              nativeLeading: IosNavigationAction(
+                label: 'Community settings',
+                onAvatarBoundsChanged: (bounds) {
+                  final header = headerKey.currentContext?.findRenderObject();
+                  if (header is RenderBox) {
+                    // Store native coordinates, then apply the current Home transform
+                    // when measuring the destination immediately before departure.
+                    nativeCommunityAvatarBounds.value =
+                        header.globalToLocal(bounds.topLeft) & bounds.size;
+                  }
+                },
+                avatarHidden: communityFlightActive.value,
+                avatarIdentity: activeCommunity?.id,
+                symbol: 'building.2.crop.circle',
+                imageUrl: communityAvatar,
+                avatarInitial: communityName.isEmpty
+                    ? '?'
+                    : communityName.substring(0, 1).toUpperCase(),
+                onPressed: openCommunitySwitcher,
               ),
-            ),
-          ),
-        ],
-        horizontalInset: _kTopSectionInset,
-        // Let the full Buzz gradient show at rest. Once the list begins to
-        // move beneath this row, build up blur over the first 64dp of scroll
-        // without adding the usual white frosted wash. The Buzz list is
-        // transparent, so the blurred pixels remain a continuation of the
-        // pinned gradient instead of turning into a white header.
-        frosted: !usesPinnedGradient || headerFrostProgress.value > 0,
-        frostedSurfaceOpacity: usesPinnedGradient ? 0 : 0.5,
-        frostedBlurSigma: usesPinnedGradient
-            ? _kHeaderFrostMaxBlurSigma * headerFrostProgress.value
-            : 20,
-        showBottomDivider: false,
-        leading: _CommunityIndicator(
-          onTap: openCommunitySwitcher,
-          avatarKey: communityAvatarKey,
-          hidden: communityFlightActive.value,
-        ),
-        centerTitle: false,
-        titleStyle: headerTitleStyle,
-        title: const SizedBox.shrink(),
-        actions: [
-          _ChannelHeaderActions(
-            onSearch: onSearch,
-            onInbox: onInbox,
-            hasUnreadInbox: hasUnreadInbox,
-            onHideSidebar: onHideSidebar,
-            onSettings: () {
-              unawaited(HapticFeedback.lightImpact());
-              Navigator.of(context).push(
-                BottomUpPageRoute<void>(
-                  builder: settingsPageBuilder,
-                  reducedMotion: reducedMotion,
+              nativeActions: [
+                if (onSearch != null)
+                  IosNavigationAction(
+                    label: 'Search',
+                    symbol: 'magnifyingglass',
+                    sharesBackground: true,
+                    icon: BuzzIcons.search300,
+                    onPressed: onSearch,
+                  ),
+                if (onInbox != null)
+                  IosNavigationAction(
+                    label: 'Inbox',
+                    symbol: 'tray',
+                    sharesBackground: true,
+                    icon: BuzzIcons.inbox300,
+                    activityColor: hasUnreadInbox
+                        ? context.colors.primary
+                        : null,
+                    activityLabel: hasUnreadInbox ? 'Unread' : null,
+                    onPressed: onInbox,
+                  ),
+                IosNavigationAction(
+                  label: 'Settings',
+                  sharesBackground: false,
+                  avatarIdentity:
+                      '${activeCommunity?.id}:${activeCommunity?.pubkey}',
+                  symbol: 'person.crop.circle',
+                  imageUrl: profile?.avatarUrl,
+                  avatarInitial: profile?.initial ?? '?',
+                  onPressed: () => Navigator.of(context).push(
+                    BottomUpPageRoute<void>(
+                      builder: settingsPageBuilder,
+                      reducedMotion: reducedMotion,
+                    ),
+                  ),
                 ),
-              );
-            },
-          ),
-        ],
-        bottomHeight: _kTopSectionBottomPadding,
-        bottom: const SizedBox.expand(),
-      ),
+              ],
+              horizontalInset: _kTopSectionInset,
+              // Let the full Buzz gradient show at rest. Once the list begins to
+              // move beneath this row, build up blur over the first 64dp of scroll
+              // without adding the usual white frosted wash. The Buzz list is
+              // transparent, so the blurred pixels remain a continuation of the
+              // pinned gradient instead of turning into a white header.
+              frosted: !usesPinnedGradient || headerFrostProgress.value > 0,
+              frostedSurfaceOpacity: usesPinnedGradient ? 0 : 0.5,
+              frostedBlurSigma: usesPinnedGradient
+                  ? _kHeaderFrostMaxBlurSigma * headerFrostProgress.value
+                  : 20,
+              showBottomDivider: false,
+              leading: _CommunityIndicator(
+                onTap: openCommunitySwitcher,
+                avatarKey: communityAvatarKey,
+                hidden: communityFlightActive.value,
+              ),
+              centerTitle: false,
+              titleStyle: headerTitleStyle,
+              title: const SizedBox.shrink(),
+              actions: [
+                _ChannelHeaderActions(
+                  onSearch: onSearch,
+                  onInbox: onInbox,
+                  hasUnreadInbox: hasUnreadInbox,
+                  onSettings: () {
+                    unawaited(HapticFeedback.lightImpact());
+                    Navigator.of(context).push(
+                      BottomUpPageRoute<void>(
+                        builder: settingsPageBuilder,
+                        reducedMotion: reducedMotion,
+                      ),
+                    );
+                  },
+                ),
+              ],
+              bottomHeight: _kTopSectionBottomPadding,
+              bottom: const SizedBox.expand(),
+            ),
       body: ProviderScope(
         overrides: [
           _workspaceSelectedChannelIdProvider.overrideWithValue(
@@ -712,4 +733,80 @@ class _CommunitySurfaceRoute extends PageRouteBuilder<void> {
       ),
     );
   }
+}
+
+/// Tablet sidebar header: profile (Settings) on the left; Hide sidebar and the
+/// community menu (gear) on the right. Icons only, matching the compact rail.
+FrostedAppBar _tabletHeader({
+  required GlobalKey headerKey,
+  required ValueChanged<bool> onNativeReadyChanged,
+  required UserProfile? profile,
+  required String profileIdentity,
+  required VoidCallback onHideSidebar,
+  required VoidCallback onCommunityMenu,
+  required VoidCallback onSettings,
+  required bool usesPinnedGradient,
+  required double headerFrostProgress,
+  required TextStyle? titleStyle,
+}) {
+  return FrostedAppBar(
+    key: headerKey,
+    onNativeReadyChanged: onNativeReadyChanged,
+    nativeTitle: '',
+    nativeLargeTitle: false,
+    nativeLeading: IosNavigationAction(
+      label: 'Settings',
+      avatarIdentity: profileIdentity,
+      symbol: 'person.crop.circle',
+      imageUrl: profile?.avatarUrl,
+      avatarInitial: profile?.initial ?? '?',
+      onPressed: onSettings,
+    ),
+    nativeActions: [
+      IosNavigationAction(
+        label: 'Hide sidebar',
+        symbol: 'sidebar.left',
+        icon: BuzzIcons.layoutSidebar,
+        onPressed: onHideSidebar,
+      ),
+      IosNavigationAction(
+        label: 'Community settings',
+        symbol: 'gearshape',
+        icon: BuzzIcons.settings,
+        onPressed: onCommunityMenu,
+      ),
+    ],
+    horizontalInset: _kTopSectionInset,
+    frosted: !usesPinnedGradient || headerFrostProgress > 0,
+    frostedSurfaceOpacity: usesPinnedGradient ? 0 : 0.5,
+    frostedBlurSigma: usesPinnedGradient
+        ? _kHeaderFrostMaxBlurSigma * headerFrostProgress
+        : 20,
+    showBottomDivider: false,
+    leading: ProfileAvatar(
+      key: const ValueKey('tablet-header-profile'),
+      size: _kTopSectionProfileAvatarSize,
+      showPresence: false,
+      onTap: onSettings,
+    ),
+    centerTitle: false,
+    titleStyle: titleStyle,
+    title: const SizedBox.shrink(),
+    actions: [
+      IconButton(
+        key: const ValueKey('hide-sidebar'),
+        tooltip: 'Hide sidebar',
+        icon: const Icon(BuzzIcons.layoutSidebar),
+        onPressed: onHideSidebar,
+      ),
+      IconButton(
+        key: const ValueKey('tablet-community-menu'),
+        tooltip: 'Community settings',
+        icon: const Icon(BuzzIcons.settings),
+        onPressed: onCommunityMenu,
+      ),
+    ],
+    bottomHeight: _kTopSectionBottomPadding,
+    bottom: const SizedBox.expand(),
+  );
 }

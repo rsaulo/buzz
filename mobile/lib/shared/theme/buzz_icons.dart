@@ -322,6 +322,15 @@ abstract final class BuzzIcons {
   /// Tabler `settings`.
   static const settings = IconData(0xeb20, fontFamily: 'BuzzTabler');
 
+  /// Tabler `layout-sidebar` (tablet sidebar toggle).
+  static const layoutSidebar = IconData(0xeada, fontFamily: 'BuzzTabler');
+
+  /// Tabler `arrows-maximize` (tablet thread full screen).
+  static const arrowsMaximize = IconData(0xea28, fontFamily: 'BuzzTabler');
+
+  /// Tabler `arrows-minimize` (tablet thread exit full screen).
+  static const arrowsMinimize = IconData(0xea29, fontFamily: 'BuzzTabler');
+
   /// Tabler `share`.
   static const share = IconData(0xeb21, fontFamily: 'BuzzTabler');
 
