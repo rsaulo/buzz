@@ -55,7 +55,9 @@ EOF
 runner_entitlements=ios/Runner/Runner.entitlements
 extension_entitlements=ios/NotificationService/NotificationService.entitlements
 restore_entitlements() {
-  git -C "$mobile_dir" checkout -- "$runner_entitlements" "$extension_entitlements"
+  # pod install also rewrites the CocoaPods version line in Podfile.lock.
+  git -C "$mobile_dir" checkout -- "$runner_entitlements" \
+    "$extension_entitlements" ios/Podfile.lock
 }
 trap restore_entitlements EXIT
 plist_head='<?xml version="1.0" encoding="UTF-8"?>
