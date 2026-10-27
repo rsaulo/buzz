@@ -109,6 +109,38 @@ void main() {
     );
   });
 
+  testWidgets('collapses the tablet sidebar to a rail and restores it', (
+    tester,
+  ) async {
+    tester.view.devicePixelRatio = 1;
+    tester.view.physicalSize = const Size(1194, 834);
+    addTearDown(tester.view.reset);
+
+    await tester.pumpWidget(await buildHome());
+    await tester.pump();
+
+    final contentSurface = find.byKey(
+      const ValueKey('tablet-workspace-content-surface'),
+    );
+    expect(tester.getRect(contentSurface).left, 300);
+    expect(find.byKey(const ValueKey('tablet-workspace-rail')), findsNothing);
+
+    await tester.tap(find.byKey(const ValueKey('hide-sidebar')));
+    await tester.pump();
+
+    expect(find.byKey(const ValueKey('tablet-workspace-rail')), findsOneWidget);
+    expect(tester.getRect(contentSurface).left, 68);
+
+    await tester.tap(find.byKey(const ValueKey('tablet-rail-solo')));
+    await tester.pump();
+    expect(find.text('Personal workspace'), findsOneWidget);
+
+    await tester.tap(find.byKey(const ValueKey('tablet-show-sidebar')));
+    await tester.pump();
+    expect(find.byKey(const ValueKey('tablet-workspace-rail')), findsNothing);
+    expect(tester.getRect(contentSurface).left, 300);
+  });
+
   testWidgets('keeps a wide landscape phone in the compact shell', (
     tester,
   ) async {

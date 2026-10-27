@@ -5,6 +5,7 @@ import 'dart:async';
 import 'dart:math' as math;
 
 import 'package:flutter/foundation.dart' show ValueListenable;
+import 'package:flutter/cupertino.dart' show CupertinoIcons;
 import 'package:flutter/material.dart';
 import 'package:flutter/gestures.dart'
     show Drag, GestureBinding, PointerScrollEvent;
@@ -127,6 +128,12 @@ class ThreadDetailPage extends HookConsumerWidget {
   final String? initialMessageId;
   final VoidCallback? onClose;
 
+  /// Whether an enclosing tablet pane currently shows this thread full screen.
+  final bool expanded;
+
+  /// Toggles [expanded] from the header of an enclosing tablet pane.
+  final VoidCallback? onToggleExpanded;
+
   /// Overrides the tail jump only in deterministic lazy-layout tests.
   @visibleForTesting
   final bool Function()? jumpThreadTailForTesting;
@@ -141,6 +148,8 @@ class ThreadDetailPage extends HookConsumerWidget {
     required this.isArchived,
     this.initialMessageId,
     this.onClose,
+    this.expanded = false,
+    this.onToggleExpanded,
     this.jumpThreadTailForTesting,
   });
 
@@ -148,6 +157,8 @@ class ThreadDetailPage extends HookConsumerWidget {
     ThreadDetailTarget target, {
     Key? key,
     VoidCallback? onClose,
+    bool expanded = false,
+    VoidCallback? onToggleExpanded,
   }) => ThreadDetailPage(
     key: key,
     threadHead: target.threadHead,
@@ -158,6 +169,8 @@ class ThreadDetailPage extends HookConsumerWidget {
     isArchived: target.isArchived,
     initialMessageId: target.initialMessageId,
     onClose: onClose,
+    expanded: expanded,
+    onToggleExpanded: onToggleExpanded,
   );
 
   @override
@@ -988,6 +1001,8 @@ class ThreadDetailPage extends HookConsumerWidget {
         channel,
         currentPubkey,
         onClose: onClose,
+        expanded: expanded,
+        onToggleExpanded: onToggleExpanded,
       ),
       body: Stack(
         fit: StackFit.expand,

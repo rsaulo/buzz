@@ -6,12 +6,14 @@ class _ChannelHeaderActions extends StatelessWidget {
     required this.onInbox,
     required this.hasUnreadInbox,
     required this.onSettings,
+    this.onHideSidebar,
   });
 
   final VoidCallback? onSearch;
   final VoidCallback? onInbox;
   final bool hasUnreadInbox;
   final VoidCallback onSettings;
+  final VoidCallback? onHideSidebar;
 
   @override
   Widget build(BuildContext context) => Row(
@@ -43,6 +45,13 @@ class _ChannelHeaderActions extends StatelessWidget {
                     child: const Icon(BuzzIcons.inbox300),
                   ),
                 ),
+              ),
+            if (onHideSidebar != null)
+              IconButton(
+                key: const ValueKey('hide-sidebar'),
+                tooltip: 'Hide sidebar',
+                icon: const Icon(CupertinoIcons.sidebar_left),
+                onPressed: onHideSidebar,
               ),
           ],
         ),

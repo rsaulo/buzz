@@ -4439,6 +4439,45 @@ void main() {
       expect(find.byType(ThreadDetailPage), findsNothing);
     });
 
+    testWidgets('tablet thread pane offers full screen and close', (
+      tester,
+    ) async {
+      final root = _textMsg(
+        id: threadIdRoot,
+        pubkey: 'alice',
+        content: 'Thread head',
+        createdAt: 1000,
+      );
+      var expandTaps = 0;
+      var closeTaps = 0;
+      Widget build({required bool expanded}) => _buildTestable(
+        messages: [root],
+        home: ThreadDetailPage(
+          threadHead: formatTimeline([root]).single,
+          allMessages: formatTimeline([root]),
+          channelId: _channelId,
+          currentPubkey: 'self',
+          isMember: true,
+          isArchived: false,
+          expanded: expanded,
+          onToggleExpanded: () => expandTaps++,
+          onClose: () => closeTaps++,
+        ),
+      );
+
+      await tester.pumpWidget(build(expanded: false));
+      await tester.pumpAndSettle();
+      expect(find.byTooltip('Full screen'), findsOneWidget);
+      await tester.tap(find.byKey(const ValueKey('tablet-thread-expand')));
+      await tester.tap(find.byKey(const ValueKey('tablet-thread-close')));
+      expect(expandTaps, 1);
+      expect(closeTaps, 1);
+
+      await tester.pumpWidget(build(expanded: true));
+      await tester.pumpAndSettle();
+      expect(find.byTooltip('Exit full screen'), findsOneWidget);
+    });
+
     testWidgets('constrains reply summaries at accessibility text sizes', (
       tester,
     ) async {

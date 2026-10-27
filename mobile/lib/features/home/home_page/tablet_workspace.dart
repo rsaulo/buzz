@@ -1,6 +1,7 @@
 part of '../home_page.dart';
 
 const double _tabletSidebarWidth = 300;
+const double _tabletRailWidth = 68;
 const double _tabletThreadPaneWidth = 380;
 
 /// Window width at which a selected channel keeps its thread in a third pane.
@@ -35,6 +36,10 @@ class _TabletWorkspace extends StatelessWidget {
     required this.onThreadClosed,
     required this.onCommunityChanged,
     required this.onSelectedChannelUnavailable,
+    required this.sidebarCollapsed,
+    required this.onSidebarCollapsedChanged,
+    required this.threadExpanded,
+    required this.onThreadExpandedChanged,
   });
 
   final WidgetBuilder settingsPageBuilder;
@@ -55,6 +60,14 @@ class _TabletWorkspace extends StatelessWidget {
   final VoidCallback onThreadClosed;
   final ValueChanged<String?> onCommunityChanged;
   final VoidCallback onSelectedChannelUnavailable;
+
+  /// Whether the sidebar is reduced to the compact rail.
+  final bool sidebarCollapsed;
+  final ValueChanged<bool> onSidebarCollapsedChanged;
+
+  /// Whether the open thread fills the whole window.
+  final bool threadExpanded;
+  final ValueChanged<bool> onThreadExpandedChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -83,6 +96,8 @@ class _TabletWorkspace extends StatelessWidget {
     final showsThreadPane =
         channel != null &&
         MediaQuery.sizeOf(context).width >= _tabletThreePaneMinWidth;
+    final threadVisible = showsThreadPane && selectedThread != null;
+    final threadFullScreen = threadVisible && threadExpanded;
     final contentNavigator = _TabletContentNavigator(
       key: ValueKey('tablet-content-$destination-${channel?.id}'),
       child: page,
@@ -107,106 +122,146 @@ class _TabletWorkspace extends StatelessWidget {
         ),
         child: Row(
           children: [
-            SizedBox(
-              key: const ValueKey('tablet-workspace-sidebar'),
-              width: _tabletSidebarWidth,
-              child: Stack(
-                fit: StackFit.expand,
-                children: [
-                  MediaQuery(
-                    // Keep the last channel rows clear of the quick actions.
-                    data: _mediaQueryWithFloatingTabBarClearance(
-                      context,
-                      HomePage._fabClearance,
-                    ),
-                    child: ChannelsPage(
-                      settingsPageBuilder: settingsPageBuilder,
-                      communityInvitePageBuilder: communityInvitePageBuilder,
-                      communityAppearancePageBuilder:
-                          communityAppearancePageBuilder,
-                      onSettingsTransitionProgress: (progress) {
-                        if (settingsTransitionProgress.value != progress) {
-                          settingsTransitionProgress.value = progress;
-                        }
-                      },
-                      selectedChannelId: channel?.id,
-                      onChannelSelected: onChannelSelected,
-                      onCommunityChanged: onCommunityChanged,
-                      onSelectedChannelUnavailable:
-                          onSelectedChannelUnavailable,
-                      workspaceHeader: _TabletWorkspaceDestinations(
-                        selectedDestination: destination,
-                        hasUnreadInbox: hasUnreadInbox,
-                        hasUnreadSolo: hasUnreadSolo,
-                        showsSolo: mePageBuilder != null,
-                        onDestinationSelected: onDestinationSelected,
+            // Hidden panes stay mounted offstage so scroll positions, drafts
+            // and nested routes survive collapsing and expanding.
+            Offstage(
+              key: const ValueKey('tablet-workspace-sidebar-slot'),
+              offstage: sidebarCollapsed || threadFullScreen,
+              child: SizedBox(
+                key: const ValueKey('tablet-workspace-sidebar'),
+                width: _tabletSidebarWidth,
+                child: Stack(
+                  fit: StackFit.expand,
+                  children: [
+                    MediaQuery(
+                      // Keep the last channel rows clear of the quick actions.
+                      data: _mediaQueryWithFloatingTabBarClearance(
+                        context,
+                        HomePage._fabClearance,
+                      ),
+                      child: ChannelsPage(
+                        settingsPageBuilder: settingsPageBuilder,
+                        communityInvitePageBuilder: communityInvitePageBuilder,
+                        communityAppearancePageBuilder:
+                            communityAppearancePageBuilder,
+                        onSettingsTransitionProgress: (progress) {
+                          if (settingsTransitionProgress.value != progress) {
+                            settingsTransitionProgress.value = progress;
+                          }
+                        },
+                        selectedChannelId: channel?.id,
+                        onChannelSelected: onChannelSelected,
+                        onCommunityChanged: onCommunityChanged,
+                        onSelectedChannelUnavailable:
+                            onSelectedChannelUnavailable,
+                        onHideSidebar: () => onSidebarCollapsedChanged(true),
+                        workspaceHeader: _TabletWorkspaceDestinations(
+                          selectedDestination: destination,
+                          hasUnreadInbox: hasUnreadInbox,
+                          hasUnreadSolo: hasUnreadSolo,
+                          showsSolo: mePageBuilder != null,
+                          onDestinationSelected: onDestinationSelected,
+                        ),
                       ),
                     ),
-                  ),
-                  ValueListenableBuilder<VoidCallback?>(
-                    valueListenable: newChatAction,
-                    builder: (context, onNewChat, _) =>
-                        ChannelQuickActionsLauncher(
-                          key: const ValueKey('tablet-quick-actions'),
-                          visible: true,
-                          newChatMode: destination == _kWorkspaceSolo,
-                          onNewChat: onNewChat,
-                          navigationBarHeight: HomePage._tabBarHeight,
-                          navigationBarBottomGap: HomePage._tabBarBottomGap,
-                          navigationBarWidth: 0,
-                          navigationBarLeft: 0,
-                          systemBottomInset: MediaQuery.viewPaddingOf(
-                            context,
-                          ).bottom,
-                          rightInset: Grid.gutter,
-                          onOpenChannel: onChannelSelected,
-                        ),
-                  ),
-                ],
+                    ValueListenableBuilder<VoidCallback?>(
+                      valueListenable: newChatAction,
+                      builder: (context, onNewChat, _) =>
+                          ChannelQuickActionsLauncher(
+                            key: const ValueKey('tablet-quick-actions'),
+                            visible: true,
+                            newChatMode: destination == _kWorkspaceSolo,
+                            onNewChat: onNewChat,
+                            navigationBarHeight: HomePage._tabBarHeight,
+                            navigationBarBottomGap: HomePage._tabBarBottomGap,
+                            navigationBarWidth: 0,
+                            navigationBarLeft: 0,
+                            systemBottomInset: MediaQuery.viewPaddingOf(
+                              context,
+                            ).bottom,
+                            rightInset: Grid.gutter,
+                            onOpenChannel: onChannelSelected,
+                          ),
+                    ),
+                  ],
+                ),
               ),
             ),
+            if (sidebarCollapsed && !threadFullScreen)
+              _TabletWorkspaceRail(
+                selectedDestination: destination,
+                hasUnreadInbox: hasUnreadInbox,
+                hasUnreadSolo: hasUnreadSolo,
+                showsSolo: mePageBuilder != null,
+                onDestinationSelected: onDestinationSelected,
+                onShowSidebar: () => onSidebarCollapsedChanged(false),
+              ),
             Expanded(
               child: DecoratedBox(
                 key: const ValueKey('tablet-workspace-content-surface'),
                 decoration: BoxDecoration(
                   color: context.colors.surface,
                   border: Border(
-                    left: BorderSide(
-                      color: context.colors.outlineVariant.withValues(
-                        alpha: 0.45,
-                      ),
-                    ),
+                    left: threadFullScreen
+                        ? BorderSide.none
+                        : BorderSide(
+                            color: context.colors.outlineVariant.withValues(
+                              alpha: 0.45,
+                            ),
+                          ),
                   ),
                 ),
-                child: Row(
+                child: Stack(
                   children: [
-                    Expanded(child: content),
-                    if (showsThreadPane && selectedThread != null) ...[
-                      VerticalDivider(
-                        key: const ValueKey('tablet-thread-divider'),
-                        width: 1,
-                        thickness: 1,
-                        color: context.colors.outlineVariant.withValues(
-                          alpha: 0.45,
-                        ),
+                    Positioned(
+                      left: 0,
+                      top: 0,
+                      bottom: 0,
+                      right: threadVisible && !threadFullScreen
+                          ? _tabletThreadPaneWidth
+                          : 0,
+                      child: Offstage(
+                        offstage: threadFullScreen,
+                        child: content,
                       ),
-                      SizedBox(
-                        key: const ValueKey('tablet-thread-pane'),
-                        width: _tabletThreadPaneWidth,
-                        // Nested threads replace the pane's thread instead of
-                        // covering the whole workspace.
-                        child: ThreadDetailPaneScope(
-                          onOpenThread: onThreadSelected,
-                          child: ThreadDetailPage.fromTarget(
-                            selectedThread!,
-                            key: ValueKey(
-                              'tablet-thread-${selectedThread!.threadHead.id}',
+                    ),
+                    if (threadVisible)
+                      Positioned(
+                        top: 0,
+                        bottom: 0,
+                        right: 0,
+                        left: threadFullScreen ? 0 : null,
+                        width: threadFullScreen ? null : _tabletThreadPaneWidth,
+                        child: DecoratedBox(
+                          key: const ValueKey('tablet-thread-pane'),
+                          decoration: BoxDecoration(
+                            color: context.colors.surface,
+                            border: Border(
+                              left: threadFullScreen
+                                  ? BorderSide.none
+                                  : BorderSide(
+                                      color: context.colors.outlineVariant
+                                          .withValues(alpha: 0.45),
+                                    ),
                             ),
-                            onClose: onThreadClosed,
+                          ),
+                          // Nested threads replace the pane's thread instead
+                          // of covering the whole workspace.
+                          child: ThreadDetailPaneScope(
+                            onOpenThread: onThreadSelected,
+                            child: ThreadDetailPage.fromTarget(
+                              selectedThread!,
+                              key: ValueKey(
+                                'tablet-thread-${selectedThread!.threadHead.id}',
+                              ),
+                              onClose: onThreadClosed,
+                              expanded: threadFullScreen,
+                              onToggleExpanded: () =>
+                                  onThreadExpandedChanged(!threadExpanded),
+                            ),
                           ),
                         ),
                       ),
-                    ],
                   ],
                 ),
               ),
@@ -218,9 +273,6 @@ class _TabletWorkspace extends StatelessWidget {
   }
 }
 
-/// Hosts a workspace destination in its own navigator, so the routes it opens
-/// (channel info, Solo chats, search results, phone-width threads) stay
-/// beside the sidebar instead of covering the whole window.
 class _TabletContentNavigator extends HookWidget {
   const _TabletContentNavigator({required this.child, super.key});
 
@@ -389,6 +441,144 @@ class _TabletWorkspaceDestination extends StatelessWidget {
                     ),
                   ),
                 ],
+              ),
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+/// Compact sidebar: show-sidebar control plus the top-level destinations.
+class _TabletWorkspaceRail extends StatelessWidget {
+  const _TabletWorkspaceRail({
+    required this.selectedDestination,
+    required this.hasUnreadInbox,
+    required this.hasUnreadSolo,
+    required this.showsSolo,
+    required this.onDestinationSelected,
+    required this.onShowSidebar,
+  });
+
+  final int selectedDestination;
+  final bool hasUnreadInbox;
+  final bool hasUnreadSolo;
+  final bool showsSolo;
+  final ValueChanged<int> onDestinationSelected;
+  final VoidCallback onShowSidebar;
+
+  @override
+  Widget build(BuildContext context) {
+    return SizedBox(
+      key: const ValueKey('tablet-workspace-rail'),
+      width: _tabletRailWidth,
+      child: Padding(
+        padding: EdgeInsets.only(
+          top: MediaQuery.viewPaddingOf(context).top + Grid.xxs,
+        ),
+        child: Column(
+          children: [
+            _TabletRailButton(
+              key: const ValueKey('tablet-show-sidebar'),
+              icon: CupertinoIcons.sidebar_left,
+              label: 'Show sidebar',
+              onTap: onShowSidebar,
+            ),
+            const SizedBox(height: Grid.sm),
+            _TabletRailButton(
+              key: const ValueKey('tablet-rail-inbox'),
+              icon: BuzzIcons.inbox300,
+              label: 'Inbox',
+              selected: selectedDestination == _kWorkspaceInbox,
+              showBadge: hasUnreadInbox,
+              onTap: () => onDestinationSelected(_kWorkspaceInbox),
+            ),
+            _TabletRailButton(
+              key: const ValueKey('tablet-rail-search'),
+              icon: BuzzIcons.search300,
+              label: 'Search',
+              selected: selectedDestination == _kWorkspaceSearch,
+              onTap: () => onDestinationSelected(_kWorkspaceSearch),
+            ),
+            if (showsSolo)
+              _TabletRailButton(
+                key: const ValueKey('tablet-rail-solo'),
+                icon: BuzzIcons.messageSquare,
+                label: 'Solo',
+                selected: selectedDestination == _kWorkspaceSolo,
+                showBadge: hasUnreadSolo,
+                onTap: () => onDestinationSelected(_kWorkspaceSolo),
+              ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _TabletRailButton extends StatelessWidget {
+  const _TabletRailButton({
+    required this.icon,
+    required this.label,
+    required this.onTap,
+    this.selected = false,
+    this.showBadge = false,
+    super.key,
+  });
+
+  final IconData icon;
+  final String label;
+  final VoidCallback onTap;
+  final bool selected;
+  final bool showBadge;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: Grid.half),
+      child: Semantics(
+        button: true,
+        selected: selected,
+        label: showBadge && !selected ? '$label, unread' : label,
+        excludeSemantics: true,
+        child: Tooltip(
+          message: label,
+          excludeFromSemantics: true,
+          child: Material(
+            color: selected
+                ? context.colors.primaryContainer.withValues(alpha: 0.72)
+                : context.controlSurface,
+            shape: const CircleBorder(),
+            clipBehavior: Clip.antiAlias,
+            child: InkWell(
+              onTap: onTap,
+              child: SizedBox.square(
+                dimension: 44,
+                child: Stack(
+                  alignment: Alignment.center,
+                  clipBehavior: Clip.none,
+                  children: [
+                    Icon(
+                      icon,
+                      size: 20,
+                      color: navigationPrimaryForeground(context),
+                    ),
+                    if (showBadge)
+                      Positioned(
+                        top: 10,
+                        right: 10,
+                        child: Container(
+                          width: 7,
+                          height: 7,
+                          decoration: BoxDecoration(
+                            color: context.colors.primary,
+                            shape: BoxShape.circle,
+                          ),
+                        ),
+                      ),
+                  ],
+                ),
               ),
             ),
           ),

@@ -1,6 +1,7 @@
 import 'dart:async';
 import 'dart:ui';
 
+import 'package:flutter/cupertino.dart' show CupertinoIcons;
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -103,6 +104,8 @@ class HomePage extends HookConsumerWidget {
     final workspaceChannel = useState<Channel?>(null);
     final workspaceThread = useState<ThreadDetailTarget?>(null);
     final workspaceCommunityId = useRef<String?>(null);
+    final workspaceSidebarCollapsed = useState(false);
+    final workspaceThreadExpanded = useState(false);
     final reducedMotion = MediaQuery.of(context).disableAnimations;
     final tabContentTransitionProgress = reducedMotion
         ? 1.0
@@ -183,6 +186,7 @@ class HomePage extends HookConsumerWidget {
           unawaited(HapticFeedback.selectionClick());
           workspaceChannel.value = null;
           workspaceThread.value = null;
+          workspaceThreadExpanded.value = false;
           workspaceDestination.value = index;
         },
         onChannelSelected: (channel) {
@@ -191,10 +195,14 @@ class HomePage extends HookConsumerWidget {
           }
           workspaceChannel.value = channel;
           workspaceThread.value = null;
+          workspaceThreadExpanded.value = false;
           workspaceDestination.value = _kWorkspaceChannel;
         },
         onThreadSelected: (thread) => workspaceThread.value = thread,
-        onThreadClosed: () => workspaceThread.value = null,
+        onThreadClosed: () {
+          workspaceThread.value = null;
+          workspaceThreadExpanded.value = false;
+        },
         onCommunityChanged: (communityId) {
           if (workspaceCommunityId.value == communityId) return;
           workspaceCommunityId.value = communityId;
@@ -205,7 +213,18 @@ class HomePage extends HookConsumerWidget {
         onSelectedChannelUnavailable: () {
           workspaceChannel.value = null;
           workspaceThread.value = null;
+          workspaceThreadExpanded.value = false;
           workspaceDestination.value = _kWorkspaceInbox;
+        },
+        sidebarCollapsed: workspaceSidebarCollapsed.value,
+        onSidebarCollapsedChanged: (collapsed) {
+          unawaited(HapticFeedback.selectionClick());
+          workspaceSidebarCollapsed.value = collapsed;
+        },
+        threadExpanded: workspaceThreadExpanded.value,
+        onThreadExpandedChanged: (expanded) {
+          unawaited(HapticFeedback.selectionClick());
+          workspaceThreadExpanded.value = expanded;
         },
       );
     }

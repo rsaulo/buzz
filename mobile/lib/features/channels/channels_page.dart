@@ -8,6 +8,7 @@ import 'dart:math' show max, min, pi;
 import 'dart:ui';
 
 import 'package:flutter/foundation.dart';
+import 'package:flutter/cupertino.dart' show CupertinoIcons;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
@@ -123,6 +124,7 @@ class ChannelsPage extends HookConsumerWidget {
     this.workspaceHeader,
     this.onCommunityChanged,
     this.onSelectedChannelUnavailable,
+    this.onHideSidebar,
     super.key,
   });
 
@@ -173,6 +175,9 @@ class ChannelsPage extends HookConsumerWidget {
   /// Clears a persistent detail when the selected channel leaves the joined
   /// channel set.
   final VoidCallback? onSelectedChannelUnavailable;
+
+  /// Collapses an enclosing workspace sidebar from the header.
+  final VoidCallback? onHideSidebar;
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -541,6 +546,13 @@ class ChannelsPage extends HookConsumerWidget {
               activityLabel: hasUnreadInbox ? 'Unread' : null,
               onPressed: onInbox,
             ),
+          if (onHideSidebar != null)
+            IosNavigationAction(
+              label: 'Hide sidebar',
+              symbol: 'sidebar.left',
+              sharesBackground: true,
+              onPressed: onHideSidebar,
+            ),
           IosNavigationAction(
             label: 'Settings',
             sharesBackground: false,
@@ -581,6 +593,7 @@ class ChannelsPage extends HookConsumerWidget {
             onSearch: onSearch,
             onInbox: onInbox,
             hasUnreadInbox: hasUnreadInbox,
+            onHideSidebar: onHideSidebar,
             onSettings: () {
               unawaited(HapticFeedback.lightImpact());
               Navigator.of(context).push(

@@ -6,6 +6,8 @@ FrostedAppBar _threadAppBar(
   Channel? channel,
   String? currentPubkey, {
   VoidCallback? onClose,
+  bool expanded = false,
+  VoidCallback? onToggleExpanded,
 }) {
   final channelDisplayName = channel == null
       ? ''
@@ -52,7 +54,35 @@ FrostedAppBar _threadAppBar(
       child: const Text('Thread', key: ValueKey('thread-app-bar-title')),
     ),
     titleStyle: channelTitleTextStyle,
+    nativeActions: onClose == null
+        ? null
+        : [
+            if (onToggleExpanded != null)
+              IosNavigationAction(
+                label: expanded ? 'Exit full screen' : 'Full screen',
+                symbol: expanded
+                    ? 'arrow.down.right.and.arrow.up.left'
+                    : 'arrow.up.left.and.arrow.down.right',
+                onPressed: onToggleExpanded,
+              ),
+            IosNavigationAction(
+              label: 'Close thread',
+              symbol: 'xmark',
+              onPressed: onClose,
+            ),
+          ],
     actions: [
+      if (onToggleExpanded != null)
+        IconButton(
+          key: const ValueKey('tablet-thread-expand'),
+          tooltip: expanded ? 'Exit full screen' : 'Full screen',
+          onPressed: onToggleExpanded,
+          icon: Icon(
+            expanded
+                ? CupertinoIcons.arrow_down_right_arrow_up_left
+                : CupertinoIcons.arrow_up_left_arrow_down_right,
+          ),
+        ),
       if (onClose != null)
         IconButton(
           key: const ValueKey('tablet-thread-close'),
