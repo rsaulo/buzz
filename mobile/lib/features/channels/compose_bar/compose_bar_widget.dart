@@ -253,14 +253,44 @@ class ComposeBar extends HookConsumerWidget {
     // owners so @mention suggestions show names ("managed by …" included).
     final relayAgents = ref.watch(agentDirectoryProvider).asData?.value;
     final agentOwners = ref.watch(agentOwnersProvider).asData?.value;
-    final agentMentionLabels = _agentMentionLabels(bindings: mentionMap.value);
+    // Chips mirror send-time resolution: picked mentions plus channel members
+    // whose `@Name` resolves on send, for agents and people alike.
+    final memberMentionCandidates = buildMentionCandidates(
+      members: channelMembersForAutocomplete(
+        membersAsync: membersAsync,
+        sessionStatus: sessionStatus,
+        cachedMembers: cachedMembers,
+      ),
+      relayAgents: const [],
+      sharedChannelIds: const {},
+      userCache: userCache,
+      ownerByAgentPubkey: agentOwners ?? const {},
+    );
+    final agentMentionLabels = {
+      ..._agentMentionLabels(bindings: mentionMap.value),
+      for (final c in memberMentionCandidates)
+        if (c.isAgent) c.label,
+    };
+    final personMentionLabels = {
+      for (final entry in mentionMap.value.entries)
+        if (!entry.value.isAgent) entry.key,
+      for (final c in memberMentionCandidates)
+        if (!c.isAgent) c.label,
+    };
     final agentMentionLabelsKey = (agentMentionLabels.toList()..sort()).join(
+      '\u0000',
+    );
+    final personMentionLabelsKey = (personMentionLabels.toList()..sort()).join(
       '\u0000',
     );
     useEffect(() {
       controller.setAgentMentionNames(agentMentionLabels);
       return null;
     }, [controller, agentMentionLabelsKey]);
+    useEffect(() {
+      controller.setPersonMentionNames(personMentionLabels);
+      return null;
+    }, [controller, personMentionLabelsKey]);
     useEffect(
       () {
         final memberList = channelMembersForAutocomplete(

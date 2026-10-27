@@ -1757,6 +1757,28 @@ void main() {
       Future<void> settleSearch(WidgetTester tester) =>
           tester.pump(mentionSearchDebounce * 2);
 
+      testWidgets('typed member names render as person mention chips', (
+        tester,
+      ) async {
+        await pumpMembers(tester, ['Sergio Flor', 'Ana']);
+        await tester.enterText(
+          find.byType(TextField),
+          'oi @Sergio Flor e @Ninguem ',
+        );
+        await tester.pump();
+
+        expect(
+          find.byKey(const ValueKey('composer-person-mention-chip')),
+          findsOneWidget,
+        );
+        expect(find.byIcon(BuzzIcons.user), findsOneWidget);
+        expect(
+          find.byKey(const ValueKey('composer-agent-mention-chip')),
+          findsNothing,
+        );
+        await settleSearch(tester);
+      });
+
       Finder popover() =>
           find.byKey(const ValueKey('mention-suggestions-popover'));
 
