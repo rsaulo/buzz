@@ -39,6 +39,7 @@ import 'inline_agent_typing.dart';
 import '../../shared/me/me_assistants.dart';
 import 'thread_replies_provider.dart';
 import 'channel_ids_by_name_provider.dart';
+import 'thread_detail_target.dart';
 import 'channels_provider.dart';
 import 'compose_bar.dart';
 import 'composer_dock_size_reporter.dart';
@@ -80,6 +81,44 @@ const _landingHighlightDelay = Duration(milliseconds: 50);
 const _landingHighlightTransitionDuration = Duration(milliseconds: 300);
 const _landingHighlightOpacity = 0.12;
 
+/// Opens a thread: in the enclosing tablet pane when there is one
+/// ([ThreadDetailPaneScope]), otherwise as a full-screen route.
+void openThreadDetail(
+  BuildContext context, {
+  required TimelineMessage threadHead,
+  required List<TimelineMessage> allMessages,
+  required String channelId,
+  required String? currentPubkey,
+  required bool isMember,
+  required bool isArchived,
+  String? initialMessageId,
+  bool replaceCurrentRoute = false,
+}) {
+  final target = ThreadDetailTarget(
+    threadHead: threadHead,
+    allMessages: allMessages,
+    channelId: channelId,
+    currentPubkey: currentPubkey,
+    isMember: isMember,
+    isArchived: isArchived,
+    initialMessageId: initialMessageId,
+  );
+  final pane = ThreadDetailPaneScope.maybeOf(context);
+  if (pane != null) {
+    pane.onOpenThread(target);
+    return;
+  }
+  final route = MaterialPageRoute<void>(
+    builder: (_) => ThreadDetailPage.fromTarget(target),
+  );
+  final navigator = Navigator.of(context);
+  if (replaceCurrentRoute) {
+    navigator.pushReplacement(route);
+  } else {
+    navigator.push(route);
+  }
+}
+
 /// Full-screen thread detail page.
 ///
 /// Shows the thread head message, direct replies, typing indicators scoped to
@@ -92,6 +131,13 @@ class ThreadDetailPage extends HookConsumerWidget {
   final bool isMember;
   final bool isArchived;
   final String? initialMessageId;
+  final VoidCallback? onClose;
+
+  /// Whether an enclosing tablet pane currently shows this thread full screen.
+  final bool expanded;
+
+  /// Toggles [expanded] from the header of an enclosing tablet pane.
+  final VoidCallback? onToggleExpanded;
 
   /// Overrides the tail jump only in deterministic lazy-layout tests.
   @visibleForTesting
@@ -106,8 +152,31 @@ class ThreadDetailPage extends HookConsumerWidget {
     required this.isMember,
     required this.isArchived,
     this.initialMessageId,
+    this.onClose,
+    this.expanded = false,
+    this.onToggleExpanded,
     this.jumpThreadTailForTesting,
   });
+
+  factory ThreadDetailPage.fromTarget(
+    ThreadDetailTarget target, {
+    Key? key,
+    VoidCallback? onClose,
+    bool expanded = false,
+    VoidCallback? onToggleExpanded,
+  }) => ThreadDetailPage(
+    key: key,
+    threadHead: target.threadHead,
+    allMessages: target.allMessages,
+    channelId: target.channelId,
+    currentPubkey: target.currentPubkey,
+    isMember: target.isMember,
+    isArchived: target.isArchived,
+    initialMessageId: target.initialMessageId,
+    onClose: onClose,
+    expanded: expanded,
+    onToggleExpanded: onToggleExpanded,
+  );
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
@@ -943,7 +1012,15 @@ class ThreadDetailPage extends HookConsumerWidget {
             )
           : null,
       resizeToAvoidBottomInset: !usesFixedAndroidImeViewport,
-      appBar: _threadAppBar(context, ref, channel, currentPubkey),
+      appBar: _threadAppBar(
+        context,
+        ref,
+        channel,
+        currentPubkey,
+        onClose: onClose,
+        expanded: expanded,
+        onToggleExpanded: onToggleExpanded,
+      ),
       body: Stack(
         fit: StackFit.expand,
         children: [

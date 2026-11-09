@@ -121,17 +121,14 @@ class MessageSwipeReply extends HookConsumerWidget {
           final reply = !cancelled.value && offset.value >= 72;
           reset();
           if (!reply) return;
-          Navigator.of(context).push(
-            MaterialPageRoute<void>(
-              builder: (_) => ThreadDetailPage(
-                threadHead: message,
-                allMessages: messages,
-                channelId: channelId,
-                currentPubkey: currentPubkey,
-                isMember: isMember,
-                isArchived: isArchived,
-              ),
-            ),
+          openThreadDetail(
+            context,
+            threadHead: message,
+            allMessages: messages,
+            channelId: channelId,
+            currentPubkey: currentPubkey,
+            isMember: isMember,
+            isArchived: isArchived,
           );
         },
         child: AnimatedBuilder(

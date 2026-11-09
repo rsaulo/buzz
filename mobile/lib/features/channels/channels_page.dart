@@ -55,6 +55,7 @@ import 'ios_create_channel_sheet.dart';
 import 'ios_add_members_sheet.dart';
 import 'channel_actions_sheet.dart';
 import 'channel_detail_page.dart';
+import 'channel_workspace_scope.dart';
 import 'channel_management_provider.dart';
 import 'dm_channel_labels.dart';
 import 'ephemeral_channel_display.dart';
@@ -266,13 +267,11 @@ class ChannelsPage extends HookConsumerWidget {
         .toList();
     Future<void> openChannel(Channel channel) async {
       if (!context.mounted) return;
-      await Navigator.of(context).push(
-        MaterialPageRoute<void>(
-          builder: (_) => ChannelDetailPage(
-            channel: channel,
-            placement: ChannelRoutePlacement.ordinary,
-          ),
-        ),
+      // Beside the sidebar in the tablet workspace, a full route otherwise.
+      await openChannelDetail(
+        context,
+        channel: channel,
+        placement: ChannelRoutePlacement.ordinary,
       );
     }
 

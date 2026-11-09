@@ -19,7 +19,7 @@ import '../../shared/widgets/preset_agent_avatar.dart';
 import '../../shared/widgets/navigation_button_surface.dart';
 import 'empty_bestie_avatar.dart';
 import 'channel.dart';
-import 'channel_detail_page.dart';
+import 'channel_workspace_scope.dart';
 import 'channels_provider.dart';
 import 'channel_management_provider.dart';
 
@@ -94,12 +94,11 @@ class DefaultAgentLauncher extends HookConsumerWidget {
             ref.read(defaultAgentProvider).value != pubkey) {
           return;
         }
-        await Navigator.of(context).push<void>(
-          MaterialPageRoute(
-            // Native glass and video layers must track the live route.
-            allowSnapshotting: false,
-            builder: (_) => ChannelDetailPage(channel: channel),
-          ),
+        // Native glass and video layers must track the live route.
+        await openChannelDetail(
+          context,
+          channel: channel,
+          allowSnapshotting: false,
         );
       } catch (error) {
         if (context.mounted) {

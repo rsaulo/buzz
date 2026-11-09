@@ -41,6 +41,7 @@ import 'new_me_project.dart';
 import 'me_workspace_picker.dart';
 import 'me_recovery_dialog.dart';
 import '../channel_detail_page.dart';
+import '../channel_workspace_scope.dart';
 import '../channel_management_provider.dart';
 import '../channels_provider.dart';
 
@@ -130,14 +131,11 @@ class MePage extends HookConsumerWidget {
         : () => perform(() async {
             final result = await _showNewMeChat(context, ref);
             if (result == null || !context.mounted) return;
-            await Navigator.of(context).push(
-              MaterialPageRoute<void>(
-                builder: (_) => ChannelDetailPage(
-                  channel: result.$1,
-                  personalChat: true,
-                  initialAssistant: result.$2,
-                ),
-              ),
+            await openChannelDetail(
+              context,
+              channel: result.$1,
+              personalChat: true,
+              initialAssistant: result.$2,
             );
           });
 
@@ -191,11 +189,10 @@ class MePage extends HookConsumerWidget {
             channelId: channel.id,
             name: channel.name,
             isUnread: unreadIds.contains(channel.id),
-            onTap: () => Navigator.of(context).push(
-              MaterialPageRoute<void>(
-                builder: (_) =>
-                    ChannelDetailPage(channel: channel, personalChat: true),
-              ),
+            onTap: () => openChannelDetail(
+              context,
+              channel: channel,
+              personalChat: true,
             ),
           );
           final inventorySlivers = <Widget>[

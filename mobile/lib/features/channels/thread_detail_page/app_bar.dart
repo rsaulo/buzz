@@ -4,8 +4,11 @@ FrostedAppBar _threadAppBar(
   BuildContext context,
   WidgetRef ref,
   Channel? channel,
-  String? currentPubkey,
-) {
+  String? currentPubkey, {
+  VoidCallback? onClose,
+  bool expanded = false,
+  VoidCallback? onToggleExpanded,
+}) {
   final channelDisplayName = channel == null
       ? ''
       : channel.isDm
@@ -20,10 +23,12 @@ FrostedAppBar _threadAppBar(
         )
       : channel.name;
   final usesNativeIosGlassBackButton =
+      onClose == null &&
       Navigator.canPop(context) &&
       Theme.of(context).platform == TargetPlatform.iOS;
 
   return FrostedAppBar(
+    automaticallyImplyLeading: onClose == null,
     alwaysFrosted: true,
     nativeViewSuppressed: messageActionBackdropActive,
     nativeTitle: 'Thread',
@@ -49,5 +54,43 @@ FrostedAppBar _threadAppBar(
       child: const Text('Thread', key: ValueKey('thread-app-bar-title')),
     ),
     titleStyle: channelTitleTextStyle,
+    nativeActions: onClose == null
+        ? null
+        : [
+            if (onToggleExpanded != null)
+              IosNavigationAction(
+                label: expanded ? 'Exit full screen' : 'Full screen',
+                symbol: expanded
+                    ? 'arrow.down.right.and.arrow.up.left'
+                    : 'arrow.up.left.and.arrow.down.right',
+                icon: expanded
+                    ? BuzzIcons.arrowsMinimize
+                    : BuzzIcons.arrowsMaximize,
+                onPressed: onToggleExpanded,
+              ),
+            IosNavigationAction(
+              label: 'Close thread',
+              symbol: 'xmark',
+              onPressed: onClose,
+            ),
+          ],
+    actions: [
+      if (onToggleExpanded != null)
+        IconButton(
+          key: const ValueKey('tablet-thread-expand'),
+          tooltip: expanded ? 'Exit full screen' : 'Full screen',
+          onPressed: onToggleExpanded,
+          icon: Icon(
+            expanded ? BuzzIcons.arrowsMinimize : BuzzIcons.arrowsMaximize,
+          ),
+        ),
+      if (onClose != null)
+        IconButton(
+          key: const ValueKey('tablet-thread-close'),
+          tooltip: 'Close thread',
+          onPressed: onClose,
+          icon: const Icon(BuzzIcons.x),
+        ),
+    ],
   );
 }

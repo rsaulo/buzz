@@ -106,6 +106,9 @@ enum NativeTabler {
     "workspace": 0xecd7, // cube-3d-sphere
     "folder.badge.plus": 0xeaab, // folder-plus
     "headphones": 0xeabd, // headphones
+    "sidebar.left": 0xeada, // layout-sidebar
+    "arrow.up.left.and.arrow.down.right": 0xea28, // arrows-maximize
+    "arrow.down.right.and.arrow.up.left": 0xea29, // arrows-minimize
     "line.3.horizontal.decrease": 0xeaa5, // filter
     "square.and.pencil": 0xea98, // edit
     "pencil": 0xea98, // edit
