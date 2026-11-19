@@ -285,30 +285,39 @@ class ComposeBar extends HookConsumerWidget {
     final relayAgents = ref.watch(agentDirectoryProvider).asData?.value;
     final agentOwners = ref.watch(agentOwnersProvider).asData?.value;
     final ownedAgents = ref.watch(ownedAgentDirectoryProvider).asData?.value;
+    List<MentionCandidate> memberMentionCandidates() => _typedMemberCandidates(
+      membersAsync: membersAsync,
+      sessionStatus: sessionStatus,
+      cachedMembers: cachedMembers,
+      userCache: userCache,
+      agentOwners: agentOwners,
+    );
+
     // Chips mirror send-time resolution: picked mentions plus channel members
     // whose `@Name` resolves on send, for agents and people alike.
-    final memberMentionCandidates = buildMentionCandidates(
-      members: channelMembersForAutocomplete(
-        membersAsync: membersAsync,
-        sessionStatus: sessionStatus,
-        cachedMembers: cachedMembers,
-      ),
-      relayAgents: const [],
-      sharedChannelIds: const {},
-      userCache: userCache,
-      ownerByAgentPubkey: agentOwners ?? const {},
-      currentPubkey: currentPubkey,
-      ownedAgents: ownedAgents,
-    );
+    final selectedLabels = {
+      for (final label in mentionMap.value.keys) label.toLowerCase(),
+    };
+    final membersByLabel = <String, List<MentionCandidate>>{};
+    for (final member in memberMentionCandidates()) {
+      final label = member.label.toLowerCase();
+      if (!selectedLabels.contains(label)) {
+        (membersByLabel[label] ??= []).add(member);
+      }
+    }
+    final chipMembers = [
+      for (final matches in membersByLabel.values)
+        if (matches.length == 1) matches.single,
+    ];
     final agentMentionLabels = {
       ..._agentMentionLabels(bindings: mentionMap.value),
-      for (final c in memberMentionCandidates)
+      for (final c in chipMembers)
         if (c.isAgent) c.label,
     };
     final personMentionLabels = {
       for (final entry in mentionMap.value.entries)
         if (!entry.value.isAgent) entry.key,
-      for (final c in memberMentionCandidates)
+      for (final c in chipMembers)
         if (!c.isAgent) c.label,
     };
     final agentMentionLabelsKey = (agentMentionLabels.toList()..sort()).join(
@@ -359,14 +368,6 @@ class ComposeBar extends HookConsumerWidget {
     final lastTypingSentMs = useRef(0);
     final isModifyingText = useRef(false);
     final lastObservedEditingValue = useRef(controller.value);
-
-    List<MentionCandidate> memberMentionCandidates() => _typedMemberCandidates(
-      membersAsync: membersAsync,
-      sessionStatus: sessionStatus,
-      cachedMembers: cachedMembers,
-      userCache: userCache,
-      agentOwners: agentOwners,
-    );
 
     // Insert a selected mention into the text field.
     void insertMention(MentionCandidate candidate) {
